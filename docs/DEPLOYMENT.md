@@ -148,6 +148,13 @@ terms_url = "https://example.com/terms"        # optional
 privacy_url = "https://example.com/privacy"    # optional
 ```
 
+With `terms_url` (and `privacy_url`), the web sign-up shows a required
+"I have read and accept the terms of use and the privacy policy" checkbox
+with links to them, and the acceptance (with the version the client sends)
+is recorded in the audit entry of the registration (`auth.register`). Apps
+that do not send it can still sign up (see `accept_terms` in
+[API.md](API.md#terms-of-use)).
+
 ## Email
 
 Needed to verify emails, reset passwords and send invitations. Without email,

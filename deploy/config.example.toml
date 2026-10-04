@@ -95,6 +95,8 @@ enabled = true
 # app (needs an index.html; other files are served under /assets/).
 # dir = "/var/lib/termoak/web"
 # support_email = "support@example.com"
+# Terms of use and privacy policy: the web sign-up asks to accept them and the
+# acceptance is recorded in the audit log.
 # terms_url = "https://example.com/terms"
 # privacy_url = "https://example.com/privacy"
 

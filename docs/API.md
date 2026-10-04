@@ -93,6 +93,8 @@ Accounts and sign-in:
 | `email_failed` | 502 | The email could not be sent; try again later |
 | `invalid_link` | 400, 401, 404 | The link (email link or session share link) is invalid or has expired |
 | `invalid_locale` | 400 | The server does not have that language (see `GET /locales`) |
+| `terms_not_accepted` | 400 | Registration sent `accept_terms: false` on a server with terms of use |
+| `invalid_terms_version` | 400 | `terms_version` is longer than 16 characters or has control characters |
 | `last_admin` | 409 | You are the only administrator: appoint another one first |
 | `last_team_owner` | 409 | A team would be left without an owner. Extra field when deleting the account: `teams` (names of those teams) |
 | `plan_limit` | 403 | Your plan does not allow more. Extra fields: `limit` (`max_teams`, `max_team_members` or `max_server_sessions`) and `max` |
@@ -169,7 +171,7 @@ Sync, AI, push notifications and updates:
 |---|---|---|
 | GET | `/info` | Server version, registration state (`open`/`closed`), `needs_setup`, `features` and contact links |
 | GET | `/locales` | Languages the server has for emails and notifications: `{default, locales: [{code, name}]}`. No authentication |
-| POST | `/auth/register` | `{email, name, password, device_name, platform, invite?, locale?}`. The first user becomes an administrator; with registration closed an invitation is needed |
+| POST | `/auth/register` | `{email, name, password, device_name, platform, invite?, locale?, accept_terms?, terms_version?}`. The first user becomes an administrator; with registration closed an invitation is needed. See [Terms of use](#terms-of-use) |
 | POST | `/auth/login` | `{email, password, device_name, platform, totp_code?}` → `{user, tokens}` |
 | POST | `/auth/refresh` | `{refresh_token}` → new tokens. Both rotate |
 | POST | `/auth/logout` | Revokes the current device |
@@ -197,6 +199,29 @@ emails and push notifications; apps can use it as the account's language.
   doesn't have is rejected with `invalid_locale`. Regional variants are
   normalized (`es-ES` → `es`).
 - `GET /locales` lists the available languages.
+
+### Terms of use
+
+`GET /info` returns the server's `terms_url` and `privacy_url` (`null` when
+not configured, `[web]` in the configuration). Clients that show them at
+sign-up send, with the registration:
+
+- `accept_terms`: `true` when the person ticked "I have read and accept the
+  terms of use and the privacy policy".
+- `terms_version`: the version of the documents they accepted (`"1.0"`), at
+  most 16 characters (`invalid_terms_version` otherwise).
+
+Both are optional, so apps that predate them can still sign up. With
+`accept_terms: true`, the acceptance is recorded in the audit entry of the
+registration (`auth.register`, readable in `GET /audit` and
+`GET /admin/audit`):
+
+```json
+{"platform": "web", "invite": null, "terms": {"accepted": true, "version": "1.0"}}
+```
+
+On a server with `terms_url`, `accept_terms: false` is rejected with `400`
+`terms_not_accepted`. Without `accept_terms`, nothing is recorded.
 
 ### Email, forgotten password and plans
 

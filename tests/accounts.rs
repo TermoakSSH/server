@@ -20,6 +20,11 @@ struct Srv {
 
 impl Srv {
     async fn start() -> Self {
+        Self::start_with(|_| {}).await
+    }
+
+    /// Starts a server with closed registration, after `configure`.
+    async fn start_with(configure: impl FnOnce(&mut ServerConfig)) -> Self {
         let data = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -29,6 +34,7 @@ impl Srv {
         config.server.registration = Registration::Closed;
         // The tests simulate different IPs with the header.
         config.server.trust_forwarded_for = true;
+        configure(&mut config);
         let state = build_state(config).await.unwrap();
         tokio::spawn(async move { axum::serve(listener, routes::router(state)).await.unwrap() });
         Srv {
@@ -437,4 +443,89 @@ async fn accounts_2fa_invites_admin_and_teams() {
     // From another IP, Ana signs in without trouble.
     let (s, _) = srv.login("ana@example.com", "ana-password", None).await;
     assert!(s.is_success());
+}
+
+#[tokio::test]
+async fn registration_records_terms_acceptance() {
+    let srv = Srv::start_with(|c| {
+        c.server.registration = Registration::Open;
+        c.web.terms_url = Some("https://example.com/terms".into());
+        c.web.privacy_url = Some("https://example.com/privacy".into());
+    })
+    .await;
+    let register = |email: &str, extra: Value| {
+        let mut body =
+            json!({"email": email, "name": "Test", "password": "long-password", "platform": "web"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        srv.post("/api/v1/auth/register", None, body)
+    };
+    let terms_of = |audit: &Value| -> Value {
+        audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["action"] == "auth.register")
+            .map(|e| e["detail"]["terms"].clone())
+            .expect("no auth.register entry")
+    };
+
+    let (s, info) = srv
+        .call(
+            reqwest::Method::GET,
+            "/api/v1/info",
+            None,
+            None,
+            "192.0.2.1",
+        )
+        .await;
+    assert!(s.is_success());
+    assert_eq!(info["terms_url"], "https://example.com/terms");
+    assert_eq!(info["privacy_url"], "https://example.com/privacy");
+
+    // Accepted: recorded with the version.
+    let (s, ana) = register(
+        "ana@example.com",
+        json!({"accept_terms": true, "terms_version": "1.0"}),
+    )
+    .await;
+    assert!(s.is_success(), "{ana}");
+    let token = ana["tokens"]["access_token"].as_str().unwrap();
+    let terms = terms_of(&srv.get("/api/v1/audit", token).await);
+    assert_eq!(terms, json!({"accepted": true, "version": "1.0"}));
+
+    // Older apps that do not send it can still sign up; nothing is recorded.
+    let (s, bea) = register("bea@example.com", json!({})).await;
+    assert!(s.is_success(), "{bea}");
+    let token = bea["tokens"]["access_token"].as_str().unwrap();
+    assert!(terms_of(&srv.get("/api/v1/audit", token).await).is_null());
+
+    // An explicit refusal or an over-long version is rejected (no account).
+    let (s, e) = register("carla@example.com", json!({"accept_terms": false})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(e["error"]["code"], "terms_not_accepted");
+    let (s, e) = register(
+        "carla@example.com",
+        json!({"accept_terms": true, "terms_version": "12345678901234567"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(e["error"]["code"], "invalid_terms_version");
+    let (s, _) = srv.login("carla@example.com", "long-password", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn registration_without_terms_ignores_refusal() {
+    // A server without terms has nothing to accept: `false` is not an error.
+    let srv = Srv::start_with(|c| c.server.registration = Registration::Open).await;
+    let (s, v) = srv
+        .post(
+            "/api/v1/auth/register",
+            None,
+            json!({"email": "ana@example.com", "password": "long-password", "accept_terms": false}),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
 }

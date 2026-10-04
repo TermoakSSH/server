@@ -328,7 +328,10 @@ pub struct WebSection {
     pub dir: Option<PathBuf>,
     /// Contact email shown on the website.
     pub support_email: Option<String>,
-    /// Links to the terms and the privacy policy (if you have them).
+    /// Links to the terms and the privacy policy (if you have them). They are
+    /// shown in `GET /info`; with them the web sign-up asks the person to
+    /// accept them, and the acceptance is recorded in the registration's
+    /// audit entry.
     pub terms_url: Option<String>,
     pub privacy_url: Option<String>,
 }
@@ -571,6 +574,8 @@ enabled = true
 # app (needs an index.html; other files are served under /assets/).
 # dir = "/var/lib/termoak/web"
 # support_email = "support@example.com"
+# Terms of use and privacy policy: the web sign-up asks to accept them and the
+# acceptance is recorded in the audit log.
 # terms_url = "https://example.com/terms"
 # privacy_url = "https://example.com/privacy"
 

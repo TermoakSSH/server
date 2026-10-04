@@ -186,6 +186,18 @@ pub struct RegisterRequest {
     /// not have it), the best match from `Accept-Language`, else `en`.
     #[serde(default)]
     pub locale: Option<String>,
+    /// The person accepted the server's terms of use and privacy policy
+    /// (`terms_url` and `privacy_url` in `GET /info`). Optional, so older
+    /// apps can still sign up; when `true` it is recorded in the audit entry
+    /// of the registration. If the server has terms (`terms_url`), `false`
+    /// is rejected with `terms_not_accepted`.
+    #[serde(default)]
+    pub accept_terms: Option<bool>,
+    /// Version of the terms that were accepted (`"1.0"`), at most 16
+    /// characters. Recorded with `accept_terms`.
+    #[serde(default)]
+    #[schema(max_length = 16)]
+    pub terms_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -497,6 +509,7 @@ async fn register(
         .or_else(|| crate::i18n::from_accept_language(&headers))
         .unwrap_or(crate::i18n::DEFAULT);
     check_new_account(&req.email, &req.password)?;
+    let terms = terms_acceptance(&st, &req)?;
     let mut user = st
         .store
         .create_account(&req.email, &req.name, &req.password, is_admin, verified)
@@ -529,16 +542,51 @@ async fn register(
         .store
         .issue_device(user.id, &req.device_name, &req.platform, st.ttl)
         .await?;
+    let mut detail = json!({"platform": req.platform, "invite": invite.as_ref().map(|i| i.id)});
+    if let Some(terms) = terms {
+        detail["terms"] = terms;
+    }
     st.store
         .audit(
             user.id,
             &format!("user:{}", user.id),
             "auth.register",
             None,
-            json!({"platform": req.platform, "invite": invite.as_ref().map(|i| i.id)}),
+            detail,
         )
         .await?;
     Ok(Json(AuthResponse { user, tokens }))
+}
+
+/// Maximum length of `terms_version`.
+const TERMS_VERSION_MAX: usize = 16;
+
+/// Acceptance of the terms in a registration, for its audit entry:
+/// `{"accepted": true, "version": "1.0"}`, or `None` when the client did not
+/// say (older apps). An explicit `false` is rejected when the server has
+/// terms of use (`[web] terms_url`).
+fn terms_acceptance(st: &AppState, req: &RegisterRequest) -> ApiResult<Option<Value>> {
+    let version = req
+        .terms_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if let Some(v) = version
+        && (v.chars().count() > TERMS_VERSION_MAX || v.chars().any(char::is_control))
+    {
+        return Err(ApiError::bad_request(format!(
+            "terms_version must be at most {TERMS_VERSION_MAX} printable characters"
+        ))
+        .with_code("invalid_terms_version"));
+    }
+    match req.accept_terms {
+        Some(true) => Ok(Some(json!({"accepted": true, "version": version}))),
+        Some(false) if st.config.web.terms_url.is_some() => Err(ApiError::bad_request(
+            "the terms of use and the privacy policy must be accepted to sign up",
+        )
+        .with_code("terms_not_accepted")),
+        _ => Ok(None),
+    }
 }
 
 /// The invitation code is invalid, used, revoked or expired.

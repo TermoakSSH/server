@@ -2,7 +2,8 @@
 //
 // - With registration closed and no invitation, it explains how to get one
 //   and lets you paste the code.
-// - If the server has terms of use, they must be accepted.
+// - If the server has terms of use (`terms_url` in /info), they must be
+//   accepted, and the acceptance is sent with the registration.
 
 import { h, replace } from '../dom.js';
 import { icon } from '../icons.js';
@@ -112,6 +113,8 @@ export function signupForm({ invite = '', lockedEmail = null, requireInvite = fa
           platform: 'web',
           invite: code || undefined,
           locale: getLanguage(),
+          // Recorded by the server in the registration's audit entry.
+          accept_terms: terms ? true : undefined,
         }, { auth: false });
         await signIn(resp);
         const f = (state.info && state.info.features) || {};

@@ -110,7 +110,10 @@ fn endpoints() -> Vec<Ep> {
                 "/api/v1/auth/register",
                 "auth",
                 "Create an account (the first user becomes an administrator). \
-                 `locale` defaults to the best match of `Accept-Language`, else `en`",
+                 `locale` defaults to the best match of `Accept-Language`, else `en`. \
+                 `accept_terms: true` (and `terms_version`) records the acceptance of the \
+                 server's terms (`terms_url`, `privacy_url` in `/info`) in the audit log; \
+                 `false` is rejected with `terms_not_accepted` when the server has terms",
                 Ref("RegisterRequest"),
                 Ref("AuthResponse"),
             )
@@ -1329,5 +1332,8 @@ mod tests {
         assert!(json["paths"]["/api/v1/hosts"]["post"].is_object());
         assert!(json["paths"]["/api/v1/me/ai/keys/{provider}"]["put"].is_object());
         assert!(json["paths"]["/api/v1/me/ai/access"]["get"].is_object());
+        let register = &schemas["RegisterRequest"]["properties"];
+        assert!(register["accept_terms"].is_object());
+        assert_eq!(register["terms_version"]["maxLength"], 16);
     }
 }
