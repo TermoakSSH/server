@@ -21,6 +21,8 @@ pub struct Inner {
     pub started_at: i64,
     /// Failed sign-in attempts (per email and per IP).
     pub limiter: crate::limiter::LoginLimiter,
+    /// Emails with a verification code (per address and per IP).
+    pub code_emails: crate::limiter::CodeEmailLimiter,
     /// Checks of the users' own AI keys (each one calls the provider).
     pub ai_key_limiter: crate::limiter::RateLimiter,
     /// Desktop updates (if configured).

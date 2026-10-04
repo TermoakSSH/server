@@ -156,6 +156,7 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
         ttl,
         started_at: now_ms(),
         limiter: Default::default(),
+        code_emails: Default::default(),
         ai_key_limiter: limiter::RateLimiter::new(AI_KEY_CHECKS_PER_MINUTE, 60_000),
         updates,
         mailer,

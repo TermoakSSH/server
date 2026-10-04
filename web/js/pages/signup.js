@@ -13,6 +13,7 @@ import { navigate, safeNext } from '../router.js';
 import { deviceName } from '../format.js';
 import { field, errorBox, busy, toast, checkbox, passwordMeter, alertBox } from '../ui.js';
 import { t, tx, getLanguage } from '../i18n.js';
+import { toCheckEmail } from './verify.js';
 
 /**
  * Sign-up form.
@@ -116,6 +117,11 @@ export function signupForm({ invite = '', lockedEmail = null, requireInvite = fa
           // Recorded by the server in the registration's audit entry.
           accept_terms: terms ? true : undefined,
         }, { auth: false });
+        // The email must be confirmed first: the code screen (it signs in).
+        if (resp.verification_required) {
+          await toCheckEmail(resp, { next });
+          return;
+        }
         await signIn(resp);
         const f = (state.info && state.info.features) || {};
         if (!resp.user.email_verified && f.email_verification) {

@@ -85,11 +85,7 @@ impl FromRequestParts<AppState> for AuthUser {
                     || path.starts_with("/api/v1/auth/")
                     || path.starts_with("/api/v1/devices");
                 if !own_account && crate::account::verification_required(state, &user) {
-                    return Err(ApiError::new(
-                        axum::http::StatusCode::FORBIDDEN,
-                        "email_not_verified",
-                        "confirm your email to use the account (check your inbox)",
-                    ));
+                    return Err(crate::account::email_not_verified(&user));
                 }
                 Ok(AuthUser { user, device })
             }
@@ -220,6 +216,13 @@ pub struct LoginRequest {
 pub struct AuthResponse {
     pub user: User,
     pub tokens: TokenPair,
+    /// The server requires a verified email and this account has not
+    /// verified it yet. The tokens then only reach the account itself
+    /// (`/me*`, `/auth/*`, `/devices*`; anything else answers
+    /// `email_not_verified`) until the code from the email is entered
+    /// (`POST /auth/verify-code`, which signs in with new tokens) or its link
+    /// is opened.
+    pub verification_required: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -427,7 +430,9 @@ async fn info(State(st): State<AppState>) -> ApiResult<Json<Value>> {
             "plans": true,
             "web": st.config.web.enabled,
             "email": st.mailer.enabled(),
-            "email_verification": st.config.email.require_verification && st.mailer.enabled(),
+            "email_verification": crate::account::verification_enforced(&st),
+            // `POST /auth/verify-code` and `/auth/resend-code` exist.
+            "email_verification_code": crate::account::verification_enforced(&st),
             "push": {
                 "apns": st.push.as_ref().is_some_and(|p| p.platforms().0),
                 "fcm": st.push.as_ref().is_some_and(|p| p.platforms().1),
@@ -462,6 +467,7 @@ fn requested_locale(locale: &str) -> ApiResult<&'static str> {
 
 async fn register(
     State(st): State<AppState>,
+    ClientIp(ip): ClientIp,
     headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> ApiResult<Json<AuthResponse>> {
@@ -532,11 +538,14 @@ async fn register(
                 .await;
         }
     }
-    if !user.email_verified
-        && let Err(e) = crate::account::send_verification_email(&st, &user).await
-    {
-        // The account is created: the user can ask for another email later.
-        tracing::warn!(user = %user.id, error = %e.message, "no verification email");
+    if !user.email_verified {
+        // Counts against the limits on code emails (so asking for another
+        // one right away waits), but is always sent: it is the first.
+        let _ = st.code_emails.try_send(&user.email, ip);
+        if let Err(e) = crate::account::send_verification_email(&st, &user).await {
+            // The account is created: the user can ask for another email later.
+            tracing::warn!(user = %user.id, error = %e.message, "no verification email");
+        }
     }
     let tokens = st
         .store
@@ -555,7 +564,12 @@ async fn register(
             detail,
         )
         .await?;
-    Ok(Json(AuthResponse { user, tokens }))
+    let verification_required = crate::account::verification_required(&st, &user);
+    Ok(Json(AuthResponse {
+        user,
+        tokens,
+        verification_required,
+    }))
 }
 
 /// Maximum length of `terms_version`.
@@ -604,7 +618,7 @@ fn check_new_account(email: &str, password: &str) -> ApiResult<()> {
     crate::account::check_password_len(password)
 }
 
-fn too_many_attempts() -> ApiError {
+pub(crate) fn too_many_attempts() -> ApiError {
     ApiError::new(
         axum::http::StatusCode::TOO_MANY_REQUESTS,
         "too_many_attempts",
@@ -612,7 +626,7 @@ fn too_many_attempts() -> ApiError {
     )
 }
 
-fn unix_secs() -> u64 {
+pub(crate) fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -674,7 +688,17 @@ async fn login(
             json!({"device": req.device_name, "platform": req.platform, "via": via, "ip": ip}),
         )
         .await?;
-    Ok(Json(AuthResponse { user, tokens }))
+    // Unverified: the tokens only reach the account itself, and the user
+    // needs a code that still works.
+    let verification_required = crate::account::verification_required(&st, &user);
+    if verification_required {
+        crate::account::refresh_code_on_login(&st, &user, ip).await;
+    }
+    Ok(Json(AuthResponse {
+        user,
+        tokens,
+        verification_required,
+    }))
 }
 
 async fn refresh(
@@ -695,7 +719,13 @@ async fn logout(State(st): State<AppState>, u: AuthUser) -> ApiResult<Json<Value
 
 async fn me(State(st): State<AppState>, u: AuthUser) -> Json<Value> {
     let plan = st.config.plans.get(&u.user.plan);
-    Json(json!({"user": u.user, "device": u.device, "plan": plan}))
+    let verification_required = crate::account::verification_required(&st, &u.user);
+    Json(json!({
+        "user": u.user,
+        "device": u.device,
+        "plan": plan,
+        "verification_required": verification_required,
+    }))
 }
 
 async fn update_me(

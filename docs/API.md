@@ -78,7 +78,7 @@ Accounts and sign-in:
 | `invalid_credentials` | 401 | Wrong email or password |
 | `totp_required` | 401 | The account has two-step verification: repeat the request with the code |
 | `totp_invalid` | 401 | The two-step verification code is not correct |
-| `too_many_attempts` | 429 | Too many failed attempts (or emails requested too often); wait a few minutes |
+| `too_many_attempts` | 429 | Too many failed attempts (or emails requested too often); wait a few minutes. Extra field when asking for emails too often (`/auth/resend-code`, `/me/verify-email`): `retry_after` (seconds) |
 | `invalid_password` | 403 | The password (or code) asked to confirm the action is not correct |
 | `registration_closed` | 403 | Registration is closed: an invitation is needed |
 | `invalid_invite` | 403, 404 | The invitation is invalid, used, revoked or expired |
@@ -88,7 +88,8 @@ Accounts and sign-in:
 | `email_taken` | 409 | An account with that email already exists |
 | `same_email` | 400 | The new email is the current one |
 | `email_already_verified` | 400 | The email is already verified |
-| `email_not_verified` | 403 | The server requires a verified email to use the account |
+| `email_not_verified` | 403 | The server requires a verified email to use the account. Extra fields: `email` (the account's address) and `verification` (`["code", "link"]`): show the screen to enter the code from the email. See [Email verification](#email-verification) |
+| `invalid_code` | 400 | The email verification code is wrong, has expired or was used up (five wrong tries); the same answer whether or not the account exists |
 | `email_disabled` | 400 | The server does not send emails |
 | `email_failed` | 502 | The email could not be sent; try again later |
 | `invalid_link` | 400, 401, 404 | The link (email link or session share link) is invalid or has expired |
@@ -171,11 +172,13 @@ Sync, AI, push notifications and updates:
 |---|---|---|
 | GET | `/info` | Server version, registration state (`open`/`closed`), `needs_setup`, `features` and contact links |
 | GET | `/locales` | Languages the server has for emails and notifications: `{default, locales: [{code, name}]}`. No authentication |
-| POST | `/auth/register` | `{email, name, password, device_name, platform, invite?, locale?, accept_terms?, terms_version?}`. The first user becomes an administrator; with registration closed an invitation is needed. See [Terms of use](#terms-of-use) |
-| POST | `/auth/login` | `{email, password, device_name, platform, totp_code?}` → `{user, tokens}` |
+| POST | `/auth/register` | `{email, name, password, device_name, platform, invite?, locale?, accept_terms?, terms_version?}` → `{user, tokens, verification_required}`. The first user becomes an administrator; with registration closed an invitation is needed. See [Terms of use](#terms-of-use) and [Email verification](#email-verification) |
+| POST | `/auth/login` | `{email, password, device_name, platform, totp_code?}` → `{user, tokens, verification_required}` |
+| POST | `/auth/verify-code` | `{email, code, device_name?, platform?, totp_code?}` → `{user, tokens, verification_required: false}`. Verifies the email with the six-digit code and signs in. No authentication. See [Email verification](#email-verification) |
+| POST | `/auth/resend-code` | `{email}` → `{ok: true, resend_after: 60}`. Emails a new code. No authentication |
 | POST | `/auth/refresh` | `{refresh_token}` → new tokens. Both rotate |
 | POST | `/auth/logout` | Revokes the current device |
-| GET | `/me` | Your profile (`User`) |
+| GET | `/me` | `{user, device, plan, verification_required}` |
 | PATCH | `/me` | `{name?, locale?}` → the updated `User` |
 | DELETE | `/me` | `{password, totp_code?}`. Deletes the account and all its data |
 | POST | `/me/password` | `{current_password, new_password}` |
@@ -227,7 +230,7 @@ On a server with `terms_url`, `accept_terms: false` is rejected with `400`
 
 | Method | Route | Description |
 |---|---|---|
-| POST | `/me/verify-email` | Sends the verification email again (once per minute) |
+| POST | `/me/verify-email` | Sends the verification email again (once per minute; with a new code too when the server requires verification) |
 | POST | `/auth/verify-email` | `{token}` from the email. No authentication |
 | POST | `/me/email` | `{email, password}`. With email configured, the change stays pending (`{pending: true}`) until confirmed from the new address |
 | POST | `/auth/confirm-email` | `{token}` from the email-change email. No authentication |
@@ -239,7 +242,60 @@ On a server with `terms_url`, `accept_terms: false` is rejected with `400`
 
 If the server requires a verified email (`[email] require_verification`), an
 unverified account can only use `/me*`, `/auth/*` and `/devices*`; everything
-else answers `403` with `email_not_verified`.
+else answers `403` with `email_not_verified`. See
+[Email verification](#email-verification).
+
+### Email verification
+
+On a server that requires a verified email (`[email] require_verification`
+with email configured; `GET /info` says `features.email_verification: true`,
+and `features.email_verification_code: true` when the routes below exist),
+new accounts confirm their address with a **six-digit code** sent by email.
+Accounts created from an invitation sent to their own email, and the first
+account of the server, are verified from the start.
+
+1. `POST /auth/register` answers as always, plus `verification_required`:
+
+   ```json
+   {"user": {"email": "ana@example.com", "email_verified": false, ...},
+    "tokens": {...}, "verification_required": true}
+   ```
+
+   The email (subject `Your Termoak code: 123456`, in the account's
+   language) carries the code and, for older apps, the verification link.
+   While `verification_required` is `true`, the tokens only reach the
+   account itself (`/me*`, `/auth/*`, `/devices*`); clients should show a
+   "check your email" screen instead of the app. The web app discards them
+   (`POST /auth/logout`) and signs in with the tokens of step 2.
+2. `POST /auth/verify-code` with `{"email": "ana@example.com", "code": "123456",
+   "device_name": "Ana's iPhone", "platform": "ios"}` (`device` is accepted as
+   another name for `device_name`; spaces and dashes in the code are
+   ignored) verifies the email and signs in: the same response as the login,
+   with `verification_required: false`. Errors:
+   - `400 invalid_code`: wrong, expired, already used, or invalidated after
+     five wrong tries; the same answer when there is no such unverified
+     account.
+   - `429 too_many_attempts`: too many failures for that email or IP (they
+     count together with failed sign-ins: 10 per email or 30 per IP in 10
+     minutes).
+   - `401 totp_required` / `totp_invalid`: only if the account already has
+     two-step verification; repeat with `totp_code`.
+3. `POST /auth/resend-code` with `{"email": "ana@example.com"}` emails a new
+   code (and link), which replaces the previous one. It always answers
+   `{"ok": true, "resend_after": 60}`, whether or not the account exists or
+   needs it, except when asked too often: at most once a minute and five
+   times an hour per address, and thirty times an hour per IP, counting
+   every request, answered with `429 too_many_attempts` and `retry_after`
+   (seconds). Registration counts as the first email.
+
+Codes last 15 minutes. Signing in to an unverified account
+(`POST /auth/login`) still works and answers `verification_required: true`;
+if the last code can no longer be used (expired, used up, invalidated), it
+emails a new one, within the same limits. The link in the email
+(`POST /auth/verify-email`, 48 hours) keeps working and then invalidates
+the code. Any other route answers `403 email_not_verified` with the
+account's `email` and `"verification": ["code", "link"]`, so clients can open
+the code screen from anywhere.
 
 Plans have a stable `id` (`free`, `pro`), English `name` and `description`,
 `price_cents` (`0` = free, `null` = not published yet), `currency`,

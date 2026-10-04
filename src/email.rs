@@ -1,4 +1,5 @@
-//! Outgoing email: email verification, password reset and invitations.
+//! Outgoing email: email verification (code and link), password reset and
+//! invitations.
 //!
 //! Without `[email] smtp_url` nothing is sent and the website and apps show
 //! the links to copy by hand. With `log://` emails are written to the log and
@@ -206,6 +207,61 @@ pub fn verify_email(to: &str, locale: &str, name: &str, link: &str) -> Email {
     )
 }
 
+/// Verification email with a six-digit code to type in the app, plus the
+/// link (older apps and the website still use it). The code goes in the
+/// subject too, so it can be read from the notification.
+pub fn verify_code(
+    to: &str,
+    locale: &str,
+    name: &str,
+    code: &str,
+    minutes: i64,
+    link: &str,
+) -> Email {
+    let l = crate::i18n::resolve(locale);
+    let subject = t!("email.verify_code.subject", locale = l, code = code).into_owned();
+    let intro = t!("email.verify_code.intro", locale = l, name = name);
+    let expires = t!(
+        "email.verify_code.expires",
+        locale = l,
+        minutes = minutes.to_string()
+    );
+    let or_link = t!("email.verify_code.or_link", locale = l);
+    let button = t!("email.verify_code.button", locale = l);
+    let note = t!("email.verify_code.note", locale = l);
+    let signature = t!("email.signature", locale = l);
+    let text = format!(
+        "{intro}\n\n    {code}\n\n{expires}\n\n{or_link}\n{button}: {link}\n\n{note}\n\n{signature}\n"
+    );
+    let html = format!(
+        r#"<!doctype html><html lang="{lang}"><body style="margin:0;padding:24px;background:#0f1115;font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#e6e8ee">
+<table role="presentation" width="100%" style="max-width:520px;margin:0 auto;background:#171a21;border-radius:12px;padding:28px">
+<tr><td style="font-size:18px;font-weight:600;color:#9fd36b">Termoak</td></tr>
+<tr><td style="padding:16px 0 8px;font-size:15px;line-height:1.5">{intro}</td></tr>
+<tr><td style="padding:8px 0"><div style="display:inline-block;background:#0f1115;border:1px solid #2a2f3a;border-radius:10px;padding:12px 20px;font-family:SFMono-Regular,Menlo,Consolas,monospace;font-size:32px;font-weight:700;letter-spacing:8px;color:#e6e8ee">{code}</div></td></tr>
+<tr><td style="padding:8px 0 20px;font-size:13px;color:#8a90a0">{expires}</td></tr>
+<tr><td style="padding-bottom:10px;font-size:14px">{or_link}</td></tr>
+<tr><td><a href="{link}" style="display:inline-block;background:#6fbf3b;color:#0f1115;text-decoration:none;font-weight:600;padding:10px 18px;border-radius:8px">{button}</a></td></tr>
+<tr><td style="padding-top:16px;font-size:12px;color:#8a90a0;word-break:break-all">{link}</td></tr>
+<tr><td style="padding-top:16px;font-size:13px;color:#8a90a0">{note}</td></tr>
+</table></body></html>"#,
+        lang = escape(l),
+        intro = escape(&intro),
+        code = escape(code),
+        expires = escape(&expires),
+        or_link = escape(&or_link),
+        button = escape(&button),
+        link = escape(link),
+        note = escape(&note),
+    );
+    Email {
+        to: to.to_string(),
+        subject,
+        text,
+        html,
+    }
+}
+
 pub fn change_email(to: &str, locale: &str, name: &str, link: &str) -> Email {
     let l = crate::i18n::resolve(locale);
     compose(
@@ -309,6 +365,20 @@ mod tests {
         // Unknown languages fall back to English.
         let xx = reset_password("a@b.es", "xx", "Ann", "https://x/r");
         assert_eq!(xx.subject, "Reset your Termoak password");
+    }
+
+    #[test]
+    fn code_email() {
+        let en = verify_code("a@b.es", "en", "Ann", "042917", 15, "https://x/v?token=t");
+        assert_eq!(en.subject, "Your Termoak code: 042917");
+        assert!(en.text.contains("\n    042917\n"));
+        assert!(en.text.contains("15 minutes"));
+        assert!(en.text.contains("https://x/v?token=t"));
+        assert!(en.html.contains(">042917</div>"));
+        let es = verify_code("a@b.es", "es", "Bea", "042917", 15, "https://x/v");
+        assert_eq!(es.subject, "Tu código de Termoak: 042917");
+        assert!(es.text.starts_with("Hola, Bea."));
+        assert!(es.html.contains(r#"<html lang="es">"#));
     }
 
     #[tokio::test]

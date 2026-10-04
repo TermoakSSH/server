@@ -8,12 +8,12 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use termoak_core::model::User;
-use termoak_core::store::email_tokens::EmailPurpose;
+use termoak_core::store::email_tokens::{EmailPurpose, is_email_code};
 use termoak_core::store::users::SecondFactor;
 use termoak_core::time::now_ms;
 use utoipa::ToSchema;
 
-use crate::auth::{AuthUser, ClientIp};
+use crate::auth::{AuthResponse, AuthUser, ClientIp};
 use crate::config::{Plan, PlanLimits, PlansSection};
 use crate::email;
 use crate::error::{ApiError, ApiResult};
@@ -24,10 +24,33 @@ const VERIFY_TTL_MS: i64 = 48 * 3_600_000;
 const RESET_TTL_MS: i64 = 3_600_000;
 /// Minimum wait between two verification emails.
 const RESEND_AFTER_MS: i64 = 60_000;
+/// Lifetime of the six-digit verification codes (15 minutes).
+pub const CODE_TTL_MS: i64 = 15 * 60_000;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct TokenRequest {
     pub token: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct VerifyCode {
+    pub email: String,
+    /// The six digits from the email (spaces and dashes are ignored).
+    pub code: String,
+    /// Name of this device (as in the login). `device` is accepted too.
+    #[serde(default, alias = "device")]
+    pub device_name: String,
+    #[serde(default)]
+    pub platform: String,
+    /// Authenticator app code or recovery code, only if the account already
+    /// has two-step verification (otherwise `totp_required`).
+    #[serde(default)]
+    pub totp_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResendCode {
+    pub email: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -63,14 +86,33 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/me/verify-email", post(send_verification))
         .route("/api/v1/me/email", post(change_email))
         .route("/api/v1/auth/verify-email", post(verify_email))
+        .route("/api/v1/auth/verify-code", post(verify_code))
+        .route("/api/v1/auth/resend-code", post(resend_code))
         .route("/api/v1/auth/confirm-email", post(confirm_email))
         .route("/api/v1/auth/forgot-password", post(forgot_password))
         .route("/api/v1/auth/reset-password", post(reset_password))
 }
 
+/// The server requires a verified email (and can send emails).
+pub fn verification_enforced(st: &AppState) -> bool {
+    st.config.email.require_verification && st.mailer.enabled()
+}
+
 /// The user's email must be verified to use the account.
 pub fn verification_required(st: &AppState, user: &User) -> bool {
-    st.config.email.require_verification && st.mailer.enabled() && !user.email_verified
+    verification_enforced(st) && !user.email_verified
+}
+
+/// `403 email_not_verified`, with the address and the ways to verify it so
+/// that clients can open the screen to enter the code.
+pub fn email_not_verified(user: &User) -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "email_not_verified",
+        "confirm your email to use the account (check your inbox)",
+    )
+    .with_detail("email", user.email.clone())
+    .with_detail("verification", json!(["code", "link"]))
 }
 
 /// Website link (`/path?token=...`).
@@ -79,22 +121,53 @@ fn web_link(st: &AppState, path: &str, token: &str) -> String {
     format!("{}{path}?token={enc}", st.config.base_url())
 }
 
-/// Sends the verification email for the current address.
+/// Sends the verification email for the current address. When the server
+/// requires a verified email it carries a new six-digit code (valid for
+/// [`CODE_TTL_MS`]) as well as the link, which older apps and the website
+/// still use; otherwise only the link.
 pub async fn send_verification_email(st: &AppState, user: &User) -> ApiResult<()> {
     let token = st
         .store
         .create_email_token(user.id, EmailPurpose::Verify, &user.email, VERIFY_TTL_MS)
         .await?;
     let link = web_link(st, "/verify-email", &token);
-    st.mailer
-        .send(email::verify_email(
+    let mail = if verification_enforced(st) {
+        let code = st
+            .store
+            .create_email_code(user.id, &user.email, CODE_TTL_MS)
+            .await?;
+        email::verify_code(
             &user.email,
             &user.locale,
             &user.name,
+            &code,
+            CODE_TTL_MS / 60_000,
             &link,
-        ))
-        .await
-        .map_err(|e| mail_error(&e))
+        )
+    } else {
+        email::verify_email(&user.email, &user.locale, &user.name, &link)
+    };
+    st.mailer.send(mail).await.map_err(|e| mail_error(&e))
+}
+
+/// After signing in to an unverified account: emails a new code if the last
+/// one can no longer be used (expired, used up or never sent), within the
+/// limits on code emails. Failures are only logged.
+pub async fn refresh_code_on_login(st: &AppState, user: &User, ip: Option<std::net::IpAddr>) {
+    match st.store.has_email_code(user.id).await {
+        Ok(false) => {}
+        Ok(true) => return,
+        Err(e) => {
+            tracing::warn!(user = %user.id, error = %e, "could not check the email code");
+            return;
+        }
+    }
+    if st.code_emails.try_send(&user.email, ip).is_err() {
+        return;
+    }
+    if let Err(e) = send_verification_email(st, user).await {
+        tracing::warn!(user = %user.id, error = %e.message, "no verification email");
+    }
 }
 
 fn mail_error(e: &anyhow::Error) -> ApiError {
@@ -293,17 +366,30 @@ async fn send_verification(State(st): State<AppState>, u: AuthUser) -> ApiResult
     if !st.mailer.enabled() {
         return Err(no_email());
     }
-    if let Some(at) = st
+    let wait = match st
         .store
         .last_email_token_at(u.id(), EmailPurpose::Verify)
         .await?
-        && now_ms() - at < RESEND_AFTER_MS
     {
+        Some(at) if now_ms() - at < RESEND_AFTER_MS => RESEND_AFTER_MS - (now_ms() - at),
+        _ => 0,
+    };
+    // The email carries a code too: same limits as `/auth/resend-code`.
+    let wait = if wait > 0 || !verification_enforced(&st) {
+        wait
+    } else {
+        st.code_emails
+            .try_send(&u.user.email, None)
+            .err()
+            .unwrap_or(0)
+    };
+    if wait > 0 {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too_many_attempts",
             "wait a minute before asking for another email",
-        ));
+        )
+        .with_detail("retry_after", (wait + 999) / 1000));
     }
     send_verification_email(&st, &u.user).await?;
     Ok(Json(json!({"sent": true, "email": u.user.email})))
@@ -324,16 +410,171 @@ async fn verify_email(
         return Err(invalid_link());
     }
     let user = st.store.set_email_verified(user.id, true).await?;
+    // The code sent with the link is no longer needed.
+    st.store.invalidate_email_codes(user.id).await?;
     st.store
         .audit(
             user.id,
             &format!("user:{}", user.id),
             "auth.email_verified",
             None,
-            json!({}),
+            json!({"via": "link"}),
         )
         .await?;
     Ok(Json(json!({"ok": true, "email": user.email})))
+}
+
+/// The code is wrong, expired, used up or there is none (one answer for all,
+/// whether or not the account exists).
+fn invalid_code() -> ApiError {
+    ApiError::bad_request("the code is wrong or has expired: check it or ask for a new one")
+        .with_code("invalid_code")
+}
+
+/// The account of an email typed by someone signed out (`None` when there
+/// is none, or the address is not valid).
+async fn account_for(st: &AppState, email: &str) -> ApiResult<Option<User>> {
+    match st.store.user_by_email(email).await {
+        Ok(user) => Ok(user),
+        Err(termoak_core::CoreError::Invalid(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `POST /auth/verify-code`: verifies the email with the six-digit code from
+/// the verification email and signs in, like the login.
+async fn verify_code(
+    State(st): State<AppState>,
+    ClientIp(ip): ClientIp,
+    Json(req): Json<VerifyCode>,
+) -> ApiResult<Json<AuthResponse>> {
+    if st.limiter.is_blocked(&req.email, ip) {
+        return Err(crate::auth::too_many_attempts());
+    }
+    let code: String = req
+        .code
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
+    let user = account_for(&st, &req.email)
+        .await?
+        .filter(|u| !u.disabled && verification_required(&st, u));
+    // Checked without spending it: two-step verification may come next.
+    let found = match &user {
+        Some(u) if is_email_code(&code) => st
+            .store
+            .check_email_code(u.id, &code, false)
+            .await?
+            .filter(|t| t.email.eq_ignore_ascii_case(&u.email)),
+        _ => None,
+    };
+    let (Some(user), Some(_)) = (user, found) else {
+        st.limiter.failure(&req.email, ip);
+        return Err(invalid_code());
+    };
+    if user.totp_enabled {
+        let totp = req
+            .totp_code
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
+        let Some(totp) = totp else {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "totp_required",
+                "enter the two-step verification code",
+            ));
+        };
+        if st
+            .store
+            .totp_check(user.id, totp, crate::auth::unix_secs())
+            .await?
+            == SecondFactor::Invalid
+        {
+            st.limiter.failure(&req.email, ip);
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "totp_invalid",
+                "the verification code is not correct",
+            ));
+        }
+    }
+    if st
+        .store
+        .check_email_code(user.id, &code, true)
+        .await?
+        .is_none()
+    {
+        // Spent by a parallel request.
+        return Err(invalid_code());
+    }
+    st.limiter.success(&user.email);
+    let user = st.store.set_email_verified(user.id, true).await?;
+    let tokens = st
+        .store
+        .issue_device(user.id, &req.device_name, &req.platform, st.ttl)
+        .await?;
+    let actor = format!("user:{}", user.id);
+    st.store
+        .audit(
+            user.id,
+            &actor,
+            "auth.email_verified",
+            None,
+            json!({"via": "code"}),
+        )
+        .await?;
+    st.store
+        .audit(
+            user.id,
+            &actor,
+            "auth.login",
+            Some(tokens.device_id.to_string()),
+            json!({"device": req.device_name, "platform": req.platform, "via": "email_code", "ip": ip}),
+        )
+        .await?;
+    Ok(Json(AuthResponse {
+        user,
+        tokens,
+        verification_required: false,
+    }))
+}
+
+/// `POST /auth/resend-code`: emails a new code. The same answer whether or
+/// not there is an unverified account with that email; only the limits on
+/// code emails (which count every request) can stop it.
+async fn resend_code(
+    State(st): State<AppState>,
+    ClientIp(ip): ClientIp,
+    Json(req): Json<ResendCode>,
+) -> ApiResult<Json<Value>> {
+    if !st.mailer.enabled() {
+        return Err(no_email());
+    }
+    if let Err(wait_ms) = st.code_emails.try_send(&req.email, ip) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_attempts",
+            "wait before asking for another code",
+        )
+        .with_detail("retry_after", (wait_ms + 999) / 1000));
+    }
+    if let Some(user) = account_for(&st, &req.email)
+        .await?
+        .filter(|u| !u.disabled && verification_required(&st, u))
+    {
+        // In the background, so the response time does not tell either.
+        let st = st.clone();
+        tokio::spawn(async move {
+            if let Err(e) = send_verification_email(&st, &user).await {
+                tracing::warn!(user = %user.id, error = %e.message, "no verification email");
+            }
+        });
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "resend_after": RESEND_AFTER_MS / 1000,
+    })))
 }
 
 // --- Email change ------------------------------------------------------------

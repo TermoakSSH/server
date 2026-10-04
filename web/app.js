@@ -35,6 +35,7 @@ const ROUTES = [
   { path: '/forgot-password', ...page('password.js', 'forgot'), layout: 'auth', title: 'title.forgot_password' },
   { path: '/reset-password', ...page('password.js', 'reset'), layout: 'auth', title: 'title.reset_password' },
   { path: '/verify-email', ...page('email.js', 'verify'), layout: 'auth', title: 'title.verify_email' },
+  { path: '/check-email', ...page('verify.js'), layout: 'auth', title: 'title.check_email' },
   { path: '/confirm-email', ...page('email.js', 'confirm'), layout: 'auth', title: 'title.confirm_email' },
   { path: '/invite/:token', ...page('invite.js'), layout: 'auth', title: 'title.invite' },
   { path: '/join/:token', ...page('join.js'), layout: 'bare', title: 'title.join' },

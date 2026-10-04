@@ -113,7 +113,9 @@ fn endpoints() -> Vec<Ep> {
                  `locale` defaults to the best match of `Accept-Language`, else `en`. \
                  `accept_terms: true` (and `terms_version`) records the acceptance of the \
                  server's terms (`terms_url`, `privacy_url` in `/info`) in the audit log; \
-                 `false` is rejected with `terms_not_accepted` when the server has terms",
+                 `false` is rejected with `terms_not_accepted` when the server has terms. \
+                 With `verification_required: true` the email has a six-digit code for \
+                 `/auth/verify-code` and the tokens only reach the account itself",
                 Ref("RegisterRequest"),
                 Ref("AuthResponse"),
             )
@@ -124,7 +126,9 @@ fn endpoints() -> Vec<Ep> {
                 Post,
                 "/api/v1/auth/login",
                 "auth",
-                "Sign in (issues tokens for this device)",
+                "Sign in (issues tokens for this device). With `verification_required: true` \
+                 the tokens only reach the account itself until the email is verified \
+                 (`/auth/verify-code`); a new code is emailed if the last one expired",
                 Ref("LoginRequest"),
                 Ref("AuthResponse"),
             )
@@ -478,6 +482,33 @@ fn endpoints() -> Vec<Ep> {
                 "account",
                 "Confirm the email with the token from the message",
                 Ref("TokenRequest"),
+                Object,
+            )
+        },
+        Ep {
+            auth: false,
+            ..ep(
+                Post,
+                "/api/v1/auth/verify-code",
+                "account",
+                "Verify the email with the six-digit code from the message and sign in \
+                 (same response as the login). Errors: `invalid_code` (wrong, expired or \
+                 used up: 5 wrong tries invalidate a code), `too_many_attempts`, and \
+                 `totp_required`/`totp_invalid` if the account has two-step verification",
+                Ref("VerifyCode"),
+                Ref("AuthResponse"),
+            )
+        },
+        Ep {
+            auth: false,
+            ..ep(
+                Post,
+                "/api/v1/auth/resend-code",
+                "account",
+                "Email a new verification code: `{ok, resend_after}`, the same whether or \
+                 not the account exists. At most once a minute and five times an hour per \
+                 address (`429 too_many_attempts` with `retry_after` in seconds)",
+                Ref("ResendCode"),
                 Object,
             )
         },
@@ -1218,6 +1249,8 @@ pub fn document() -> OpenApi {
         .schema_from::<crate::account::DeleteAccount>()
         .schema_from::<crate::account::ChangeEmail>()
         .schema_from::<crate::account::TokenRequest>()
+        .schema_from::<crate::account::VerifyCode>()
+        .schema_from::<crate::account::ResendCode>()
         .schema_from::<crate::account::ForgotPassword>()
         .schema_from::<crate::account::ResetWithToken>()
         .schema_from::<crate::config::Plan>()

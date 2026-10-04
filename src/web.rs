@@ -33,6 +33,7 @@ const PAGES: &[&str] = &[
     "/forgot-password",
     "/reset-password",
     "/verify-email",
+    "/check-email",
     "/confirm-email",
     "/invite/{token}",
     "/join/{token}",

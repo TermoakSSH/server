@@ -102,7 +102,8 @@ proxy, leave it `false`.
 - `first_user` (default): only the first account, which becomes the
   administrator. After that, nobody can sign up on their own.
 - `open`: anyone can sign up. With `[email] require_verification` they must
-  confirm their email.
+  confirm their email with the six-digit code (or the link) they get by
+  email.
 - `closed`: nobody; administrators create the accounts.
 
 To add someone when registration is not open:
@@ -164,7 +165,7 @@ forgotten passwords.
 ```toml
 [email]
 from = "Termoak <no-reply@example.com>"
-require_verification = true    # new accounts must confirm their email
+require_verification = true    # new accounts must confirm their email (6-digit code or link)
 ```
 
 The SMTP URL, with the password, goes in `TERMOAK_SMTP_URL`:

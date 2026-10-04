@@ -98,6 +98,31 @@ impl RateLimiter {
 
     /// Counts an action; `false` if the limit was already reached.
     pub fn allow(&self, key: &str) -> bool {
+        if self.wait_ms(key) > 0 {
+            return false;
+        }
+        self.hit(key);
+        true
+    }
+
+    /// How long until `key` may act again (0 = now). Counts nothing.
+    pub fn wait_ms(&self, key: &str) -> i64 {
+        let now = now_ms();
+        let mut hits = self.hits.lock();
+        let Some(list) = hits.get_mut(key) else {
+            return 0;
+        };
+        list.retain(|t| now - *t < self.window_ms);
+        if list.len() < self.max {
+            return 0;
+        }
+        // The oldest action that still counts leaves the window first.
+        list.first()
+            .map_or(0, |oldest| self.window_ms - (now - oldest))
+    }
+
+    /// Counts an action without checking the limit.
+    pub fn hit(&self, key: &str) {
         let now = now_ms();
         let mut hits = self.hits.lock();
         if hits.len() > PURGE_AT {
@@ -105,11 +130,62 @@ impl RateLimiter {
         }
         let list = hits.entry(key.to_string()).or_default();
         list.retain(|t| now - *t < self.window_ms);
-        if list.len() >= self.max {
-            return false;
-        }
         list.push(now);
-        true
+    }
+}
+
+/// Emails with a verification code, per address and per IP.
+pub const CODE_EMAILS_PER_MINUTE: usize = 1;
+pub const CODE_EMAILS_PER_HOUR: usize = 5;
+pub const CODE_EMAILS_PER_IP_HOUR: usize = 30;
+
+/// Limits on sending verification codes, so nobody can flood a mailbox (or
+/// the server's email quota): one a minute and five an hour per address,
+/// thirty an hour per IP. Every request counts, whether or not the account
+/// exists, so the answer reveals nothing.
+pub struct CodeEmailLimiter {
+    per_minute: RateLimiter,
+    per_hour: RateLimiter,
+    per_ip: RateLimiter,
+}
+
+impl Default for CodeEmailLimiter {
+    fn default() -> Self {
+        Self {
+            per_minute: RateLimiter::new(CODE_EMAILS_PER_MINUTE, 60_000),
+            per_hour: RateLimiter::new(CODE_EMAILS_PER_HOUR, 3_600_000),
+            per_ip: RateLimiter::new(CODE_EMAILS_PER_IP_HOUR, 3_600_000),
+        }
+    }
+}
+
+impl CodeEmailLimiter {
+    /// Counts a code email to `email` (from `ip`, if known). `Err` with the
+    /// milliseconds to wait when a limit was reached (then nothing counts).
+    pub fn try_send(&self, email: &str, ip: Option<IpAddr>) -> Result<(), i64> {
+        let email = email.trim().to_lowercase();
+        let ip = ip.map(|ip| ip.to_string());
+        let wait = self
+            .per_minute
+            .wait_ms(&email)
+            .max(self.per_hour.wait_ms(&email))
+            .max(ip.as_deref().map_or(0, |ip| self.per_ip.wait_ms(ip)));
+        if wait > 0 {
+            return Err(wait);
+        }
+        self.per_minute.hit(&email);
+        self.per_hour.hit(&email);
+        if let Some(ip) = &ip {
+            self.per_ip.hit(ip);
+        }
+        Ok(())
+    }
+
+    /// Forgets every count (tests).
+    pub fn reset(&self) {
+        for l in [&self.per_minute, &self.per_hour, &self.per_ip] {
+            l.hits.lock().clear();
+        }
     }
 }
 
@@ -143,9 +219,28 @@ mod tests {
     #[test]
     fn rate_limiter() {
         let l = RateLimiter::new(2, 60_000);
+        assert_eq!(l.wait_ms("a"), 0);
         assert!(l.allow("a"));
         assert!(l.allow("a"));
         assert!(!l.allow("a"));
+        let wait = l.wait_ms("a");
+        assert!(wait > 59_000 && wait <= 60_000, "{wait}");
         assert!(l.allow("b"));
+    }
+
+    #[test]
+    fn code_emails() {
+        let l = CodeEmailLimiter::default();
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(l.try_send("Ana@example.com", Some(ip)).is_ok());
+        // Once a minute per address, whatever the case or the IP.
+        let wait = l.try_send("ana@example.com ", None).unwrap_err();
+        assert!(wait > 0 && wait <= 60_000, "{wait}");
+        // Other addresses from the same IP, up to the IP's limit.
+        for i in 1..CODE_EMAILS_PER_IP_HOUR {
+            assert!(l.try_send(&format!("u{i}@example.com"), Some(ip)).is_ok());
+        }
+        assert!(l.try_send("new@example.com", Some(ip)).is_err());
+        assert!(l.try_send("new@example.com", None).is_ok());
     }
 }

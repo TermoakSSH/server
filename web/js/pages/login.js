@@ -9,6 +9,7 @@ import { navigate, safeNext } from '../router.js';
 import { deviceName } from '../format.js';
 import { field, errorBox, busy, toast } from '../ui.js';
 import { t, tx } from '../i18n.js';
+import { toCheckEmail, checkEmailPath } from './verify.js';
 
 export function render(ctx) {
   const next = safeNext(ctx.query.get('next'));
@@ -102,11 +103,18 @@ export function render(ctx) {
       if (!totpStep.hidden) body.totp_code = code.input.value.trim();
       try {
         const resp = await api.post('/auth/login', body, { auth: false });
+        // The email is not confirmed yet: the code screen (it signs in).
+        if (resp.verification_required) {
+          await toCheckEmail(resp, { next, from: 'login' });
+          return;
+        }
         await signIn(resp);
         toast(t('login.welcome_back', { name: resp.user.name || resp.user.email }), 'success');
         navigate(next, { replace: true });
       } catch (err) {
-        if (err.code === 'totp_required') {
+        if (err.code === 'email_not_verified') {
+          navigate(checkEmailPath(body.email, { next, from: 'login' }));
+        } else if (err.code === 'totp_required') {
           showTotp(true);
         } else if (err.code === 'totp_invalid') {
           error.show(err);
