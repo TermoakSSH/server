@@ -351,15 +351,6 @@ sudo scripts/release-local.sh deploy server    # installs it on this machine and
 To move to a new version of the core libraries, change the `tag` of the
 `termoak-*` dependencies in `Cargo.toml` and run `cargo update -p termoak-core`.
 
-### With GitHub Actions
-
-Run the release workflow (`.github/workflows/release.yml`) by hand from the
-*Actions* tab. It publishes the version in `Cargo.toml` just like the script
-(its last step is in fact `release-local.sh publish`). If a run built but did
-not publish, `download server <id>` puts its binaries in `dist/server/`
-without rebuilding (the id is the number in the run's URL); then run
-`publish` with `COMMIT=<commit of that run>`.
-
 ### Updates and downloads through the server
 
 Your server can serve the updates and downloads of the apps. This is needed
