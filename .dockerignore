@@ -1,0 +1,11 @@
+target
+dist/*
+# Binaries used by Dockerfile.release
+!dist/server
+dist/server/*
+!dist/server/amd64
+!dist/server/arm64
+.git
+.github
+docs
+*.md

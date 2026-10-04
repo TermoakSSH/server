@@ -1,0 +1,19 @@
+services:
+  termoak:
+    image: ghcr.io/termoakssh/termoak-server:latest
+    build: .
+    restart: unless-stopped
+    ports:
+      - "7722:7722"
+    volumes:
+      - termoak-data:/var/lib/termoak
+      # - ./config.toml:/etc/termoak/config.toml:ro
+    environment:
+      TERMOAK_PUBLIC_URL: "https://termoak.example.com"
+      # ANTHROPIC_API_KEY: "..."
+      # OPENAI_API_KEY: "..."
+      # OPENCODE_GO_KEY: "..."
+      # CODEX_HOME: /var/lib/termoak/codex
+
+volumes:
+  termoak-data:

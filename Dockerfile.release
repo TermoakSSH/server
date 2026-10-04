@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1
+# Server image for releases: uses the binaries already built natively when
+# publishing the server (dist/server/amd64 and dist/server/arm64), so nothing
+# is compiled under emulation. To build from source, use `Dockerfile`.
+FROM debian:bookworm-slim
+ARG TARGETARCH
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates openssh-client tini \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --home /var/lib/termoak --create-home termoak
+COPY dist/server/${TARGETARCH}/termoak-server /usr/local/bin/
+COPY deploy/config.example.toml /etc/termoak/config.toml
+ENV TERMOAK_CONFIG=/etc/termoak/config.toml \
+    TERMOAK_DATA_DIR=/var/lib/termoak \
+    TERMOAK_LISTEN=0.0.0.0:7722
+USER termoak
+VOLUME ["/var/lib/termoak"]
+EXPOSE 7722
+ENTRYPOINT ["/usr/bin/tini", "--", "termoak-server"]
+CMD ["serve"]

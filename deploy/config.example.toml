@@ -1,0 +1,160 @@
+# Termoak server configuration
+
+[server]
+listen = "0.0.0.0:7722"
+# Public URL (for shared session links and email links).
+# public_url = "https://termoak.example.com"
+data_dir = "/var/lib/termoak"
+# first_user | open | closed
+registration = "first_user"
+# Direct TLS (or use a reverse proxy such as Caddy or nginx):
+# tls_cert = "/etc/termoak/fullchain.pem"
+# tls_key = "/etc/termoak/privkey.pem"
+access_token_minutes = 60
+refresh_token_days = 90
+# Behind Caddy or nginx: use the IP from X-Forwarded-For to rate-limit sign-in
+# attempts per IP. Do not enable it if the server is exposed directly.
+trust_forwarded_for = false
+
+[sessions]
+scrollback_kb = 2048
+# 0 = server sessions never expire for inactivity
+idle_timeout_hours = 0
+record = false
+record_input = false
+# ask | accept_new | strict
+host_key_policy = "ask"
+max_per_user = 50
+# Session holder (termoak-sessions service): keeps the SSH connections open so
+# updating or restarting the server does not cut the sessions. Without it,
+# sessions live in the server and are closed when it restarts.
+# holder_socket = "/run/termoak-sessions/sessions.sock"
+
+[ai]
+# Default provider and fallbacks (provider::model format).
+default = "codex"
+fallback = ["opencode-api::deepseek-v4-flash", "opencode-api::kimi-k2.6"]
+# read_only | ask | auto
+default_mode = "ask"
+max_steps = 40
+approval_timeout_secs = 1800
+command_timeout_secs = 120
+# Monthly credit per user in USD for the server's providers, for plans that
+# allow the server's AI (`server_ai`) without their own `ai_credit_usd`.
+# Comment out for no limit. The users' own API keys never count.
+# monthly_budget_usd = 50.0
+# Tool mode for external agents using MCP with a user token
+mcp_user_mode = "read_only"
+
+# The built-in providers (claude, gpt, codex, codex-api, opencode-api,
+# openrouter, opencode, local) are configured with environment variables:
+#   ANTHROPIC_API_KEY, OPENAI_API_KEY, CODEX_HOME, OPENCODE_GO_KEY,
+#   OPENROUTER_API_KEY, LOCAL_AI_BASE_URL...
+# Users can add their own API keys for claude, gpt, openrouter and
+# opencode-api (Settings → AI): theirs replaces the server's key and does not
+# use their plan's AI credit.
+# The server's providers take from the plan's credit their real cost or, on
+# a subscription or without a price, their tokens at the model's price (e.g.
+# Codex with gpt-5.6-sol at OpenAI API prices) or a reference price (Codex:
+# GPT-5.3-codex; others: $2 / $10 per million). `credit_price` (USD per
+# million tokens) sets it per provider.
+# or by overriding them here:
+# [ai.providers.claude]
+# driver = "anthropic"
+# api_key_env = ["ANTHROPIC_API_KEY"]
+# model = "claude-opus-5"
+# effort = "high"
+#
+# [ai.providers.codex]
+# driver = "codex_cli"
+# command = "/usr/local/bin/codex"
+# codex_home = "/var/lib/termoak/codex"
+# subscription = true
+# # Charged to the plans' credit instead of the model's price:
+# credit_price = { input = 1.75, output = 14.0, cached_input = 0.175 }
+#
+# [ai.providers.opencode-api]
+# driver = "openai_chat"
+# base_url = "https://opencode.ai/zen/go/v1"
+# api_key_env = ["OPENCODE_GO_KEY"]
+# model = "deepseek-v4-flash"
+# list_models = true
+# subscription = true
+
+# Desktop updates from GitHub releases. Needed when the repository is private:
+# the app downloads them from /updates/latest.json on this server. The
+# (read-only) token goes in the TERMOAK_GITHUB_TOKEN variable.
+# [updates]
+# github_repo = "owner/repo"
+
+# Web app at /: the basic one built into the server (sign-in, sessions, teams
+# and account), or your own front-end with `dir`.
+[web]
+enabled = true
+# Serve your own front-end from a directory instead of the built-in basic web
+# app (needs an index.html; other files are served under /assets/).
+# dir = "/var/lib/termoak/web"
+# support_email = "support@example.com"
+# terms_url = "https://example.com/terms"
+# privacy_url = "https://example.com/privacy"
+
+# Outgoing email to verify addresses, reset passwords and send invitations.
+# Better put the URL (with the password) in TERMOAK_SMTP_URL. public_url is
+# needed for the links in the emails to work. Emails are sent in the
+# recipient's language (the account's `locale`).
+[email]
+# smtp_url = "smtps://user:password@smtp.example.com:465"
+from = "Termoak <no-reply@localhost>"
+# Require a verified email to use the account
+require_verification = false
+
+# Push notifications to the iOS and Android apps (AI approvals, finished
+# tasks, sessions shared with you...). By default the text is generic: Apple
+# and Google never see commands or titles (detailed = true to include them).
+[push]
+detailed = false
+# [push.apns]
+# key_path = "/etc/termoak/AuthKey_ABC123DEFG.p8"   # or TERMOAK_APNS_KEY
+# key_id = "ABC123DEFG"
+# team_id = "TEAMID1234"
+# topic = "com.termoak"
+# [push.fcm]
+# service_account_path = "/etc/termoak/firebase.json"   # or TERMOAK_FCM_CREDENTIALS
+
+# Plans. The catalog feeds the pricing page and can set limits (unlimited when
+# not set). Without a catalog the built-in one is used: "free" (everything
+# included, AI with your own API keys: server_ai = false) and "pro" (coming
+# soon: adds priority support and Termoak AI credit: server_ai = true,
+# ai_credit_usd = 5.0). Administrators have no limits.
+#
+# AI limits: `server_ai` (default true) lets the plan use this server's AI
+# providers; `ai_credit_usd` is their monthly credit (default: [ai]
+# monthly_budget_usd, or no cap). To share the server's AI with every user,
+# set server_ai = true on the plans they have.
+#
+# `features` are stable ids, not display text. Clients translate the keys
+# `plans.<id>.name`, `plans.<id>.description` and `plans.feature.<feature>`,
+# and fall back to `name`, `description` and the raw feature id. Known ids:
+# unlimited_entities, encrypted_sync, server_sessions, session_sharing, teams,
+# two_factor, ai_own_keys, ai_credit, priority_support, desktop_mobile_apps.
+[plans]
+default = "free"
+# [[plans.catalog]]
+# id = "free"
+# name = "Free"
+# description = "Everything included. AI runs with your own API keys."
+# price_cents = 0
+# features = ["unlimited_entities", "encrypted_sync", "teams"]
+# [plans.catalog.limits]
+# max_teams = 3
+# max_team_members = 10
+# max_server_sessions = 20
+# server_ai = false
+#
+# [[plans.catalog]]
+# id = "pro"
+# name = "Pro"
+# features = ["unlimited_entities", "encrypted_sync", "teams", "ai_credit"]
+# [plans.catalog.limits]
+# server_ai = true
+# ai_credit_usd = 5.0

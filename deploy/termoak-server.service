@@ -1,0 +1,32 @@
+[Unit]
+Description=Termoak server
+Documentation=https://github.com/TermoakSSH/server/blob/main/docs/DEPLOYMENT.md
+After=network-online.target termoak-sessions.service
+Wants=network-online.target termoak-sessions.service
+
+[Service]
+Type=simple
+User=termoak
+Group=termoak
+ExecStart=/usr/local/bin/termoak-server --config /etc/termoak/config.toml serve
+# AI provider keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENCODE_GO_KEY...)
+EnvironmentFile=-/etc/termoak/env
+Restart=on-failure
+RestartSec=3
+StateDirectory=termoak
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/termoak
+# Session holder socket (if installed).
+ReadWritePaths=-/run/termoak-sessions
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,71 @@
+[package]
+name = "termoak-server"
+description = "Termoak server: REST + WebSocket API, persistent and shared sessions, background AI and sync"
+# Released separately (server-vX.Y.Z tag): it has its own version.
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+authors = ["Oihalitz <oihalitz@ohz.es>"]
+repository = "https://github.com/TermoakSSH/server"
+license = "AGPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "termoak-server"
+path = "src/main.rs"
+
+[dependencies]
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0", features = ["openapi"] }
+termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
+termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+futures = "0.3"
+bytes = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+axum = { version = "0.8", features = ["ws", "macros"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+clap = { version = "4", features = ["derive", "env"] }
+url = "2"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "http2"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "pool", "tokio1-rustls-tls"] }
+ring = "0.17"
+semver = "1"
+rust-i18n = "4"
+
+[dev-dependencies]
+# The engine of the mobile apps against this server (tests/ffi_*.rs).
+termoak-ffi = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
+termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
+data-encoding = "2"
+tokio-tungstenite = "0.28"
+tempfile = "3"
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
+
+# Own workspace: the crates of TermoakSSH/core come from git.
+[workspace]
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"

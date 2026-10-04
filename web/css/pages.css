@@ -1,0 +1,255 @@
+/* Page-specific styles: shared session, app pages and web terminal. */
+
+[data-page-title]:focus,
+[data-page-title]:focus-visible {
+  box-shadow: none;
+  outline: none;
+}
+
+/* --- Shared session (/join) --------------------------------------------- */
+
+.join-meta {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+}
+
+.join-meta-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.92rem;
+}
+
+.join-meta-row span:first-child {
+  color: var(--muted);
+}
+
+.join-page {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  background: var(--glow), var(--bg);
+}
+
+.join-page.is-terminal {
+  height: 100vh;
+  height: 100dvh;
+  background: var(--bg);
+}
+
+/* --- App: sessions -------------------------------------------------------- */
+
+.session-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.session-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.session-title h3 {
+  font-size: 1.02rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.session-meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.session-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.share-result {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent-border);
+  background: var(--accent-soft);
+}
+
+/* --- App: account -------------------------------------------------------------- */
+
+.totp-setup {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+
+@media (max-width: 640px) {
+  .totp-setup {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: center;
+  }
+  .totp-setup > .stack {
+    width: 100%;
+  }
+}
+
+.danger-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--text-2);
+  font-size: 0.92rem;
+  padding-left: 18px;
+}
+
+/* --- Section titles inside dialogs ------------------------------------------ */
+
+.admin-section-title {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--faint);
+  font-weight: 700;
+  margin-top: 6px;
+}
+
+/* --- Web terminal --------------------------------------------------------------- */
+
+.term-page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+}
+
+.term-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-soft);
+}
+
+.term-head h1 {
+  font-size: 1.05rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 40vw;
+}
+
+.term-head .avatar-stack .avatar {
+  border-color: var(--bg-soft);
+}
+
+.term-head-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.term-head-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.term-stage {
+  position: relative;
+  flex: 1;
+  min-height: 320px;
+  background: var(--term-bg);
+  overflow: auto;
+}
+
+.term-host {
+  padding: 12px;
+  display: inline-block;
+  min-width: 100%;
+}
+
+.term-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(8, 11, 9, 0.78);
+  color: var(--term-text);
+  z-index: 5;
+  padding: 20px;
+  text-align: center;
+}
+
+.term-overlay .stack {
+  align-items: center;
+  max-width: 420px;
+}
+
+.term-overlay p {
+  color: #a9b6a3;
+}
+
+.term-note {
+  padding: 8px 20px;
+  font-size: 0.84rem;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  background: var(--bg-soft);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.app-content-full .term-page {
+  height: calc(100dvh - 0px);
+}
+
+@media (max-width: 640px) {
+  .term-head {
+    position: relative;
+  }
+  .term-head-actions {
+    position: absolute;
+    top: 10px;
+    right: 14px;
+  }
+}
+
+@media (max-width: 960px) {
+  .app-content-full .term-page {
+    height: calc(100dvh - 58px);
+  }
+  .term-head {
+    padding: 10px 14px;
+  }
+  .term-head h1 {
+    max-width: 60vw;
+  }
+}

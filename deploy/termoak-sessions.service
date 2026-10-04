@@ -1,0 +1,35 @@
+[Unit]
+Description=Termoak session holder
+Documentation=https://github.com/TermoakSSH/server/blob/main/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+# Keeps the SSH connections of server sessions open: restarting
+# termoak-server does not cut them. Restarting this service does (only needed
+# when its protocol changes; `release-local.sh deploy server` detects it).
+[Service]
+Type=simple
+User=termoak
+Group=termoak
+ExecStart=/usr/local/bin/termoak-server --config /etc/termoak/config.toml sessions-holder
+Restart=on-failure
+RestartSec=3
+# The socket (holder_socket = "/run/termoak-sessions/sessions.sock").
+RuntimeDirectory=termoak-sessions
+RuntimeDirectoryMode=0700
+# Session recordings.
+StateDirectory=termoak
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/termoak
+
+[Install]
+WantedBy=multi-user.target
