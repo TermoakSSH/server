@@ -101,8 +101,14 @@ impl Default for SessionsSection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpdatesSection {
-    /// Repository with the releases (`owner/repo`). Disabled when unset.
+    /// Repository with the releases of every component (`owner/repo`), in
+    /// the single-repository layout (`desktop-vX.Y.Z`, `server-vX.Y.Z`...
+    /// and the old `vX.Y.Z`). Also the fallback for the components missing
+    /// from `repos`. Disabled when neither is set.
     pub github_repo: Option<String>,
+    /// One repository per component (`owner/repo`), e.g. desktop releases
+    /// in `TermoakSSH/desktop`. Only that component's tags count there.
+    pub repos: UpdatesRepos,
     /// Environment variable holding the GitHub token (read-only "Contents").
     pub github_token_env: String,
     /// GitHub API base (changed in tests or for GitHub Enterprise).
@@ -113,10 +119,23 @@ impl Default for UpdatesSection {
     fn default() -> Self {
         Self {
             github_repo: None,
+            repos: UpdatesRepos::default(),
             github_token_env: "TERMOAK_GITHUB_TOKEN".into(),
             github_api: "https://api.github.com".into(),
         }
     }
+}
+
+/// `[updates.repos]`: the repository (`owner/repo`) of each component.
+/// A component left out uses `[updates] github_repo`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdatesRepos {
+    pub desktop: Option<String>,
+    pub server: Option<String>,
+    pub cli: Option<String>,
+    pub android: Option<String>,
+    pub ios: Option<String>,
 }
 
 /// Plan limits (`None` = unlimited).
@@ -560,11 +579,23 @@ mcp_user_mode = "read_only"
 # list_models = true
 # subscription = true
 
-# Desktop updates from GitHub releases. Needed when the repository is private:
-# the app downloads them from /updates/latest.json on this server. The
-# (read-only) token goes in the TERMOAK_GITHUB_TOKEN variable.
+# Updates and downloads from GitHub releases. Needed when the repositories are
+# private: the desktop app updates from /updates/latest.json on this server
+# and the web lists the downloads at /api/v1/downloads. The (read-only) token
+# goes in the TERMOAK_GITHUB_TOKEN variable and must have access to every
+# repository below.
 # [updates]
+# One repository with every component (desktop-vX.Y.Z, server-vX.Y.Z...);
+# also used for the components missing from [updates.repos]:
 # github_repo = "owner/repo"
+#
+# Or one repository per component (only that component's tags count there):
+# [updates.repos]
+# desktop = "TermoakSSH/desktop"
+# server = "TermoakSSH/server"
+# cli = "TermoakSSH/core"
+# android = "TermoakSSH/mobile-android"
+# ios = "TermoakSSH/mobile-ios"
 
 # Web app at /: the basic one built into the server (sign-in, sessions, teams
 # and account), or your own front-end with `dir`.
@@ -654,6 +685,24 @@ mod tests {
         .unwrap();
         let p = cfg.ai.providers["codex"].credit_price.unwrap();
         assert_eq!((p.input, p.output, p.cache_read), (1.75, 14.0, Some(0.175)));
+    }
+
+    #[test]
+    fn updates_repos_parse() {
+        let cfg: ServerConfig = toml::from_str(
+            "[updates]\ngithub_repo = \"o/r\"\n[updates.repos]\n\
+             desktop = \"TermoakSSH/desktop\"\ncli = \"TermoakSSH/core\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.updates.github_repo.as_deref(), Some("o/r"));
+        assert_eq!(
+            cfg.updates.repos.desktop.as_deref(),
+            Some("TermoakSSH/desktop")
+        );
+        assert_eq!(cfg.updates.repos.cli.as_deref(), Some("TermoakSSH/core"));
+        assert!(cfg.updates.repos.server.is_none());
+        // A typo in a component name is an error, not a silent fallback.
+        assert!(toml::from_str::<ServerConfig>("[updates.repos]\ndesktp = \"a/b\"\n").is_err());
     }
 
     #[test]

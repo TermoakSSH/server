@@ -2,7 +2,7 @@
 name = "termoak-server"
 description = "Termoak server: REST + WebSocket API, persistent and shared sessions, background AI and sync"
 # Released separately (server-vX.Y.Z tag): it has its own version.
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.89"
 authors = ["Oihalitz <oihalitz@ohz.es>"]

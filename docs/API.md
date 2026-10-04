@@ -551,10 +551,12 @@ your own key) and `own_key`. A task's `cost_micros` is its real cost.
 ## Updates and downloads
 
 No authentication. They only exist when the server has `[updates]
-github_repo` configured (see [DEPLOYMENT.md](DEPLOYMENT.md)). The desktop
-app, the server and the CLI are released separately (`desktop-vX.Y.Z`,
-`server-vX.Y.Z`, `cli-vX.Y.Z`); for each one, the latest release is used,
-skipping drafts and pre-releases.
+github_repo` or `[updates.repos]` configured (see
+[DEPLOYMENT.md](DEPLOYMENT.md)). The desktop app, the server, the CLI and
+the mobile apps are released separately (`desktop-vX.Y.Z`, `server-vX.Y.Z`,
+`cli-vX.Y.Z`, `android-vX.Y.Z`, `ios-vX.Y.Z`), each from its own repository
+or all from one; for each one, the latest release is used, skipping drafts
+and pre-releases.
 
 | Method | Route | Description |
 |---|---|---|

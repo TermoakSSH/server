@@ -273,7 +273,7 @@ run and the session titles. Texts are translated to the recipient's language.
 | `TERMOAK_CONFIG` | Path of the TOML file |
 | `TERMOAK_LISTEN`, `TERMOAK_DATA_DIR`, `TERMOAK_PUBLIC_URL` | Override the TOML values |
 | `TERMOAK_MASTER_KEY` | Master key in base64. Without it, `<data_dir>/master.key` is used |
-| `TERMOAK_UPDATES_REPO` | Overrides `[updates] github_repo` |
+| `TERMOAK_UPDATES_REPO` | Overrides `[updates] github_repo` (the single repository, or the fallback of `[updates.repos]`) |
 | `TERMOAK_GITHUB_TOKEN` | Read-only GitHub token for `[updates]` (the variable name is set by `github_token_env`) |
 | `TERMOAK_SMTP_URL`, `TERMOAK_EMAIL_FROM` | Outgoing email (see [Email](#email)) |
 | `TERMOAK_APNS_KEY`, `TERMOAK_FCM_CREDENTIALS` | Push notification keys (content of the `.p8` and the JSON) |
@@ -371,16 +371,40 @@ each component at `/updates/latest.json` (desktop) and `/updates/download/…`,
 plus the list at `/api/v1/downloads`. The Ed25519 signature does not depend
 on the URL, so the app still verifies every download.
 
+Each component is read from its own repository: desktop from
+`TermoakSSH/desktop` (`desktop-vX.Y.Z`, with `latest.json`), server from
+`TermoakSSH/server` (`server-vX.Y.Z`), CLI from `TermoakSSH/core`
+(`cli-vX.Y.Z`), Android from `TermoakSSH/mobile-android` (`android-vX.Y.Z`)
+and iOS from `TermoakSSH/mobile-ios` (`ios-vX.Y.Z`). In a component's own
+repository only that component's tags count: the `ffi-vX.Y.Z` releases and
+the plain `vX.Y.Z` tag of core are ignored. Each repository is listed once
+every 5 minutes (all of them at the same time) and the results are merged
+into the same routes; if one cannot be read, the rest is still served.
+
 1. On GitHub, create a *fine-grained* token (*Settings > Developer settings >
    Personal access tokens > Fine-grained tokens*):
-   - access to the release repository only;
+   - access to the release repositories only (all of those below);
    - *Contents: Read-only* permission;
    - note when it expires so you can renew it.
 2. On the server, add the token to `/etc/termoak/env`:
    ```sh
    TERMOAK_GITHUB_TOKEN=github_pat_...
    ```
-   and the repository to `/etc/termoak/config.toml`:
+   and the repositories to `/etc/termoak/config.toml`:
+   ```toml
+   [updates.repos]
+   desktop = "TermoakSSH/desktop"
+   server = "TermoakSSH/server"
+   cli = "TermoakSSH/core"
+   android = "TermoakSSH/mobile-android"
+   ios = "TermoakSSH/mobile-ios"
+   ```
+   A component left out is not offered, unless `[updates] github_repo` is
+   set: that single repository is the fallback for the components missing
+   from `[updates.repos]`, with every component's tags in it and the old
+   `vX.Y.Z` releases (everything together) still counting for desktop,
+   server and CLI. With only `github_repo` it works as before (one
+   repository for everything; `TERMOAK_UPDATES_REPO` overrides it):
    ```toml
    [updates]
    github_repo = "owner/repo"

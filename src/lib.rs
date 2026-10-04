@@ -142,10 +142,11 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
         p.clone().spawn_dispatcher(ai.clone(), sessions.clone());
     }
     let updates = updates::UpdateProxy::from_config(&config.updates);
-    if let Some(repo) = &config.updates.github_repo
-        && updates.is_some()
-    {
-        tracing::info!(%repo, "desktop updates at /updates/latest.json");
+    if let Some(updates) = &updates {
+        tracing::info!(
+            repos = %updates.repos().join(", "),
+            "updates at /updates/latest.json, downloads at /api/v1/downloads"
+        );
     }
     Ok(AppState(Arc::new(Inner {
         store,

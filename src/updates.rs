@@ -8,9 +8,16 @@
 //! Desktop, server, CLI, Android and iOS are released separately, each with
 //! its own version and tag (`desktop-vX.Y.Z`, `server-vX.Y.Z`,
 //! `cli-vX.Y.Z`, `android-vX.Y.Z`, `ios-vX.Y.Z`).
-//! The newest release of each component is used. The old `vX.Y.Z` tags,
-//! which carried everything, count for the three components until each one
-//! has a newer release of its own.
+//! The newest release of each component is used.
+//!
+//! Each component is read from its own repository (`[updates.repos]`, e.g.
+//! the CLI from `TermoakSSH/core`), where only that component's tags count:
+//! other releases there (`ffi-vX.Y.Z`, a plain `vX.Y.Z`) are ignored. The
+//! components left out come from `[updates] github_repo`, the single
+//! repository of the old layout: there the old `vX.Y.Z` tags, which carried
+//! everything, count for desktop, server and CLI until each one has a newer
+//! release of its own. Each distinct repository is listed once per refresh,
+//! all of them at the same time, and the results are merged.
 //!
 //! - `GET /updates/latest.json`: the manifest of the latest desktop release,
 //!   with the download URLs rewritten to point to this server.
@@ -23,7 +30,8 @@
 //! version and SHA-256, not the URL, and the app checks both before
 //! installing.
 //!
-//! Disabled unless `[updates] github_repo` is configured.
+//! Disabled unless `[updates] github_repo` or `[updates.repos]` is
+//! configured.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -45,6 +53,8 @@ use crate::state::AppState;
 
 /// How long the latest release information is reused.
 const CACHE_FOR: Duration = Duration::from_secs(5 * 60);
+/// Same, when some repository could not be read (the rest is served).
+const PARTIAL_CACHE_FOR: Duration = Duration::from_secs(30);
 const MANIFEST: &str = "latest.json";
 
 pub fn routes() -> Router<AppState> {
@@ -58,9 +68,23 @@ pub fn routes() -> Router<AppState> {
 pub struct UpdateProxy {
     http: reqwest::Client,
     api: String,
-    repo: String,
+    /// Distinct repositories (`owner/repo`), each listed once per refresh.
+    repos: Vec<String>,
+    /// Where each component is published. Missing: not served.
+    sources: HashMap<Component, Source>,
     token: Option<String>,
+    /// Published releases and until when they are reused.
     cache: Mutex<Option<(Instant, Arc<Published>)>>,
+}
+
+/// The repository a component is read from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Source {
+    /// Index in `UpdateProxy::repos`.
+    repo: usize,
+    /// Whether the old `vX.Y.Z` tags (everything together) count: only in
+    /// the single repository of `github_repo`, not in a component's own one.
+    legacy: bool,
 }
 
 /// What is released separately, each with its own version and tag.
@@ -203,16 +227,63 @@ fn belongs(name: &str, component: Component, release: Option<Component>) -> bool
     }
 }
 
+/// `owner/repo`, trimmed; `None` (with a warning if it was not empty) when
+/// it is not valid.
+fn valid_repo(key: &str, repo: Option<&str>) -> Option<String> {
+    let r = repo?.trim();
+    let valid = r.split('/').count() == 2 && !r.starts_with('/') && !r.ends_with('/');
+    if !valid && !r.is_empty() {
+        tracing::warn!(repo = r, "updates.{key} must be owner/repository");
+    }
+    valid.then(|| r.to_string())
+}
+
+/// Repository of each component: its own one from `[updates.repos]` or,
+/// for the rest, `github_repo` (where the old `vX.Y.Z` tags count).
+fn plan(cfg: &UpdatesSection) -> (Vec<String>, HashMap<Component, Source>) {
+    let fallback = valid_repo("github_repo", cfg.github_repo.as_deref());
+    let mut repos: Vec<String> = Vec::new();
+    let mut sources = HashMap::new();
+    for c in Component::ALL {
+        let own = match c {
+            Component::Desktop => &cfg.repos.desktop,
+            Component::Server => &cfg.repos.server,
+            Component::Cli => &cfg.repos.cli,
+            Component::Android => &cfg.repos.android,
+            Component::Ios => &cfg.repos.ios,
+        };
+        let (repo, legacy) = match valid_repo(&format!("repos.{}", c.id()), own.as_deref()) {
+            Some(repo) => (repo, false),
+            None => match &fallback {
+                Some(repo) => (repo.clone(), true),
+                None => continue,
+            },
+        };
+        let index = match repos.iter().position(|r| *r == repo) {
+            Some(i) => i,
+            None => {
+                repos.push(repo);
+                repos.len() - 1
+            }
+        };
+        sources.insert(
+            c,
+            Source {
+                repo: index,
+                legacy,
+            },
+        );
+    }
+    (repos, sources)
+}
+
 impl UpdateProxy {
     /// Creates the proxy if the config enables it.
     pub fn from_config(cfg: &UpdatesSection) -> Option<Arc<Self>> {
-        let repo = cfg.github_repo.as_deref().map(str::trim).filter(|r| {
-            let valid = r.split('/').count() == 2 && !r.starts_with('/') && !r.ends_with('/');
-            if !valid && !r.is_empty() {
-                tracing::warn!(repo = r, "updates.github_repo must be owner/repository");
-            }
-            valid
-        })?;
+        let (repos, sources) = plan(cfg);
+        if sources.is_empty() {
+            return None;
+        }
         let token = std::env::var(&cfg.github_token_env)
             .ok()
             .map(|t| t.trim().to_string())
@@ -231,10 +302,16 @@ impl UpdateProxy {
         Some(Arc::new(Self {
             http,
             api: cfg.github_api.trim_end_matches('/').to_string(),
-            repo: repo.to_string(),
+            repos,
+            sources,
             token,
             cache: Mutex::new(None),
         }))
+    }
+
+    /// The repositories the releases are read from.
+    pub fn repos(&self) -> &[String] {
+        &self.repos
     }
 
     fn request(&self, url: &str, accept: &str) -> reqwest::RequestBuilder {
@@ -254,20 +331,63 @@ impl UpdateProxy {
     /// Published releases (cached).
     async fn published(&self) -> ApiResult<Arc<Published>> {
         let mut cache = self.cache.lock().await;
-        if let Some((at, published)) = cache.as_ref()
-            && at.elapsed() < CACHE_FOR
+        if let Some((until, published)) = cache.as_ref()
+            && Instant::now() < *until
         {
             return Ok(published.clone());
         }
-        let published = Arc::new(self.fetch_published().await?);
-        *cache = Some((Instant::now(), published.clone()));
+        let (published, complete) = self.fetch_published().await?;
+        let published = Arc::new(published);
+        let keep = if complete {
+            CACHE_FOR
+        } else {
+            PARTIAL_CACHE_FOR
+        };
+        *cache = Some((Instant::now() + keep, published.clone()));
         Ok(published)
     }
 
-    async fn fetch_published(&self) -> ApiResult<Published> {
-        // Newest first; 100 is more than enough to find the latest one of
-        // each component.
-        let url = format!("{}/repos/{}/releases?per_page=100", self.api, self.repo);
+    /// Releases of every repository, merged. `false` if some repository
+    /// could not be read (what the others publish is still served).
+    async fn fetch_published(&self) -> ApiResult<(Published, bool)> {
+        let lists =
+            futures::future::join_all(self.repos.iter().map(|repo| self.releases(repo))).await;
+        let mut releases = Vec::new();
+        let mut failed = None;
+        for (i, list) in lists.into_iter().enumerate() {
+            match list {
+                Ok(list) => releases.extend(list.into_iter().map(|r| (i, r))),
+                Err(e) => {
+                    tracing::warn!(repo = %self.repos[i], error = %e.message, "updates");
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        let published = choose(&releases, &self.sources);
+        if published.latest.is_empty() {
+            return Err(
+                failed.unwrap_or_else(|| ApiError::not_found("there is no published release"))
+            );
+        }
+        let manifest = match published.manifest_id {
+            Some(id) => self.manifest(id, &published.assets).await,
+            None => Err(ApiError::not_found("there is no published desktop version")),
+        };
+        Ok((
+            Published {
+                latest: published.latest,
+                manifest,
+                assets: published.assets,
+                older: published.older,
+            },
+            failed.is_none(),
+        ))
+    }
+
+    /// Releases of one repository, newest first.
+    async fn releases(&self, repo: &str) -> ApiResult<Vec<GhRelease>> {
+        // 100 is more than enough to find the latest one of each component.
+        let url = format!("{}/repos/{repo}/releases?per_page=100", self.api);
         let resp = self
             .request(&url, "application/vnd.github+json")
             .send()
@@ -276,34 +396,19 @@ impl UpdateProxy {
         match resp.status() {
             s if s.is_success() => {}
             StatusCode::NOT_FOUND => {
-                return Err(ApiError::not_found(
-                    "repository not found (or the token has no access)",
-                ));
+                return Err(ApiError::not_found(format!(
+                    "repository {repo} not found (or the token has no access)"
+                )));
             }
             s => {
                 return Err(upstream(format!(
-                    "GitHub answered {s} when listing the releases"
+                    "GitHub answered {s} when listing the releases of {repo}"
                 )));
             }
         }
-        let releases: Vec<GhRelease> = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| upstream(format!("invalid GitHub response: {e}")))?;
-        let published = choose(releases);
-        if published.latest.is_empty() {
-            return Err(ApiError::not_found("there is no published release"));
-        }
-        let manifest = match published.manifest_id {
-            Some(id) => self.manifest(id, &published.assets).await,
-            None => Err(ApiError::not_found("there is no published desktop version")),
-        };
-        Ok(Published {
-            latest: published.latest,
-            manifest,
-            assets: published.assets,
-            older: published.older,
-        })
+            .map_err(|e| upstream(format!("invalid GitHub response for {repo}: {e}")))
     }
 
     /// Downloads `latest.json` and checks that its files can be served.
@@ -313,7 +418,7 @@ impl UpdateProxy {
         assets: &HashMap<String, (GhAsset, Component)>,
     ) -> ApiResult<Value> {
         let manifest: Value = self
-            .asset(id)
+            .asset(Component::Desktop, id)
             .await?
             .json()
             .await
@@ -328,9 +433,15 @@ impl UpdateProxy {
         Ok(manifest)
     }
 
-    /// Downloads an asset (follows the GitHub redirect).
-    async fn asset(&self, id: u64) -> ApiResult<reqwest::Response> {
-        let url = format!("{}/repos/{}/releases/assets/{id}", self.api, self.repo);
+    /// Downloads an asset of a component's repository (follows the GitHub
+    /// redirect).
+    async fn asset(&self, component: Component, id: u64) -> ApiResult<reqwest::Response> {
+        let repo = self
+            .sources
+            .get(&component)
+            .map(|s| &self.repos[s.repo])
+            .ok_or_else(|| ApiError::not_found("that component is not served"))?;
+        let url = format!("{}/repos/{repo}/releases/assets/{id}", self.api);
         let resp = self
             .request(&url, "application/octet-stream")
             .send()
@@ -361,12 +472,33 @@ struct Choice {
     older: HashMap<String, String>,
 }
 
-/// Picks the newest release of each component (no drafts or
-/// pre-releases). At the same version, the component's own tag wins over an
-/// old `vX.Y.Z`.
-fn choose(releases: Vec<GhRelease>) -> Choice {
+/// Whether a release (tagged for `own`, `None` for an old `vX.Y.Z`) of
+/// repository `repo` is one of component `c`.
+fn counts_for(
+    sources: &HashMap<Component, Source>,
+    c: Component,
+    repo: usize,
+    own: Option<Component>,
+) -> bool {
+    let Some(source) = sources.get(&c) else {
+        return false;
+    };
+    source.repo == repo
+        && match own {
+            Some(o) => o == c,
+            // The old `vX.Y.Z` did not carry the mobile apps, and in a
+            // component's own repository it is not one of its releases.
+            None => source.legacy && !c.mobile(),
+        }
+}
+
+/// Picks the newest release of each component from its repository
+/// (`releases` carries the index of the repository of each one), with no
+/// drafts or pre-releases. At the same version, the component's own tag
+/// wins over an old `vX.Y.Z`.
+fn choose(releases: &[(usize, GhRelease)], sources: &HashMap<Component, Source>) -> Choice {
     let mut best: HashMap<Component, (semver::Version, bool, usize)> = HashMap::new();
-    for (i, r) in releases.iter().enumerate() {
+    for (i, (repo, r)) in releases.iter().enumerate() {
         if r.draft || r.prerelease {
             continue;
         }
@@ -374,8 +506,7 @@ fn choose(releases: Vec<GhRelease>) -> Choice {
             continue;
         };
         for c in Component::ALL {
-            // The old `vX.Y.Z` did not carry the mobile apps.
-            if own.map_or(c.mobile(), |o| o != c) {
+            if !counts_for(sources, c, *repo, own) {
                 continue;
             }
             let candidate = (version.clone(), own.is_some(), i);
@@ -397,7 +528,7 @@ fn choose(releases: Vec<GhRelease>) -> Choice {
         let Some((version, _, i)) = best.remove(&c) else {
             continue;
         };
-        let release = &releases[i];
+        let release = &releases[i].1;
         let own = parse_tag(&release.tag_name).and_then(|(own, _)| own);
         for a in &release.assets {
             if !belongs(&a.name, c, own) {
@@ -418,7 +549,7 @@ fn choose(releases: Vec<GhRelease>) -> Choice {
             },
         );
     }
-    let older = fill_missing_desktop_systems(&releases, &mut assets);
+    let older = fill_missing_desktop_systems(releases, sources, &mut assets);
     Choice {
         latest,
         manifest_id,
@@ -432,7 +563,8 @@ fn choose(releases: Vec<GhRelease>) -> Choice {
 /// `latest.json` does not change: automatic updates only go to the latest
 /// version.
 fn fill_missing_desktop_systems(
-    releases: &[GhRelease],
+    releases: &[(usize, GhRelease)],
+    sources: &HashMap<Component, Source>,
     assets: &mut HashMap<String, (GhAsset, Component)>,
 ) -> HashMap<String, String> {
     let desktop_file = |name: &str| matches!(classify(name).1, "app" | "update" | "app-archive");
@@ -443,10 +575,10 @@ fn fill_missing_desktop_systems(
         .collect();
     let mut candidates: Vec<(semver::Version, &GhRelease)> = releases
         .iter()
-        .filter(|r| !r.draft && !r.prerelease)
-        .filter_map(|r| match parse_tag(&r.tag_name) {
-            Some((None | Some(Component::Desktop), v)) => Some((v, r)),
-            _ => None,
+        .filter(|(_, r)| !r.draft && !r.prerelease)
+        .filter_map(|(repo, r)| {
+            let (own, v) = parse_tag(&r.tag_name)?;
+            counts_for(sources, Component::Desktop, *repo, own).then_some((v, r))
         })
         .collect();
     candidates.sort_by(|a, b| b.0.cmp(&a.0));
@@ -612,13 +744,11 @@ async fn downloads(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
 async fn download(State(st): State<AppState>, Path(name): Path<String>) -> ApiResult<Response> {
     let proxy = proxy(&st)?;
     let published = proxy.published().await?;
-    let id = published
+    let (asset, component) = published
         .assets
         .get(&name)
-        .ok_or_else(|| ApiError::not_found("that file is not part of the latest version"))?
-        .0
-        .id;
-    let resp = proxy.asset(id).await?;
+        .ok_or_else(|| ApiError::not_found("that file is not part of the latest version"))?;
+    let resp = proxy.asset(*component, asset.id).await?;
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -637,6 +767,27 @@ async fn download(State(st): State<AppState>, Path(name): Path<String>) -> ApiRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Everything from a single repository, the old layout (`github_repo`).
+    fn mono() -> HashMap<Component, Source> {
+        Component::ALL
+            .into_iter()
+            .map(|c| {
+                (
+                    c,
+                    Source {
+                        repo: 0,
+                        legacy: true,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn choose_mono(releases: Vec<GhRelease>) -> Choice {
+        let releases: Vec<_> = releases.into_iter().map(|r| (0, r)).collect();
+        choose(&releases, &mono())
+    }
 
     #[test]
     fn classifies_release_files() {
@@ -734,7 +885,7 @@ mod tests {
             release("v0.1.2", &legacy),
             release("desktop-v0.1.9", &["latest.json"]),
         ];
-        let choice = choose(releases);
+        let choice = choose_mono(releases);
         let tag = |c| choice.latest.get(&c).map(|x: &Chosen| x.tag.as_str());
         assert_eq!(tag(Component::Desktop), Some("desktop-v0.2.0"));
         assert_eq!(tag(Component::Server), Some("server-v0.3.0"));
@@ -764,7 +915,7 @@ mod tests {
 
     #[test]
     fn own_tag_wins_over_legacy_at_same_version() {
-        let choice = choose(vec![
+        let choice = choose_mono(vec![
             release("v0.2.0", &["latest.json"]),
             release("desktop-v0.2.0", &["x", "latest.json"]),
         ]);
@@ -776,7 +927,7 @@ mod tests {
     fn legacy_combined_archive_belongs_to_server() {
         // Always the same, even if HashMap iterates in another order.
         for _ in 0..20 {
-            let choice = choose(vec![release(
+            let choice = choose_mono(vec![release(
                 "v0.1.2",
                 &["latest.json", "termoak-v0.1.2-linux-x86_64.tar.gz"],
             )]);
@@ -790,7 +941,7 @@ mod tests {
 
     #[test]
     fn android_has_its_own_releases() {
-        let choice = choose(vec![
+        let choice = choose_mono(vec![
             release("android-v0.1.0", &["Termoak-android-v0.1.0.apk"]),
             release("v0.2.0", &["latest.json", "Termoak-linux-x86_64.AppImage"]),
         ]);
@@ -801,14 +952,14 @@ mod tests {
             Component::Android
         );
         // An old release alone gives no Android version.
-        let legacy = choose(vec![release("v0.2.0", &["latest.json"])]);
+        let legacy = choose_mono(vec![release("v0.2.0", &["latest.json"])]);
         assert!(!legacy.latest.contains_key(&Component::Android));
     }
 
     #[test]
     fn ios_has_its_own_releases() {
         assert_eq!(classify("Termoak-0.3.0-unsigned.ipa"), ("ios", "app"));
-        let choice = choose(vec![
+        let choice = choose_mono(vec![
             // Just created, still without the .ipa: its version already counts.
             release("ios-v0.3.1", &[]),
             release("ios-v0.3.0", &["Termoak-0.3.0-unsigned.ipa"]),
@@ -816,13 +967,13 @@ mod tests {
         ]);
         assert_eq!(choice.latest[&Component::Ios].tag, "ios-v0.3.1");
         assert!(!choice.assets.contains_key("Termoak-0.3.0-unsigned.ipa"));
-        let legacy = choose(vec![release("v0.2.0", &["latest.json"])]);
+        let legacy = choose_mono(vec![release("v0.2.0", &["latest.json"])]);
         assert!(!legacy.latest.contains_key(&Component::Ios));
     }
 
     #[test]
     fn missing_desktop_system_comes_from_an_older_release() {
-        let choice = choose(vec![
+        let choice = choose_mono(vec![
             release(
                 "desktop-v0.1.5",
                 &[
@@ -868,9 +1019,104 @@ mod tests {
 
     #[test]
     fn nothing_published() {
-        let choice = choose(vec![release("nightly", &["latest.json"])]);
+        let choice = choose_mono(vec![release("nightly", &["latest.json"])]);
         assert!(choice.latest.is_empty());
         assert!(choice.manifest_id.is_none());
+    }
+
+    #[test]
+    fn plans_one_repository_per_component() {
+        let mut cfg = UpdatesSection::default();
+        assert!(plan(&cfg).1.is_empty(), "disabled by default");
+        cfg.repos.desktop = Some("TermoakSSH/desktop".into());
+        cfg.repos.cli = Some(" TermoakSSH/core ".into());
+        cfg.repos.ios = Some("not-a-repo".into());
+        let (repos, sources) = plan(&cfg);
+        assert_eq!(repos, vec!["TermoakSSH/desktop", "TermoakSSH/core"]);
+        assert_eq!(
+            sources[&Component::Cli],
+            Source {
+                repo: 1,
+                legacy: false
+            }
+        );
+        // No fallback: the rest is not served.
+        assert_eq!(sources.len(), 2);
+        cfg.github_repo = Some("o/r".into());
+        let (repos, sources) = plan(&cfg);
+        assert_eq!(repos, vec!["TermoakSSH/desktop", "o/r", "TermoakSSH/core"]);
+        assert_eq!(sources.len(), 5);
+        assert_eq!(
+            sources[&Component::Server],
+            Source {
+                repo: 1,
+                legacy: true
+            }
+        );
+        // An invalid repository falls back to github_repo.
+        assert_eq!(sources[&Component::Ios].repo, 1);
+    }
+
+    #[test]
+    fn own_repository_counts_only_own_tags() {
+        let sources: HashMap<Component, Source> = [
+            (
+                Component::Desktop,
+                Source {
+                    repo: 0,
+                    legacy: false,
+                },
+            ),
+            (
+                Component::Cli,
+                Source {
+                    repo: 1,
+                    legacy: false,
+                },
+            ),
+        ]
+        .into();
+        let releases = vec![
+            (
+                0,
+                release(
+                    "desktop-v0.3.0",
+                    &["latest.json", "Termoak-linux-x86_64.AppImage"],
+                ),
+            ),
+            // Older layout leftovers in the desktop repository: ignored.
+            (
+                0,
+                release("v0.9.0", &["latest.json", "Termoak-windows-x86_64.exe"]),
+            ),
+            (1, release("ffi-v0.9.0", &["termoak-ffi-v0.9.0.zip"])),
+            (
+                1,
+                release("v0.9.0", &["termoak-v0.9.0-linux-x86_64.tar.gz"]),
+            ),
+            (
+                1,
+                release("cli-v0.2.1", &["termoak-cli-v0.2.1-linux-x86_64.tar.gz"]),
+            ),
+            // A desktop tag in the CLI repository is not the desktop's.
+            (1, release("desktop-v9.0.0", &["latest.json"])),
+        ];
+        let choice = choose(&releases, &sources);
+        assert_eq!(choice.latest.len(), 2);
+        assert_eq!(choice.latest[&Component::Desktop].tag, "desktop-v0.3.0");
+        assert_eq!(choice.latest[&Component::Cli].tag, "cli-v0.2.1");
+        assert_eq!(choice.manifest_id, Some(0));
+        let mut names: Vec<_> = choice.assets.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "Termoak-linux-x86_64.AppImage",
+                "latest.json",
+                "termoak-cli-v0.2.1-linux-x86_64.tar.gz"
+            ]
+        );
+        assert!(choice.older.is_empty(), "no Windows from v0.9.0");
     }
 
     #[test]

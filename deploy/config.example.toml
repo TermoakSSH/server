@@ -81,11 +81,23 @@ mcp_user_mode = "read_only"
 # list_models = true
 # subscription = true
 
-# Desktop updates from GitHub releases. Needed when the repository is private:
-# the app downloads them from /updates/latest.json on this server. The
-# (read-only) token goes in the TERMOAK_GITHUB_TOKEN variable.
+# Updates and downloads from GitHub releases. Needed when the repositories are
+# private: the desktop app updates from /updates/latest.json on this server
+# and the web lists the downloads at /api/v1/downloads. The (read-only) token
+# goes in the TERMOAK_GITHUB_TOKEN variable and must have access to every
+# repository below.
 # [updates]
+# One repository with every component (desktop-vX.Y.Z, server-vX.Y.Z...);
+# also used for the components missing from [updates.repos]:
 # github_repo = "owner/repo"
+#
+# Or one repository per component (only that component's tags count there):
+# [updates.repos]
+# desktop = "TermoakSSH/desktop"
+# server = "TermoakSSH/server"
+# cli = "TermoakSSH/core"
+# android = "TermoakSSH/mobile-android"
+# ios = "TermoakSSH/mobile-ios"
 
 # Web app at /: the basic one built into the server (sign-in, sessions, teams
 # and account), or your own front-end with `dir`.
