@@ -14,7 +14,10 @@ mobile. A single binary that keeps everything in SQLite and adds to the apps:
 - **Background AI** with approvals from your phone, multi-provider, and an
   MCP server for external agents.
 - **A basic web app** (`web/`, built into the binary): sign-in, sessions with
-  a terminal in the browser, teams and account settings.
+  a terminal in the browser, teams and account settings. It is not indexed by
+  search engines (`/robots.txt` disallows everything); a custom front-end in
+  `[web] dir` can ship its own robots.txt, sitemap, favicons, `.well-known/`
+  files and prerendered pages (see [DEPLOYMENT.md](docs/DEPLOYMENT.md#web-app)).
 - **Push notifications** (APNs and FCM), **email** and **update downloads**
   for the apps.
 

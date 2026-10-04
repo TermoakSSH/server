@@ -130,11 +130,33 @@ as the other apps. Disable it with `[web] enabled = false`.
 Administration is not part of the web app: use the desktop app, the CLI
 (`termoak admin`) or `/api/v1/admin/*`.
 
+The basic web app also answers `/robots.txt` with `Disallow: /`: a
+self-hosted server is not meant to show up in search engines. To allow it,
+serve your own front-end (below) with its own `robots.txt`.
+
 To serve your own front-end instead, point `[web] dir` to its directory: it
 needs an `index.html`, every other file is served under `/assets/`, and every
 `GET` outside the API returns `index.html`. termoak.com serves this way the
 [public website](https://github.com/TermoakSSH/public-web) together with its full web app.
 `TERMOAK_WEB_DIR=<dir>` does the same while developing, without caching.
+
+A front-end directory can also have:
+
+| File in the directory | Served at |
+|---|---|
+| `robots.txt`, `sitemap.xml`, `favicon.ico`, `favicon.svg`, `apple-touch-icon.png`, `apple-touch-icon-precomposed.png`, `site.webmanifest`, `manifest.webmanifest` | The same name at the root (`/robots.txt`...) |
+| `.well-known/<file>` (`security.txt`, `org.flathub.VerifiedApps.txt`...) | `/.well-known/<file>` |
+| `prerendered/<path>.html` or `prerendered/<path>/index.html` | `GET /<path>` instead of `index.html` (`prerendered/index.html` for `/`) |
+
+The root files are only served if they exist (otherwise 404), with an ETag
+and `Cache-Control: public, max-age=3600` (a day for the icons). Prerendered
+pages are static HTML of the front-end's pages, generated when it is built,
+so search engines and link previews get the content without running
+JavaScript; like `index.html`, they get `{{VERSION}}` replaced and
+`Cache-Control: no-cache`. Only plain path segments (letters, digits, `-`,
+`_` and `.`, not starting with a dot) are looked up, never outside the
+directory. Everything carries the same security headers as the rest of the
+web (strict CSP, `nosniff`, `no-referrer`, no frames).
 
 For an open server:
 

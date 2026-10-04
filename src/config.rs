@@ -343,7 +343,10 @@ pub struct WebSection {
     /// Serve the web from this directory instead of the basic web app built
     /// into the server (e.g. your own front-end). It needs an `index.html`;
     /// any other file is served under `/assets/`, and every `GET` that is not
-    /// an API route returns `index.html` so the front-end can do its routing.
+    /// an API route returns `index.html` so the front-end can do its routing
+    /// (or `prerendered/<path>.html` when it exists). `robots.txt`,
+    /// `sitemap.xml`, the favicons, the manifest and `.well-known/` are also
+    /// served at the root.
     pub dir: Option<PathBuf>,
     /// Contact email shown on the website.
     pub support_email: Option<String>,
@@ -602,7 +605,9 @@ mcp_user_mode = "read_only"
 [web]
 enabled = true
 # Serve your own front-end from a directory instead of the built-in basic web
-# app (needs an index.html; other files are served under /assets/).
+# app (needs an index.html; other files are served under /assets/, robots.txt,
+# sitemap.xml, the favicons and .well-known/ also at the root, and
+# prerendered/<path>.html for /<path> if it exists).
 # dir = "/var/lib/termoak/web"
 # support_email = "support@example.com"
 # Terms of use and privacy policy: the web sign-up asks to accept them and the

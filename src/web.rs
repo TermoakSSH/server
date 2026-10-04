@@ -9,10 +9,21 @@
 //!
 //! Security: strict CSP (own resources only, no inline scripts),
 //! `Referrer-Policy: no-referrer` (email links carry tokens) and no frames.
+//!
+//! Besides `/assets/`, a few well-known files are served at the root when the
+//! web has them: `/robots.txt`, `/sitemap.xml`, the favicons, the web app
+//! manifest and `/.well-known/*` (see [`ROOT_FILES`]). The embedded web only
+//! has a `robots.txt` that disallows everything: a self-hosted server is not
+//! indexed by search engines by default.
+//!
+//! A front-end served from a directory may also ship prerendered pages:
+//! `prerendered/<path>.html` (or `prerendered/<path>/index.html`) is served
+//! for `GET /<path>` instead of `index.html`, so search engines and visitors
+//! get the content in the HTML before the JavaScript runs.
 
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
@@ -41,17 +52,39 @@ const PAGES: &[&str] = &[
     "/app/{*rest}",
 ];
 
+/// Well-known files served at the root of the site (from the root of the web
+/// directory, or of the embedded web) when they exist, besides
+/// `/.well-known/*`.
+const ROOT_FILES: &[&str] = &[
+    "robots.txt",
+    "sitemap.xml",
+    "favicon.ico",
+    "favicon.svg",
+    "apple-touch-icon.png",
+    "apple-touch-icon-precomposed.png",
+    "site.webmanifest",
+    "manifest.webmanifest",
+];
+
+/// Folder of the prerendered pages inside the web directory.
+const PRERENDERED: &str = "prerendered";
+
 pub fn routes(state: &AppState) -> Router<AppState> {
     if !state.config.web.enabled {
         return Router::new();
     }
-    let mut r = Router::new().route("/assets/{*file}", get(asset));
+    let mut r = Router::new()
+        .route("/assets/{*file}", get(asset))
+        .route("/.well-known/{*file}", get(well_known));
+    for name in ROOT_FILES {
+        r = r.route(&format!("/{name}"), get(root_file));
+    }
     for p in PAGES {
         r = r.route(p, get(index));
     }
-    if state.config.web.dir.is_some() {
+    if state.config.web.dir.is_some() || std::env::var_os("TERMOAK_WEB_DIR").is_some() {
         // A custom front-end has its own pages: every other GET outside the
-        // API gets its index.html.
+        // API gets its index.html (or its prerendered page).
         r = r.fallback(custom_page);
     }
     r
@@ -91,7 +124,8 @@ fn embedded(name: &str) -> Option<(&'static str, &'static str, &'static [u8])> {
 }
 
 fn mime_of(name: &str) -> &'static str {
-    match name.rsplit('.').next().unwrap_or("") {
+    let file_name = name.rsplit('/').next().unwrap_or(name);
+    match file_name.rsplit('.').next().unwrap_or("") {
         "html" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
@@ -102,8 +136,21 @@ fn mime_of(name: &str) -> &'static str {
         "webp" => "image/webp",
         "woff2" => "font/woff2",
         "txt" => "text/plain; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        "webmanifest" => "application/manifest+json",
+        "apple-app-site-association" => "application/json",
         _ => "application/octet-stream",
     }
+}
+
+/// Is `name` a safe relative path inside the web? (no empty, `.` or `..`
+/// segments, no backslashes or NUL).
+fn safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .split('/')
+            .any(|p| p.is_empty() || p == "." || p == "..")
+        && !name.contains(['\\', '\0'])
 }
 
 /// A file of the web: MIME type, ETag and content.
@@ -114,14 +161,14 @@ fn file(
     match src {
         Source::Embedded => embedded(name).map(|(m, e, b)| (m, e.to_string(), b.into())),
         Source::Dir { path, dev } => {
-            if name
-                .split('/')
-                .any(|p| p.is_empty() || p == "." || p == "..")
-                || name.contains('\\')
-            {
+            if !safe_name(name) {
                 return None;
             }
-            let body = std::fs::read(path.join(name)).ok()?;
+            let full = path.join(name);
+            if !full.is_file() {
+                return None;
+            }
+            let body = std::fs::read(full).ok()?;
             let etag = if *dev {
                 "\"dev\"".to_string()
             } else {
@@ -213,10 +260,49 @@ fn secure(mut headers: HeaderMap) -> HeaderMap {
     headers
 }
 
-async fn index(State(st): State<AppState>) -> Response {
-    let Some((mime, _, body)) = file(&source(&st), "index.html") else {
+/// The prerendered page for a request path, if the web directory has one:
+/// `/` → `prerendered/index.html`, `/es/pricing/` →
+/// `prerendered/es/pricing.html` or `prerendered/es/pricing/index.html`.
+/// Only plain path segments (letters, digits, `-`, `_` and `.`, not starting
+/// with a dot) are looked up.
+fn prerendered(src: &Source, path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
+    let Source::Dir { .. } = src else {
+        return None;
+    };
+    let rel = path.strip_prefix('/')?;
+    let rel = rel.strip_suffix('/').unwrap_or(rel);
+    if rel.is_empty() {
+        return file(src, &format!("{PRERENDERED}/index.html")).map(|(_, _, b)| b);
+    }
+    let plain = rel.split('/').all(|seg| {
+        !seg.is_empty()
+            && !seg.starts_with('.')
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    });
+    if !plain {
+        return None;
+    }
+    [
+        format!("{PRERENDERED}/{rel}.html"),
+        format!("{PRERENDERED}/{rel}/index.html"),
+    ]
+    .iter()
+    .find_map(|name| file(src, name))
+    .map(|(_, _, b)| b)
+}
+
+/// The page for a path: its prerendered HTML if there is one, else
+/// `index.html` (the front-end renders it).
+async fn index(State(st): State<AppState>, uri: Uri) -> Response {
+    let src = source(&st);
+    let page =
+        prerendered(&src, uri.path()).or_else(|| file(&src, "index.html").map(|(_, _, b)| b));
+    let Some(body) = page else {
         return (StatusCode::NOT_FOUND, "web not available").into_response();
     };
+    let mime = "text/html; charset=utf-8";
     // The version in the asset URLs invalidates the cache on upgrades.
     let html = String::from_utf8_lossy(&body).replace("{{VERSION}}", env!("CARGO_PKG_VERSION"));
     let mut headers = HeaderMap::new();
@@ -233,7 +319,8 @@ async fn asset(
     req_headers: HeaderMap,
 ) -> Response {
     let src = source(&st);
-    if name == "index.html" {
+    // Pages are served at their own paths (with the version filled in).
+    if name == "index.html" || name.starts_with(&format!("{PRERENDERED}/")) {
         return StatusCode::NOT_FOUND.into_response();
     }
     if name == LOCALES_INDEX {
@@ -267,19 +354,62 @@ async fn asset(
 
 /// Fallback with a custom front-end (`[web] dir`): its pages for any `GET`
 /// outside the API, a plain 404 otherwise.
-async fn custom_page(
-    State(st): State<AppState>,
-    method: axum::http::Method,
-    uri: axum::http::Uri,
-) -> Response {
+async fn custom_page(State(st): State<AppState>, method: Method, uri: Uri) -> Response {
     let path = uri.path();
     let api = ["/api/", "/assets/", "/healthz"]
         .iter()
         .any(|p| path.starts_with(p));
-    if method != axum::http::Method::GET || api {
+    if !(method == Method::GET || method == Method::HEAD) || api {
         return StatusCode::NOT_FOUND.into_response();
     }
-    index(State(st)).await
+    index(State(st), uri).await
+}
+
+/// `/robots.txt`, `/favicon.ico`... from the root of the web (404 if it does
+/// not have the file).
+async fn root_file(State(st): State<AppState>, uri: Uri, req_headers: HeaderMap) -> Response {
+    let name = uri.path().trim_start_matches('/');
+    static_file(&source(&st), name, &req_headers)
+}
+
+/// `/.well-known/<file>` from the web's `.well-known/` folder.
+async fn well_known(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    req_headers: HeaderMap,
+) -> Response {
+    static_file(&source(&st), &format!(".well-known/{name}"), &req_headers)
+}
+
+/// A file served at the root: ETag and a short public cache (an hour; a day
+/// for the icons), none while developing (`TERMOAK_WEB_DIR`).
+fn static_file(src: &Source, name: &str, req_headers: &HeaderMap) -> Response {
+    let Some((mime, etag, body)) = file(src, name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let dev = matches!(src, Source::Dir { dev: true, .. });
+    let cache = if dev {
+        "no-cache"
+    } else if mime.starts_with("image/") {
+        "public, max-age=86400"
+    } else {
+        "public, max-age=3600"
+    };
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(&etag) {
+        headers.insert(header::ETAG, v);
+    }
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    let fresh = !dev
+        && req_headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
+    if fresh {
+        return (StatusCode::NOT_MODIFIED, secure(headers)).into_response();
+    }
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    (secure(headers), body.into_owned()).into_response()
 }
 
 #[cfg(test)]
@@ -297,6 +427,69 @@ mod tests {
         assert!(etag.starts_with('"') && etag.len() == 18);
         assert!(embedded("../Cargo.toml").is_none());
         assert_eq!(mime_of("app.js"), "text/javascript; charset=utf-8");
+    }
+
+    #[test]
+    fn root_file_types() {
+        assert_eq!(mime_of("sitemap.xml"), "application/xml; charset=utf-8");
+        assert_eq!(mime_of("site.webmanifest"), "application/manifest+json");
+        assert_eq!(
+            mime_of(".well-known/security.txt"),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            mime_of(".well-known/apple-app-site-association"),
+            "application/json"
+        );
+        assert_eq!(mime_of(".well-known/other"), "application/octet-stream");
+        assert!(safe_name(".well-known/security.txt"));
+        for bad in ["", "../x", "a//b", "a/./b", "a\\b", "a\0b", "/etc/passwd"] {
+            assert!(!safe_name(bad), "{bad}");
+        }
+        let (mime, _, body) = embedded("robots.txt").unwrap();
+        assert_eq!(mime, "text/plain; charset=utf-8");
+        assert!(String::from_utf8_lossy(body).contains("Disallow: /\n"));
+    }
+
+    #[test]
+    fn prerendered_pages_are_looked_up_safely() {
+        let dir = std::env::temp_dir().join(format!("termoak-web-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for name in [
+            "index.html",
+            "pricing.html",
+            "es/index.html",
+            "es/pricing.html",
+        ] {
+            let path = dir.join(PRERENDERED).join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, name).unwrap();
+        }
+        let src = Source::Dir {
+            path: dir.clone(),
+            dev: true,
+        };
+        let page = |p: &str| prerendered(&src, p).map(|b| String::from_utf8_lossy(&b).to_string());
+        assert_eq!(page("/").as_deref(), Some("index.html"));
+        assert_eq!(page("/pricing").as_deref(), Some("pricing.html"));
+        assert_eq!(page("/pricing/").as_deref(), Some("pricing.html"));
+        assert_eq!(page("/es").as_deref(), Some("es/index.html"));
+        assert_eq!(page("/es/").as_deref(), Some("es/index.html"));
+        assert_eq!(page("/es/pricing").as_deref(), Some("es/pricing.html"));
+        for p in [
+            "/login",
+            "/es/..",
+            "/es/../pricing",
+            "/es//pricing",
+            "/%2e%2e/x",
+            "/.x",
+            "/es\\pricing",
+            "/pricing//",
+        ] {
+            assert_eq!(page(p), None, "{p}");
+        }
+        assert!(prerendered(&Source::Embedded, "/").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

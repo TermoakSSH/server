@@ -1,0 +1,5 @@
+# The basic web app built into termoak-server. A self-hosted server is not
+# meant to be indexed by search engines: serve your own robots.txt from a
+# web directory ([web] dir) to change this.
+User-agent: *
+Disallow: /

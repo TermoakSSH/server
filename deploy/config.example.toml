@@ -104,7 +104,9 @@ mcp_user_mode = "read_only"
 [web]
 enabled = true
 # Serve your own front-end from a directory instead of the built-in basic web
-# app (needs an index.html; other files are served under /assets/).
+# app (needs an index.html; other files are served under /assets/, robots.txt,
+# sitemap.xml, the favicons and .well-known/ also at the root, and
+# prerendered/<path>.html for /<path> if it exists).
 # dir = "/var/lib/termoak/web"
 # support_email = "support@example.com"
 # Terms of use and privacy policy: the web sign-up asks to accept them and the
