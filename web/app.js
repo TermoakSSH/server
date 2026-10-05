@@ -17,8 +17,11 @@ import { applyTheme } from './js/theme.js';
 import { toast, loadingState, emptyState, capitalize } from './js/ui.js';
 import { icon } from './js/icons.js';
 import { t, errorText, initI18n, setLanguage, onLanguageChange, savedLanguage, matchLanguage, getLanguage } from './js/i18n.js';
+import { startNotices } from './js/notify.js';
 
 applyTheme();
+// Notices of your sessions (join and keyboard requests...) on any page.
+startNotices();
 
 const page = (file, name = 'render') => ({ load: () => import(`./js/pages/${file}`), export: name });
 
