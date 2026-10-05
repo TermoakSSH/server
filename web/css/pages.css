@@ -477,6 +477,39 @@
   }
 }
 
+/* --- Timed control: countdown and how long to give it -------------------- */
+
+.term-countdown {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.term-note .term-countdown {
+  font-weight: 600;
+}
+
+.term-driver-sep {
+  opacity: 0.6;
+}
+
+.term-grant-options {
+  display: grid;
+  gap: 8px;
+}
+
+.term-grant-option {
+  justify-content: flex-start;
+  width: 100%;
+}
+
+.share-limit {
+  max-width: 300px;
+  padding-left: 26px;
+}
+
 /* --- Notices of your sessions (toasts with an action) ----------------------- */
 
 .toast-notice {

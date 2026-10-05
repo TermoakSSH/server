@@ -49,6 +49,23 @@ function expiryOptions() {
   ];
 }
 
+// Most minutes an automatic grant of the keyboard lasts (`control_minutes`,
+// 1-240 on the server; '' is no limit).
+const CONTROL_LIMITS = [5, 15, 30, 60, 120];
+
+/** Select "Limit automatic control to" (with the share's current value). */
+function controlLimitField(current, small = false) {
+  const values = current && !CONTROL_LIMITS.includes(current) ? [...CONTROL_LIMITS, current].sort((a, b) => a - b) : CONTROL_LIMITS;
+  return field({
+    label: t('sessions.share.option.control_limit'),
+    name: 'control_minutes',
+    small,
+    options: [{ value: '', label: t('sessions.share.control_limit.none') },
+      ...values.map((m) => ({ value: String(m), label: t('sessions.share.control_limit.minutes', { count: m }) }))],
+    value: current ? String(current) : '',
+  });
+}
+
 function kindLabel(kind) {
   return kind === 'relay' ? t('sessions.kind.relay') : t('sessions.kind.server');
 }
@@ -104,6 +121,7 @@ export function shareDialog(session, { onChange } = {}) {
       ],
       onChange: (v) => {
         eAuto.input.disabled = v !== 'control';
+        eLimit.input.disabled = v !== 'control' || !eAuto.input.checked;
       },
     });
     const eExpiry = field({
@@ -117,6 +135,11 @@ export function shareDialog(session, { onChange } = {}) {
     const eApproval = checkbox({ label: t('sessions.share.option.approval'), checked: !!s.require_approval });
     const eAuto = checkbox({ label: t('sessions.share.option.auto_grant'), checked: !!s.auto_grant });
     eAuto.input.disabled = s.permission !== 'control';
+    const eLimit = controlLimitField(s.control_minutes, true);
+    eLimit.input.disabled = s.permission !== 'control' || !s.auto_grant;
+    eAuto.input.addEventListener('change', () => {
+      eLimit.input.disabled = ePerm.value !== 'control' || !eAuto.input.checked;
+    });
     const save = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, icon('check', { size: 14 }), t('common.save'));
     const cancel = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => { editing = null; loadShares(); } }, t('common.cancel'));
     save.addEventListener('click', () => busy(save, async () => {
@@ -126,6 +149,9 @@ export function shareDialog(session, { onChange } = {}) {
         require_approval: eApproval.input.checked,
         auto_grant: ePerm.value === 'control' && eAuto.input.checked,
       };
+      const limit = eLimit.input.value;
+      if (body.auto_grant && limit) body.control_minutes = Number(limit);
+      else if (s.control_minutes) body.no_control_limit = true;
       const ex = eExpiry.input.value;
       if (ex === 'none') body.no_expiry = true;
       else if (ex !== 'keep') body.expires_in_minutes = Number(ex);
@@ -144,7 +170,7 @@ export function shareDialog(session, { onChange } = {}) {
       h('div', { class: 'form-row' },
         h('div', { class: 'field' }, h('span', { class: 'label' }, t('sessions.share.permission')), ePerm),
         eExpiry),
-      h('div', { class: 'share-options' }, eApproval, eAuto),
+      h('div', { class: 'share-options' }, eApproval, eAuto, h('div', { class: 'share-limit' }, eLimit)),
       h('div', { class: 'row-wrap' }, save, cancel));
   };
 
@@ -214,7 +240,9 @@ export function shareDialog(session, { onChange } = {}) {
                 h('div', { class: 'list-item-title' }, h('span', { class: 'break' }, d.text),
                   badge(permissionLabel(s.permission), s.permission === 'control' ? 'warn' : 'info', s.permission === 'control' ? 'keyboard' : 'eye'),
                   s.require_approval ? badge(t('sessions.share.badge.approval'), '', 'lock') : null,
-                  s.permission === 'control' && s.auto_grant ? badge(t('sessions.share.badge.auto_grant'), '', 'keyboard') : null),
+                  s.permission === 'control' && s.auto_grant
+                    ? badge(s.control_minutes ? t('sessions.share.badge.auto_grant_for', { count: s.control_minutes }) : t('sessions.share.badge.auto_grant'), '', 'keyboard')
+                    : null),
                 h('div', { class: 'list-item-meta' },
                   h('span', null, tx('sessions.share.created', { time: timeEl(s.created_at) })),
                   h('span', { title: s.expires_at ? absTime(s.expires_at) : null }, s.expires_at ? t('sessions.share.expires', { time: relTime(s.expires_at) }) : t('sessions.share.no_expiry')),
@@ -242,6 +270,11 @@ export function shareDialog(session, { onChange } = {}) {
   });
   const autoGrant = checkbox({ label: t('sessions.share.option.auto_grant'), checked: false });
   autoGrant.input.disabled = true;
+  const controlLimit = controlLimitField(null);
+  controlLimit.input.disabled = true;
+  autoGrant.input.addEventListener('change', () => {
+    controlLimit.input.disabled = !autoGrant.input.checked;
+  });
   const target = segmented({
     name: `target-${session.id}`,
     label: t('sessions.share.with_whom'),
@@ -267,6 +300,7 @@ export function shareDialog(session, { onChange } = {}) {
     onChange: (v) => {
       autoGrant.input.disabled = v !== 'control';
       if (v !== 'control') autoGrant.input.checked = false;
+      controlLimit.input.disabled = !autoGrant.input.checked;
     },
   });
   const expiry = field({ label: t('sessions.share.expiry'), name: 'expiry', options: expiryOptions(), value: '' });
@@ -279,7 +313,7 @@ export function shareDialog(session, { onChange } = {}) {
       h('div', { class: 'field' }, h('span', { class: 'label' }, t('sessions.share.permission')), perm,
         h('div', { class: 'hint' }, t('sessions.share.permission_hint'))),
       expiry),
-    h('div', { class: 'share-options' }, approval, autoGrant),
+    h('div', { class: 'share-options' }, approval, autoGrant, h('div', { class: 'share-limit' }, controlLimit)),
     h('div', null, submit));
 
   form.addEventListener('submit', (e) => {
@@ -293,6 +327,7 @@ export function shareDialog(session, { onChange } = {}) {
     };
     const minutes = expiry.input.value;
     if (minutes) body.expires_in_minutes = Number(minutes);
+    if (body.auto_grant && controlLimit.input.value) body.control_minutes = Number(controlLimit.input.value);
     let label = t('sessions.share.anyone_with_link');
     if (kind === 'user') {
       const v = email.input.value.trim();

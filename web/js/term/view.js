@@ -11,7 +11,9 @@
 //   `control_deny`/`control_take`, `kick` and `stop_sharing`).
 //
 // One person drives at a time: the owner always can, everyone else watches
-// until the owner hands them the keyboard. The terminal size is the
+// until the owner hands them the keyboard, for good or for a while (timed
+// grants: `control_grant` with `minutes`, `until` in `control`,
+// `control_expired` when the time is up). The terminal size is the
 // session's (everyone shares it); whoever can write has a button to fit it to
 // their window.
 
@@ -21,7 +23,7 @@ import { FitAddon } from '../../vendor/xterm/addon-fit.mjs';
 import { h, replace } from '../dom.js';
 import { icon } from '../icons.js';
 import { api, freshAccessToken } from '../api.js';
-import { permissionLabel, relTime } from '../format.js';
+import { permissionLabel, relTime, absTime } from '../format.js';
 import { badge, avatar, toast, confirmDialog, openDialog, field, capitalize } from '../ui.js';
 import { t, errorText } from '../i18n.js';
 import { stateBadge } from '../pages/app/shared.js';
@@ -69,6 +71,19 @@ const END_CODES = {
 };
 const END_BY_CLOSE = Object.fromEntries(Object.entries(END_CODES).map(([k, v]) => [v, k]));
 
+// How long the owner can hand the keyboard over (minutes; `null`: until they
+// take it back). The server accepts 1 to 240.
+const GRANT_MINUTES = [null, 5, 15, 30, 60];
+
+/** "4:59" or "1:02:03": time left until `until` (ms). */
+function clock(until) {
+  const secs = Math.max(0, Math.ceil((until - Date.now()) / 1000));
+  const hours = Math.floor(secs / 3600);
+  const pad = (n) => String(n).padStart(2, '0');
+  const mins = Math.floor((secs % 3600) / 60);
+  return hours ? `${hours}:${pad(mins)}:${pad(secs % 60)}` : `${mins}:${pad(secs % 60)}`;
+}
+
 /** Label of a participant kind (owner, user, guest). */
 function kindLabel(kind) {
   return t(`terminal.kind.${kind === 'owner' || kind === 'guest' ? kind : 'user'}`);
@@ -100,6 +115,10 @@ export function mountTerminal(opts) {
   let participants = [];
   let driver = null;
   let driverName = null;
+  let driverUntil = null;
+  let tickTimer = null;
+  let revokeToast = null;
+  let grantDlg = null;
   let panelOpen = false;
   let expectSnapshot = true;
   let finished = false;
@@ -182,6 +201,46 @@ export function mountTerminal(opts) {
     return p ? p.name : null;
   };
   const present = () => participants.filter((p) => !p.waiting);
+
+  // Timed grant: "4:59 left", kept up to date every second.
+  const countdown = () => (driverUntil
+    ? h('span', { class: 'term-countdown', dataset: { countdown: '' }, title: t('terminal.grant.until', { time: absTime(driverUntil) }) },
+      icon('clock', { size: 13 }), h('span', null, t('terminal.grant.left', { time: clock(driverUntil) })))
+    : null);
+  const tick = () => {
+    if (!driverUntil) {
+      clearInterval(tickTimer);
+      tickTimer = null;
+      return;
+    }
+    const text = t('terminal.grant.left', { time: clock(driverUntil) });
+    for (const el of root.querySelectorAll('[data-countdown] > span')) el.textContent = text;
+  };
+  const startTicking = () => {
+    if (driverUntil && !tickTimer) tickTimer = setInterval(tick, 1000);
+    if (!driverUntil) tick();
+  };
+
+  // Owner: hand the keyboard over, for good or for a while.
+  const grant = (pid, minutes) => send(minutes ? { type: 'control_grant', participant: pid, minutes } : { type: 'control_grant', participant: pid });
+  const chooseGrant = (p) => {
+    if (grantDlg) grantDlg.close('cancel');
+    const again = driver === p.id;
+    const pick = (m) => h('button', { class: ['btn', 'term-grant-option', !m && 'btn-primary'], type: 'button', onclick: () => { dlg.close('done'); grant(p.id, m); } },
+      icon(m ? 'clock' : 'keyboard', { size: 15 }),
+      m ? t('terminal.grant.minutes', { count: m }) : t('terminal.grant.forever'));
+    const dlg = openDialog({
+      title: again ? t('terminal.grant.change_title', { name: p.name }) : t('terminal.grant.title', { name: p.name }),
+      description: t('terminal.grant.description'),
+      iconName: 'keyboard',
+      body: h('div', { class: 'term-grant-options' }, GRANT_MINUTES.map(pick)),
+      actions: [h('button', { class: 'btn', type: 'button', onclick: () => dlg.close('cancel') }, t('common.cancel'))],
+      onClose: () => {
+        if (grantDlg === dlg) grantDlg = null;
+      },
+    });
+    grantDlg = dlg;
+  };
   const others = () => present().filter((p) => !p.you);
 
   const renderPeopleButton = () => {
@@ -204,7 +263,8 @@ export function mountTerminal(opts) {
     replace(accessSlot, isOwner() ? badge(permissionLabel('owner'), 'accent', 'crown') : badge(permissionLabel(access), access === 'control' ? 'warn' : 'info', access === 'control' ? 'keyboard' : 'eye'));
     // Who drives: shown when someone other than the owner has the keyboard.
     replace(driverSlot, proto2 && driver
-      ? h('span', { class: 'badge badge-warn term-driver', title: t('terminal.control.driver_title') }, icon('keyboard', { size: 13 }), me && driver === me.participant ? t('terminal.control.you_drive') : t('terminal.control.driving', { name: driverName || nameOf(driver) || '?' }))
+      ? h('span', { class: 'badge badge-warn term-driver', title: t('terminal.control.driver_title') }, icon('keyboard', { size: 13 }), me && driver === me.participant ? t('terminal.control.you_drive') : t('terminal.control.driving', { name: driverName || nameOf(driver) || '?' }),
+        driverUntil ? h('span', { class: 'term-driver-sep', 'aria-hidden': 'true' }, '·') : null, countdown())
       : null);
     fitBtn.hidden = !canWrite();
     closeBtn.hidden = !isOwner() || !opts.sessionId;
@@ -230,12 +290,12 @@ export function mountTerminal(opts) {
     let kind = '';
     if (isOwner()) {
       parts = driver
-        ? [icon('keyboard', { size: 15 }), h('span', null, t('terminal.note.owner_guest_drives', { name: driverName || nameOf(driver) || '?' })),
+        ? [icon('keyboard', { size: 15 }), h('span', null, t('terminal.note.owner_guest_drives', { name: driverName || nameOf(driver) || '?' })), countdown(),
           btn(t('terminal.control.take'), 'keyboard', () => send({ type: 'control_take' }), 'btn btn-sm btn-primary')]
         : [icon('keyboard', { size: 15 }), h('span', null, t('terminal.note.owner'))];
     } else if (writable) {
       kind = 'is-driving';
-      parts = [icon('keyboard', { size: 15 }), h('span', null, t('terminal.note.driving')),
+      parts = [icon('keyboard', { size: 15 }), h('span', null, t('terminal.note.driving')), countdown(),
         btn(t('terminal.control.release'), 'x', () => send({ type: 'control_release' }))];
     } else if (access === 'control') {
       kind = 'is-readonly';
@@ -271,7 +331,7 @@ export function mountTerminal(opts) {
       items.push(h('div', { class: 'term-banner', role: 'alert' },
         avatar(p.name, p.user_id || p.id, 'sm'),
         h('span', { class: 'grow' }, t('terminal.banner.control', { name: p.name })),
-        h('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => send({ type: 'control_grant', participant: p.id }) }, icon('keyboard', { size: 14 }), t('terminal.actions.give')),
+        h('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => chooseGrant(p) }, icon('keyboard', { size: 14 }), t('terminal.actions.give')),
         h('button', { class: 'btn btn-sm', type: 'button', onclick: () => send({ type: 'control_deny', participant: p.id }) }, icon('x', { size: 14 }), t('terminal.actions.deny'))));
     }
     replace(banners, items);
@@ -306,6 +366,7 @@ export function mountTerminal(opts) {
     if (p.devices > 1) tags.push(h('span', null, t('terminal.people.devices', { count: p.devices })));
     if (p.devices === 0) tags.push(h('span', null, t('terminal.people.reconnecting')));
     if (p.since) tags.push(h('span', { title: new Date(p.since).toLocaleString() }, t('terminal.people.since', { time: relTime(p.since) })));
+    if (p.is_driver && p.kind !== 'owner' && driverUntil) tags.push(countdown());
     const flags = [];
     if (p.is_driver) flags.push(h('span', { class: 'term-person-flag is-driver', title: t('terminal.people.driver') }, icon('keyboard', { size: 14 })));
     if (p.waiting) flags.push(badge(t('terminal.people.waiting'), 'info'));
@@ -317,8 +378,12 @@ export function mountTerminal(opts) {
         actions.push(act(t('terminal.actions.allow'), 'check', () => send({ type: 'join_allow', participant: p.id }), 'btn btn-sm btn-primary'),
           act(t('terminal.actions.deny'), 'x', () => send({ type: 'join_deny', participant: p.id })));
       } else {
-        if (p.is_driver) actions.push(act(t('terminal.actions.take'), 'keyboard', () => send({ type: 'control_take' })));
-        else if (p.access === 'control') actions.push(act(t('terminal.actions.give'), 'keyboard', () => send({ type: 'control_grant', participant: p.id }), p.requested_control ? 'btn btn-sm btn-primary' : 'btn btn-sm'));
+        if (p.is_driver) {
+          actions.push(act(t('terminal.actions.take'), 'keyboard', () => send({ type: 'control_take' })),
+            act(t('terminal.grant.change'), 'clock', () => chooseGrant(p)));
+        } else if (p.access === 'control') {
+          actions.push(act(t('terminal.actions.give'), 'keyboard', () => chooseGrant(p), p.requested_control ? 'btn btn-sm btn-primary' : 'btn btn-sm'));
+        }
         if (p.requested_control && !p.is_driver) actions.push(act(t('terminal.actions.deny'), 'x', () => send({ type: 'control_deny', participant: p.id })));
         actions.push(act(t('terminal.actions.kick'), 'logout', () => kick(p, false), 'btn btn-sm btn-danger-ghost'),
           act(t('terminal.actions.kick_block'), 'lock', () => kick(p, true), 'btn btn-sm btn-danger-ghost'));
@@ -353,6 +418,7 @@ export function mountTerminal(opts) {
     updateHeader();
     renderBanners();
     renderPanel();
+    startTicking();
   };
 
   // --- Authentication prompts (owner only) ------------------------------
@@ -420,7 +486,10 @@ export function mountTerminal(opts) {
     finished = true;
     waiting = false;
     closePrompt();
+    if (grantDlg) grantDlg.close('cancel');
     writable = false;
+    driverUntil = null;
+    startTicking();
     if (term) term.options.disableStdin = true;
     // The session closed: the `status` overlay (with the exit code) stays.
     if (code === 'session_ended' && already) return;
@@ -453,6 +522,8 @@ export function mountTerminal(opts) {
 
   const setRoom = (list, drv) => {
     if (Array.isArray(list)) participants = list;
+    // Someone else has the keyboard now: their time (if any) comes with `control`.
+    if (drv !== undefined && drv !== driver) driverUntil = null;
     if (drv !== undefined) driver = drv;
     const d = driver ? participants.find((p) => p.id === driver) : null;
     if (d) driverName = d.name;
@@ -484,6 +555,7 @@ export function mountTerminal(opts) {
         writable = !!(me && me.can_write);
         participants = (session && session.participants) || [];
         driver = (session && session.driver) || null;
+        driverUntil = (driver && session.driver_until) || null;
         if (term && session.cols && session.rows) term.resize(session.cols, session.rows);
         setState(session.state);
         setRoom(participants, driver);
@@ -498,12 +570,41 @@ export function mountTerminal(opts) {
         break;
       case 'control': {
         const before = writable;
+        const beforeUntil = driverUntil;
         writable = !!msg.can_write;
         driver = msg.driver || null;
         driverName = msg.driver_name || null;
-        if (!isOwner() && before !== writable) toast(writable ? t('terminal.control.granted') : t('terminal.control.revoked'), writable ? 'success' : 'info');
+        driverUntil = (driver && msg.until) || null;
+        if (!isOwner()) {
+          if (writable && !before) {
+            toast(driverUntil
+              ? t('terminal.grant.granted_for', { count: Math.max(1, Math.round((driverUntil - Date.now()) / 60000)) })
+              : t('terminal.control.granted'), 'success');
+          } else if (writable && driverUntil !== beforeUntil) {
+            toast(driverUntil ? t('terminal.grant.changed', { time: clock(driverUntil) }) : t('terminal.grant.unlimited'), 'info');
+          } else if (!writable && before) {
+            // If the time ran out, `control_expired` comes right after: that
+            // toast instead of this one.
+            clearTimeout(revokeToast);
+            revokeToast = setTimeout(() => {
+              revokeToast = null;
+              if (!disposed && !finished) toast(t('terminal.control.revoked'), 'info');
+            }, 400);
+          }
+        }
         renderRoom();
         if (writable && term) term.focus();
+        break;
+      }
+      case 'control_expired': {
+        if (me && msg.participant === me.participant) {
+          clearTimeout(revokeToast);
+          revokeToast = null;
+          toast(t('terminal.grant.expired_you'), 'info');
+        } else if (isOwner()) {
+          const name = nameOf(msg.participant);
+          toast(name ? t('terminal.grant.expired_owner', { name }) : t('terminal.grant.expired_owner_unknown'), 'info');
+        }
         break;
       }
       case 'join_request':
@@ -767,7 +868,10 @@ export function mountTerminal(opts) {
     disposed = true;
     clearTimeout(retryTimer);
     clearInterval(pingTimer);
+    clearInterval(tickTimer);
+    clearTimeout(revokeToast);
     closePrompt();
+    if (grantDlg) grantDlg.close('cancel');
     if (ws) {
       const s = ws;
       ws = null;
