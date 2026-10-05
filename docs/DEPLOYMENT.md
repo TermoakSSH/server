@@ -50,6 +50,10 @@ Without it, sessions live in the server process and close when it restarts.
 Restarting the holder does cut them; it is only needed when its protocol
 changes (`deploy server` detects and reports it) or to pick up new SSH engine
 code (`RESTART_SESSIONS=1 scripts/release-local.sh deploy server`).
+A holder older than the server keeps working; additions it does not know
+about are simply not used until it restarts (for example, an older holder
+does not mark who typed in recordings: the server logs it when it
+connects).
 
 The first user to sign up becomes an administrator. You can also create it
 from the console:

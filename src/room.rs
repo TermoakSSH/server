@@ -17,12 +17,16 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use termoak_core::time::now_ms;
 use termoak_core::{Id, new_id};
 
 use crate::sessions::{Access, Viewer};
 
 /// Maximum length of a display name.
 pub const MAX_NAME: usize = 40;
+
+/// Longest timed grant of the keyboard, in minutes.
+pub const MAX_CONTROL_MINUTES: u32 = 240;
 
 /// Kind of participant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +117,8 @@ pub struct Grant {
     pub expires_at: Option<i64>,
     pub require_approval: bool,
     pub auto_grant: bool,
+    /// Automatic grants last at most this many minutes.
+    pub control_minutes: Option<u32>,
     /// A link share.
     pub link: bool,
 }
@@ -300,6 +306,31 @@ pub fn clean_guest_key(raw: &str) -> Option<String> {
     .then(|| k.to_string())
 }
 
+/// A participant who had the keyboard, from when to when (one audit entry
+/// `session.control_period` each).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ControlPeriod {
+    pub participant: Id,
+    pub name: String,
+    pub kind: ParticipantKind,
+    #[serde(skip)]
+    pub user_id: Option<Id>,
+    /// ms.
+    pub from: i64,
+    pub to: i64,
+    /// End of the timed grant, if it was timed (ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<i64>,
+    /// Bytes they typed (that reached the terminal).
+    pub bytes: u64,
+    /// Bytes the owner typed meanwhile.
+    pub owner_bytes: u64,
+    /// `released`, `taken`, `granted` (to someone else), `expired`, `left`,
+    /// `removed`, `permission` (their share went down to view) or
+    /// `session_ended`.
+    pub reason: &'static str,
+}
+
 /// Participants and keyboard of a session.
 #[derive(Debug, Default)]
 pub struct Room {
@@ -309,6 +340,12 @@ pub struct Room {
     sockets: HashMap<Id, Id>,
     /// Participant with the keyboard (`None`: the owner).
     driver: Option<Id>,
+    /// End of the driver's timed grant (ms).
+    driver_until: Option<i64>,
+    /// The current driver's period (not the owner's).
+    period: Option<ControlPeriod>,
+    /// Periods that ended and were not audited yet.
+    ended: Vec<ControlPeriod>,
     /// Guests named so far (for "Guest N").
     guests: u32,
 }
@@ -316,6 +353,87 @@ pub struct Room {
 impl Room {
     pub fn driver(&self) -> Option<Id> {
         self.driver
+    }
+
+    /// End of the driver's timed grant (ms), if it is timed.
+    pub fn driver_until(&self) -> Option<i64> {
+        self.driver.and(self.driver_until)
+    }
+
+    /// Changes the driver (`until`: end of a timed grant). The period of
+    /// whoever had it ends with `reason`.
+    fn set_driver(&mut self, driver: Option<Id>, until: Option<i64>, reason: &'static str) {
+        let now = now_ms();
+        if self.driver != driver {
+            if let Some(mut p) = self.period.take() {
+                p.to = now;
+                p.reason = reason;
+                self.ended.push(p);
+            }
+            self.period = driver
+                .and_then(|d| self.persons.get(&d))
+                .map(|p| ControlPeriod {
+                    participant: p.id,
+                    name: p.name.clone(),
+                    kind: p.kind,
+                    user_id: p.user_id,
+                    from: now,
+                    to: now,
+                    until: None,
+                    bytes: 0,
+                    owner_bytes: 0,
+                    reason: "",
+                });
+        }
+        self.driver = driver;
+        self.driver_until = driver.and(until);
+        if let Some(p) = self.period.as_mut() {
+            p.until = self.driver_until;
+        }
+    }
+
+    /// Someone's input reached the terminal: counted in the current period.
+    pub fn typed(&mut self, pid: Id, bytes: usize) {
+        let owner = self
+            .persons
+            .get(&pid)
+            .is_some_and(|p| p.kind == ParticipantKind::Owner);
+        if let Some(p) = self.period.as_mut() {
+            if p.participant == pid {
+                p.bytes += bytes as u64;
+            } else if owner {
+                p.owner_bytes += bytes as u64;
+            }
+        }
+    }
+
+    /// The session ended: the current period ends too.
+    pub fn end_period(&mut self) {
+        if let Some(mut p) = self.period.take() {
+            p.to = now_ms();
+            p.reason = "session_ended";
+            self.ended.push(p);
+        }
+    }
+
+    /// Periods that ended since the last call.
+    pub fn take_periods(&mut self) -> Vec<ControlPeriod> {
+        std::mem::take(&mut self.ended)
+    }
+
+    /// The driver's timed grant is over at `now`: the keyboard goes back to
+    /// the owner. Returns who had it.
+    pub fn control_expired(&mut self, now: i64) -> Option<Id> {
+        let driver = self.driver?;
+        if self.driver_until.is_none_or(|u| u > now) {
+            return None;
+        }
+        // An older client that keeps typing does not take it back.
+        if let Some(p) = self.persons.get_mut(&driver) {
+            p.legacy_blocked = true;
+        }
+        self.set_driver(None, None, "expired");
+        Some(driver)
     }
 
     /// A socket arrives.
@@ -430,25 +548,27 @@ impl Room {
         }
         p.present = false;
         p.requested_control = false;
+        let name = p.name.clone();
+        let (kind, user_id) = (p.kind, p.user_id);
         let was_driver = self.driver == Some(pid);
         if was_driver {
-            self.driver = None;
+            self.set_driver(None, None, "left");
         }
         Some(Gone {
             participant: pid,
-            name: p.name.clone(),
-            kind: p.kind,
-            user_id: p.user_id,
+            name,
+            kind,
+            user_id,
             was_driver,
         })
     }
 
     fn remove(&mut self, pid: Id) -> Option<Person> {
+        if self.driver == Some(pid) {
+            self.set_driver(None, None, "removed");
+        }
         let p = self.persons.remove(&pid)?;
         self.keys.remove(&p.key);
-        if self.driver == Some(pid) {
-            self.driver = None;
-        }
         Some(p)
     }
 
@@ -553,7 +673,13 @@ impl Room {
         if auto || legacy_take {
             p.requested_control = false;
             p.legacy_blocked = false;
-            self.driver = Some(pid);
+            // The share's time limit applies to automatic grants.
+            let until = p
+                .grant
+                .as_ref()
+                .and_then(|g| g.control_minutes)
+                .map(|m| now_ms() + i64::from(m.clamp(1, MAX_CONTROL_MINUTES)) * 60_000);
+            self.set_driver(Some(pid), until, "granted");
             return Request::Granted { previous: driver };
         }
         if p.requested_control {
@@ -573,18 +699,25 @@ impl Room {
             changed = true;
         }
         if self.driver == Some(pid) {
-            self.driver = None;
+            self.set_driver(None, None, "released");
             changed = true;
         }
         changed
     }
 
-    /// The owner hands the keyboard to someone. `Err` with an error code.
-    pub fn grant(&mut self, pid: Id) -> Result<Option<Id>, &'static str> {
+    /// The owner hands the keyboard to someone, until `until` (ms) if
+    /// timed. Granting it again changes (or removes) the time limit. `Err`
+    /// with an error code.
+    pub fn grant(&mut self, pid: Id, until: Option<i64>) -> Result<Option<Id>, &'static str> {
         let previous = self.driver;
         let p = self.persons.get_mut(&pid).ok_or("participant_not_found")?;
         if p.kind == ParticipantKind::Owner {
-            self.driver = None;
+            if let Some(d) = previous
+                && let Some(d) = self.persons.get_mut(&d)
+            {
+                d.legacy_blocked = true;
+            }
+            self.set_driver(None, None, "taken");
             return Ok(previous);
         }
         if !p.can_drive() {
@@ -592,7 +725,7 @@ impl Room {
         }
         p.requested_control = false;
         p.legacy_blocked = false;
-        self.driver = Some(pid);
+        self.set_driver(Some(pid), until, "granted");
         Ok(previous.filter(|d| *d != pid))
     }
 
@@ -610,10 +743,11 @@ impl Room {
 
     /// The owner takes the keyboard back. Returns who had it.
     pub fn take(&mut self) -> Option<Id> {
-        let previous = self.driver.take()?;
+        let previous = self.driver?;
         if let Some(p) = self.persons.get_mut(&previous) {
             p.legacy_blocked = true;
         }
+        self.set_driver(None, None, "taken");
         Some(previous)
     }
 
@@ -652,7 +786,7 @@ impl Room {
         if access != Access::Control {
             p.requested_control = false;
             if driver == Some(pid) {
-                self.driver = None;
+                self.set_driver(None, None, "permission");
                 lost_drive = true;
             }
         }
@@ -798,6 +932,7 @@ mod tests {
             expires_at: None,
             require_approval: approval,
             auto_grant: auto,
+            control_minutes: None,
             link: approval,
         }
     }
@@ -871,7 +1006,7 @@ mod tests {
             room.request_control(b, false),
             Request::Asked { new: false }
         );
-        assert_eq!(room.grant(b), Ok(None));
+        assert_eq!(room.grant(b, None), Ok(None));
         assert!(room.can_write(b) && room.can_write(o));
         assert_eq!(room.driver(), Some(b));
         // The owner takes it back.
@@ -886,7 +1021,7 @@ mod tests {
             room.request_control(g.participant, false),
             Request::Forbidden
         );
-        assert_eq!(room.grant(g.participant), Err("forbidden"));
+        assert_eq!(room.grant(g.participant, None), Err("forbidden"));
         // Two sockets of the same user are one participant.
         let again = room.join(new_id(), user(bea, &control, false), 5);
         assert_eq!(again.participant, b);
@@ -943,7 +1078,7 @@ mod tests {
             room.request_control(old, true),
             Request::Asked { new: true }
         );
-        assert_eq!(room.grant(old), Ok(None));
+        assert_eq!(room.grant(old, None), Ok(None));
         assert!(room.can_write(old));
     }
 
@@ -972,7 +1107,7 @@ mod tests {
             .join(s2, guest(&link, "Zoe", Some("key-0123456")), 2)
             .participant;
         assert!(room.admit(pid, 3));
-        assert_eq!(room.grant(pid), Ok(None));
+        assert_eq!(room.grant(pid, None), Ok(None));
         let left = room.leave(s2).unwrap();
         assert!(left.empty && !left.was_waiting);
         let back = room.join(new_id(), guest(&link, "Zoe", Some("key-0123456")), 4);
@@ -997,7 +1132,7 @@ mod tests {
         let pid = room
             .join(new_id(), user(new_id(), &g, false), 1)
             .participant;
-        assert_eq!(room.grant(pid), Ok(None));
+        assert_eq!(room.grant(pid, None), Ok(None));
         let mut down = g.clone();
         down.access = Access::View;
         assert_eq!(
@@ -1009,5 +1144,58 @@ mod tests {
         assert_eq!(room.expired(100), vec![pid]);
         assert_eq!(room.apply(pid, None), Applied::Removed);
         assert!(room.info(pid).is_none());
+    }
+
+    #[test]
+    fn timed_control_and_periods() {
+        let mut room = Room::default();
+        let ana = new_id();
+        let o = room.join(new_id(), owner(ana), 1).participant;
+        let control = grant(Access::Control, false, false);
+        let b = room
+            .join(new_id(), user(new_id(), &control, true), 2)
+            .participant;
+        // Timed grant: `until` is known until it expires.
+        assert_eq!(room.grant(b, Some(1_000)), Ok(None));
+        assert_eq!(room.driver_until(), Some(1_000));
+        room.typed(b, 5);
+        room.typed(o, 2);
+        assert_eq!(room.control_expired(999), None);
+        assert_eq!(room.control_expired(1_000), Some(b));
+        assert_eq!((room.driver(), room.driver_until()), (None, None));
+        // An older client that keeps typing does not take it back.
+        assert_eq!(room.request_control(b, true), Request::Asked { new: true });
+        let periods = room.take_periods();
+        assert_eq!(periods.len(), 1);
+        let p = &periods[0];
+        assert_eq!((p.participant, p.bytes, p.owner_bytes), (b, 5, 2));
+        assert_eq!((p.until, p.reason), (Some(1_000), "expired"));
+        assert!(room.take_periods().is_empty());
+        // Granting again without a limit removes it; giving it to someone
+        // else ends the period with `granted`.
+        assert_eq!(room.grant(b, Some(5_000)), Ok(None));
+        assert_eq!(room.grant(b, None), Ok(None));
+        assert_eq!(room.driver_until(), None);
+        assert_eq!(room.control_expired(i64::MAX), None);
+        let auto = Grant {
+            control_minutes: Some(10),
+            ..grant(Access::Control, false, true)
+        };
+        let c = room
+            .join(new_id(), user(new_id(), &auto, false), 3)
+            .participant;
+        assert_eq!(
+            room.request_control(c, false),
+            Request::Granted { previous: Some(b) }
+        );
+        // The share's limit applies to automatic grants.
+        let until = room.driver_until().unwrap();
+        assert!(until > now_ms() + 9 * 60_000 && until <= now_ms() + 10 * 60_000);
+        room.typed(c, 3);
+        room.end_period();
+        let periods = room.take_periods();
+        let reasons: Vec<_> = periods.iter().map(|p| (p.participant, p.reason)).collect();
+        assert_eq!(reasons, vec![(b, "granted"), (c, "session_ended")]);
+        assert_eq!(periods[1].bytes, 3);
     }
 }

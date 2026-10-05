@@ -43,7 +43,23 @@ request to the host (see [Relay sessions](#relay-sessions)).
 
 The keyboard goes back to the owner when the driver gives it back, when the
 owner takes it, when the driver's share goes down to `view` (or is revoked,
-or expires), or when the driver leaves (no device for 10 seconds).
+or expires), when the driver leaves (no device for 10 seconds), or when a
+timed grant ends.
+
+**Timed grants.** The owner can hand the keyboard over for 1 to 240 minutes
+(`control_grant` with `minutes`); a share with `auto_grant` can have a
+`control_minutes` limit for its automatic grants. While a grant is timed,
+`control` (and `driver_until` in the session) says when it ends (`until`,
+ms). When the time is up the server takes it back by itself: everyone gets
+`control` with `driver: null`, and the driver and the owner get
+`control_expired`. Granting it again changes the time (or, without
+`minutes`, removes the limit).
+
+**Who typed what.** Every input that reaches the terminal comes from the
+owner or the driver, so the server knows who typed it: in recorded
+sessions the recording says who typed each part (see
+[API.md](API.md#who-typed-what)), and each period someone else had the
+keyboard is one `session.control_period` audit entry.
 
 **Waiting room.** If the share has `require_approval` (links by default),
 whoever joins gets `waiting` and nothing else until the owner lets them in
@@ -66,8 +82,8 @@ On connect, the server sends, in this order:
 2. `{"type":"hello","proto":2,"session":{…},"you":{…}}`. `you` has `id`
    (this socket), `participant`, `name`, `kind`, `access`, `role`
    (`viewer` or `host`), `since`, `can_write`, `is_driver` and `user_id`
-   (your own, if signed in). `session` includes `participants` and
-   `driver`.
+   (your own, if signed in). `session` includes `participants`, `driver`
+   and, while a grant is timed, `driver_until` (ms).
 3. Owner only: pending `prompt`s, `join_request`s and `control_request`s.
 4. A binary frame with the scrollback snapshot. If the session is still
    connecting, it arrives as soon as it becomes `running`.
@@ -80,7 +96,8 @@ Other messages:
 |---|---|---|
 | `status` | `status` | The state changes. `status.state` is `connecting` (with `message`), `running`, `host_offline` (relay without its host) or `closed` (with `exit_code` and `reason`) |
 | `participants` | `participants[]`, `driver` | Someone joins, leaves, asks for the keyboard, changes devices or permission. See [Participant](#participant) |
-| `control` | `driver`, `driver_name`, `can_write` | The keyboard changes hands. `driver` is a participant id, or `null` when the owner has it. `can_write`: your input and resizes reach the terminal now |
+| `control` | `driver`, `driver_name`, `can_write`, `until?` | The keyboard changes hands. `driver` is a participant id, or `null` when the owner has it. `can_write`: your input and resizes reach the terminal now. `until` (ms): only for a timed grant, when it ends |
+| `control_expired` | `participant` | The driver and the owner only. The timed grant of `participant` ended and the keyboard went back to the owner (a `control` arrives too) |
 | `waiting` | `participant`, `name`, `session: {id, title, owner}` | You are in the waiting room |
 | `join_request` | `participant` | Owner only. Someone waits to be let in |
 | `control_request` | `participant` | Owner only. Someone asks for the keyboard |
@@ -133,7 +150,7 @@ Owner only (also from a relay host):
 ```json
 {"type":"join_allow","participant":"…"}
 {"type":"join_deny","participant":"…"}
-{"type":"control_grant","participant":"…"}
+{"type":"control_grant","participant":"…","minutes":15}
 {"type":"control_deny","participant":"…"}
 {"type":"control_take"}
 {"type":"kick","participant":"…","revoke_share":false}
@@ -144,12 +161,14 @@ Owner only (also from a relay host):
 - `set_name`: link guests only (also while waiting).
 - `control_request`: with a `view` share it answers `error` `forbidden`.
   With `auto_grant` on the share the keyboard is granted at once (even if
-  someone else had it).
+  someone else had it), for the share's `control_minutes` if it has them.
 - `control_release`: the driver gives the keyboard back to the owner; whoever
   asked withdraws the request.
 - `control_grant`: hands the keyboard to a participant with `control`
   (errors: `forbidden` for a `view` share, `participant_not_found`). Granting
-  it to yourself (the owner) is the same as `control_take`.
+  it to yourself (the owner) is the same as `control_take`. `minutes`
+  (optional, 1-240) makes it a timed grant; anything else gets `error`
+  `invalid_control_minutes`.
 - `kick`: sends the participant away (`kicked`). They can come back with
   their share unless `revoke_share` is `true`: then the share they joined
   with is revoked too (for a team share or a link, that is everyone who uses
@@ -179,7 +198,7 @@ reason. Clients must not reconnect after these:
 | `forbidden` | 4006 | No access any more |
 
 Other errors (`forbidden` for a single action, `bad_request`,
-`participant_not_found`, `internal`) do not close the socket and must not
+`participant_not_found`, `invalid_control_minutes`, `internal`) do not close the socket and must not
 stop a client from reconnecting if the connection drops later.
 
 When access changes (a share is revoked, changed with `PATCH`, expires, or a
@@ -201,8 +220,9 @@ The host, connected with `?role=host` (and `proto=2`), is an owner socket:
   see. When the driver or the owner (from another device) resizes, the host
   receives `resize` with `by` (the participant): it may apply it to its
   terminal or ignore it.
-- It receives `participants`, `control`, `join_request` and
-  `control_request`, and can send every owner message above.
+- It receives `participants`, `control`, `control_expired`,
+  `join_request` and `control_request`, and can send every owner message
+  above.
 - If its connection drops, guests see `host_offline` and the server keeps
   the session for `[sessions] relay_grace_minutes`. The client library
   reconnects by itself.

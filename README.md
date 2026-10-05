@@ -71,6 +71,18 @@ cargo test        # some end-to-end tests use the system sshd (Linux)
 against this server. To work on core at the same time, see
 ["Using the libraries"](https://github.com/TermoakSSH/core#using-the-libraries) in the core README.
 
+If `Cargo.toml` points to a core tag that only exists in a local checkout
+(created but not pushed yet), make git fetch from that checkout instead of
+GitHub, without touching any file:
+
+```sh
+export GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0=url./path/to/core.insteadOf \
+  GIT_CONFIG_VALUE_0=https://github.com/TermoakSSH/core \
+  CARGO_NET_GIT_FETCH_WITH_CLI=true
+cargo build        # Cargo.lock gets the same commit as once the tag is pushed
+```
+
 The server is released with `scripts/release-local.sh` (`server-vX.Y.Z`):
 
 ```sh

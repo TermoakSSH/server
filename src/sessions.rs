@@ -31,7 +31,7 @@ use termoak_core::model::{Host, SessionInfo, SessionShare, SessionStatus, ShareP
 use termoak_core::time::now_ms;
 use termoak_core::{Id, Store, new_id};
 use termoak_ssh::prompt::{AuthPrompter, Prompt};
-use termoak_ssh::recording::Recorder;
+use termoak_ssh::recording::{InputAuthor, Recorder};
 use termoak_ssh::terminal::OutputHub;
 use termoak_ssh::{
     ConnectOptions, Connection, HostKeyVerifier, PtyOptions, StoreVerifier, TermStatus,
@@ -45,7 +45,7 @@ use crate::holder::HolderClient;
 use crate::holder::proto::{
     Answer, HeldStatus, HostKeyError, OpenSession, Question, RecordingOptions, ToHolder,
 };
-use crate::room::{EndCode, Grant, Room};
+use crate::room::{EndCode, Grant, ParticipantKind, PersonInfo, Room};
 
 /// Visible state of a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -187,6 +187,11 @@ pub enum Signal {
     Room,
     /// The keyboard changed hands.
     Control,
+    /// A participant's timed grant ended (the keyboard went back to the
+    /// owner; `Control` goes too).
+    ControlExpired {
+        participant: Id,
+    },
     /// Someone is waiting to be let in (owner).
     JoinRequest {
         participant: Id,
@@ -260,6 +265,20 @@ impl ServerTerm {
         }
     }
 
+    /// Who types the input that follows (recording).
+    async fn author(&self, author: InputAuthor) {
+        match self {
+            ServerTerm::Local(t) => {
+                let _ = t.set_input_author(author).await;
+            }
+            // A holder older than this server does not know the message.
+            ServerTerm::Held(h) if h.holder.records_authors() => {
+                h.holder.send(ToHolder::Author { id: h.id, author });
+            }
+            ServerTerm::Held(_) => {}
+        }
+    }
+
     async fn resize(&self, cols: u16, rows: u16) {
         match self {
             ServerTerm::Local(t) => {
@@ -306,11 +325,17 @@ struct HeldMeta {
     title: String,
 }
 
+/// Input typed while a session connects.
+pub enum Pending {
+    Data(Bytes),
+    Author(InputAuthor),
+}
+
 pub enum Backing {
     Server {
         term: OnceLock<ServerTerm>,
         /// Input typed while the session connects (sent once it opens).
-        pending: Mutex<Vec<Bytes>>,
+        pending: Mutex<Vec<Pending>>,
     },
     Relay {
         hub: Arc<OutputHub>,
@@ -336,6 +361,9 @@ pub struct LiveSession {
     prompts: Mutex<HashMap<Id, oneshot::Sender<PromptAnswer>>>,
     prompt_reqs: Mutex<HashMap<Id, PromptRequest>>,
     last_activity: AtomicI64,
+    /// Serializes input and keeps who typed last (so the recording gets an
+    /// author mark only when it changes, right before their input).
+    input_author: tokio::sync::Mutex<Option<InputAuthor>>,
 }
 
 /// Public view of a session.
@@ -356,6 +384,9 @@ pub struct SessionView {
     /// Participant with the keyboard (`null`: the owner).
     #[serde(default)]
     pub driver: Option<Id>,
+    /// End of the driver's timed grant (ms), if it is timed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_until: Option<i64>,
     pub cols: u16,
     pub rows: u16,
     pub recording: bool,
@@ -414,19 +445,50 @@ impl LiveSession {
         self.last_activity.store(now_ms(), Ordering::Relaxed);
     }
 
+    /// Keyboard input from `author` (who may write: the owner, the driver
+    /// or the AI on the owner's behalf). It counts in the driver's control
+    /// period and, when recording, the recording gets an author mark each
+    /// time the author changes.
+    pub async fn write_by(&self, data: Bytes, author: InputAuthor) -> ApiResult<()> {
+        let mut last = self.input_author.lock().await;
+        if self.recording && last.as_ref() != Some(&author) {
+            match &self.backing {
+                Backing::Server { term, pending } => match term.get() {
+                    Some(t) => t.author(author.clone()).await,
+                    None => pending.lock().push(Pending::Author(author.clone())),
+                },
+                Backing::Relay { .. } => {}
+            }
+            *last = Some(author.clone());
+        }
+        let len = data.len();
+        self.write(data).await?;
+        if let Some(pid) = author.participant {
+            self.room.lock().typed(pid, len);
+        }
+        Ok(())
+    }
+
     /// Writes to the terminal (keyboard input).
-    pub async fn write(&self, data: Bytes) -> ApiResult<()> {
+    async fn write(&self, data: Bytes) -> ApiResult<()> {
         self.touch();
         match &self.backing {
             Backing::Server { term, pending } => match term.get() {
                 Some(t) => t.write(data).await,
                 None => {
                     let mut p = pending.lock();
-                    if p.iter().map(|b| b.len()).sum::<usize>() + data.len() > 64 * 1024 {
+                    let queued: usize = p
+                        .iter()
+                        .map(|i| match i {
+                            Pending::Data(b) => b.len(),
+                            Pending::Author(_) => 0,
+                        })
+                        .sum();
+                    if queued + data.len() > 64 * 1024 {
                         return Err(ApiError::conflict("the session is still connecting")
                             .with_code("session_connecting"));
                     }
-                    p.push(data);
+                    p.push(Pending::Data(data));
                     Ok(())
                 }
             },
@@ -579,7 +641,7 @@ impl LiveSession {
     pub fn view_for(&self, access: Access, me: Option<Id>) -> SessionView {
         let (cols, rows) = self.size();
         let owner = access == Access::Owner;
-        let (viewers, participants, driver) = {
+        let (viewers, participants, driver, driver_until) = {
             let room = self.room.lock();
             let viewers = room.viewers();
             (
@@ -590,6 +652,7 @@ impl LiveSession {
                 },
                 room.participants(owner, me),
                 room.driver(),
+                room.driver_until(),
             )
         };
         SessionView {
@@ -603,6 +666,7 @@ impl LiveSession {
             viewers,
             participants,
             driver,
+            driver_until,
             cols,
             rows,
             recording: self.recording,
@@ -838,7 +902,7 @@ impl SessionManager {
             loop {
                 tick.tick().await;
                 let Some(m) = weak.upgrade() else { break };
-                m.expire().await;
+                m.check_expiry(now_ms()).await;
             }
         });
         mgr
@@ -887,7 +951,7 @@ impl SessionManager {
     ) -> Arc<LiveSession> {
         let (state, _) = watch::channel(initial);
         let (signals, _) = broadcast::channel(256);
-        Arc::new(LiveSession {
+        let live = Arc::new(LiveSession {
             id,
             owner,
             host_id,
@@ -902,7 +966,25 @@ impl SessionManager {
             prompts: Mutex::new(HashMap::new()),
             prompt_reqs: Mutex::new(HashMap::new()),
             last_activity: AtomicI64::new(now_ms()),
-        })
+            input_author: tokio::sync::Mutex::new(None),
+        });
+        // Control periods are audited as they end.
+        let mut rx = live.signals();
+        let weak = Arc::downgrade(&live);
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(Signal::Control | Signal::Room | Signal::End { .. })
+                    | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+                let Some(live) = weak.upgrade() else { break };
+                audit_periods(&store, &live).await;
+            }
+        });
+        live
     }
 
     fn check_quota(&self, owner: Id) -> ApiResult<()> {
@@ -1070,9 +1152,12 @@ impl SessionManager {
         } = &live.backing
         {
             let _ = slot.set(ServerTerm::Local(term.clone()));
-            let queued: Vec<Bytes> = std::mem::take(&mut *pending.lock());
-            for data in queued {
-                let _ = term.write(data).await;
+            let queued: Vec<Pending> = std::mem::take(&mut *pending.lock());
+            for input in queued {
+                let _ = match input {
+                    Pending::Data(data) => term.write(data).await,
+                    Pending::Author(author) => term.set_input_author(author).await,
+                };
             }
         }
         live.set_state(SessionState::Running);
@@ -1250,6 +1335,8 @@ impl SessionManager {
             exit_code,
             reason: reason.clone(),
         });
+        live.room().end_period();
+        audit_periods(&self.store, live).await;
         // Unblock pending questions.
         live.prompts.lock().clear();
         live.prompt_reqs.lock().clear();
@@ -1587,9 +1674,10 @@ impl SessionManager {
             .await;
     }
 
-    /// Sends away participants whose share expired.
-    async fn expire(self: &Arc<Self>) {
-        let now = now_ms();
+    /// Takes the keyboard back from timed grants that are over and sends
+    /// away participants whose share expired, as of `now` (ms). It runs
+    /// every second; tests call it with a later `now`.
+    pub async fn check_expiry(&self, now: i64) {
         let live: Vec<Arc<LiveSession>> = self
             .sessions
             .read()
@@ -1598,6 +1686,25 @@ impl SessionManager {
             .cloned()
             .collect();
         for s in live {
+            let ended = s.room().control_expired(now);
+            if let Some(pid) = ended {
+                s.signal(Signal::Control);
+                s.signal(Signal::ControlExpired { participant: pid });
+                s.signal(Signal::Room);
+                let info = s.room().info(pid);
+                if let Some(info) = info {
+                    if let Some(user) = info.user_id {
+                        s.notify(user, SessionNotice::ControlRevoked { session_id: s.id });
+                    }
+                    self.audit(
+                        &s,
+                        &actor_of(&info),
+                        "session.control_expired",
+                        serde_json::json!({"participant": pid, "name": info.name}),
+                    )
+                    .await;
+                }
+            }
             let expired = s.room().expired(now);
             for pid in expired {
                 let gone = s.room().kick(pid);
@@ -1722,7 +1829,48 @@ pub fn grant_of(share: &SessionShare) -> Grant {
         expires_at: share.expires_at,
         require_approval: share.require_approval,
         auto_grant: share.auto_grant,
+        control_minutes: share.control_minutes,
         link: share.is_link,
+    }
+}
+
+/// Author of a participant's input (recordings).
+pub fn author_of(info: &PersonInfo) -> InputAuthor {
+    InputAuthor {
+        participant: Some(info.participant),
+        name: info.name.clone(),
+        kind: info.kind.as_str().into(),
+    }
+}
+
+/// Author of what the AI types in one of the owner's sessions.
+fn ai_author() -> InputAuthor {
+    InputAuthor {
+        participant: None,
+        name: "AI".into(),
+        kind: "ai".into(),
+    }
+}
+
+/// One `session.control_period` audit entry per control period that ended
+/// (who drove, from when to when, how much they typed).
+async fn audit_periods(store: &Store, live: &LiveSession) {
+    let periods = live.room().take_periods();
+    for p in periods {
+        let actor = match p.user_id {
+            Some(u) => format!("user:{u}"),
+            None if p.kind == ParticipantKind::Owner => format!("user:{}", live.owner),
+            None => format!("guest:{}", p.participant),
+        };
+        let _ = store
+            .audit(
+                live.owner,
+                &actor,
+                "session.control_period",
+                Some(live.id.to_string()),
+                serde_json::to_value(&p).unwrap_or_default(),
+            )
+            .await;
     }
 }
 
@@ -1769,7 +1917,7 @@ impl SessionAccess for SessionManager {
             .get(session)
             .filter(|s| s.owner == owner)
             .ok_or_else(|| format!("no such session {session}"))?;
-        live.write(Bytes::from(input.to_string()))
+        live.write_by(Bytes::from(input.to_string()), ai_author())
             .await
             .map_err(|e| e.message)
     }
@@ -1789,7 +1937,7 @@ impl SessionAccess for SessionManager {
         let hub = live.hub().ok_or("the session is still connecting")?;
         // Subscribed before writing: no output is lost.
         let (_, mut rx) = hub.attach();
-        live.write(Bytes::from(input.to_string()))
+        live.write_by(Bytes::from(input.to_string()), ai_author())
             .await
             .map_err(|e| e.message)?;
         let deadline = tokio::time::Instant::now() + max;

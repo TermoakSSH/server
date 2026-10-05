@@ -2,6 +2,7 @@
 //! is running).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -14,13 +15,17 @@ use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{mpsc, oneshot};
 
-use super::proto::{Frame, PROTOCOL, ToHolder, ToServer, read_frame, write_frame};
+use super::proto::{
+    FEATURE_INPUT_AUTHORS, Frame, PROTOCOL, ToHolder, ToServer, read_frame, write_frame,
+};
 use crate::sessions::SessionManager;
 
 /// Connection to the holder.
 pub struct HolderClient {
     pub path: PathBuf,
     tx: Mutex<Option<mpsc::UnboundedSender<Frame<ToHolder>>>>,
+    /// The holder records input authors ([`ToHolder::Author`]).
+    authors: AtomicBool,
 }
 
 impl HolderClient {
@@ -28,7 +33,13 @@ impl HolderClient {
         Self {
             path,
             tx: Mutex::new(None),
+            authors: AtomicBool::new(false),
         }
+    }
+
+    /// The holder understands [`ToHolder::Author`].
+    pub fn records_authors(&self) -> bool {
+        self.authors.load(Ordering::Relaxed)
     }
 
     pub fn connected(&self) -> bool {
@@ -110,12 +121,22 @@ async fn connection(
     let (mut rd, wr) = stream.into_split();
     match read_frame::<_, ToServer>(&mut rd).await? {
         Some(Frame::Msg(ToServer::Hello {
-            protocol, version, ..
+            protocol,
+            version,
+            features,
+            ..
         })) => {
             anyhow::ensure!(
                 protocol == PROTOCOL,
                 "the session holder ({version}) uses protocol {protocol} and this server uses {PROTOCOL}: it must be restarted (its sessions will be cut)"
             );
+            let authors = features.iter().any(|f| f == FEATURE_INPUT_AUTHORS);
+            client.authors.store(authors, Ordering::Relaxed);
+            if !authors {
+                tracing::info!(
+                    "the session holder is older than this server: recordings of the sessions it keeps will not say who typed (restart it to get that)"
+                );
+            }
             tracing::info!(%version, "connected to the session holder");
         }
         _ => anyhow::bail!("the session holder did not say hello"),

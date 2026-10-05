@@ -136,6 +136,7 @@ Server sessions:
 | `title_required` | 400 | The title cannot be empty |
 | `cannot_invite_self` | 400 | You cannot share a session with yourself |
 | `share_revoked` | 409 | The invitation was revoked: it cannot be changed |
+| `invalid_control_minutes` | 400 | A timed grant of the keyboard (`control_minutes`) must be 1 to 240 minutes |
 
 The terminal WebSocket has its own codes (`revoked`, `kicked`, `expired`,
 `session_ended`, `join_denied`, `forbidden`), see
@@ -459,11 +460,12 @@ All routes live under `/hosts/{id}/sftp/`:
 | PATCH | `/sessions/{id}` | `{title}` |
 | DELETE | `/sessions/{id}` | Closes the session |
 | GET | `/sessions/{id}/ws` | Terminal WebSocket. See [WEBSOCKET-PROTOCOL.md](WEBSOCKET-PROTOCOL.md) |
-| GET | `/sessions/{id}/recording` | asciicast v2 recording (`.cast`) |
+| GET | `/sessions/{id}/recording` | asciicast v2 recording (`.cast`). Owner only. See [Who typed what](#who-typed-what) |
+| GET | `/sessions/{id}/recording/authors` | Owner only. Who typed in the recording: `{started_at, authors: [{time, participant?, name, kind}]}` (see below) |
 | GET | `/sessions/{id}/shares` | Owner. Every share (also revoked and expired ones), with `user_email`/`user_name` or `team_name`, `active` (not revoked nor expired) and `participants` (people inside with it now) |
-| POST | `/sessions/{id}/shares` | Owner. `{email? \| team_id? \| link: true, permission: view\|control, expires_in_minutes?, require_approval?, auto_grant?}`. Returns `{share, token?, link?, app_link?}` (the token only once). `404 session_ended` if the session already ended |
+| POST | `/sessions/{id}/shares` | Owner. `{email? \| team_id? \| link: true, permission: view\|control, expires_in_minutes?, require_approval?, auto_grant?, control_minutes?}`. Returns `{share, token?, link?, app_link?}` (the token only once). `404 session_ended` if the session already ended |
 | DELETE | `/sessions/{id}/shares` | Owner. Stops sharing: revokes every share and sends everyone but the owner away (`revoked`). Returns `{ok, revoked}` (shares that were active) |
-| PATCH | `/sessions/{id}/shares/{share_id}` | Owner. `{permission?, expires_in_minutes?, expires_at?, no_expiry?, require_approval?, auto_grant?}`. Applied live to whoever uses it; returns the share as in the list |
+| PATCH | `/sessions/{id}/shares/{share_id}` | Owner. `{permission?, expires_in_minutes?, expires_at?, no_expiry?, require_approval?, auto_grant?, control_minutes?, no_control_limit?}`. Applied live to whoever uses it; returns the share as in the list |
 | DELETE | `/sessions/{id}/shares/{share_id}` | Owner. Revokes the share; whoever joined with it leaves, unless they have another valid share |
 | POST | `/relay` | `{title, cols, rows, host_id?}`. Shares a local terminal. Returns `host_ws_path` |
 | GET | `/join/{token}` | Public data of a link share (no authentication): `{session: {id, title, kind, state, created_at, cols, rows, access, participants}, owner, permission, require_approval, expires_at, ws_path}`. `participants` is a count: it never lists who is inside |
@@ -484,6 +486,7 @@ a time: the owner always can, everyone else joins read-only and the share's
 | `expires_in_minutes` | none | Expiry. It also sends away whoever is already inside when it passes |
 | `require_approval` | `true` for links, `false` otherwise | Whoever joins waits until the owner lets them in |
 | `auto_grant` | `false` | Requests for the keyboard are granted without asking the owner |
+| `control_minutes` | none | With `auto_grant`: each automatic grant lasts at most this many minutes (1-240), then the keyboard goes back to the owner. `PATCH` with `no_control_limit: true` removes it |
 
 `PATCH` changes a share live: going down to `view` takes the keyboard away
 at once; `expires_at` (ms) or `expires_in_minutes` set a new expiry and
@@ -500,7 +503,10 @@ highest permission, then one without a waiting room, then a direct one.
 `participants` in a session (`GET /sessions`, `GET /sessions/{id}`, the
 WebSocket `hello`) lists people, not sockets (see
 [Participant](WEBSOCKET-PROTOCOL.md#participant)); `driver` is the
-participant with the keyboard (`null`: the owner). Only the owner sees user
+participant with the keyboard (`null`: the owner) and `driver_until` (ms,
+only while it is a timed grant) when the keyboard goes back to the owner.
+The owner can hand it over for a while: `control_grant` with `minutes`
+over the WebSocket. Only the owner sees user
 ids and share ids, in `participants` and in the old `viewers` list.
 
 Everything is audited in the owner's log (`/audit`): `session.join` (once
@@ -508,10 +514,41 @@ per person, not per reconnect; guests with their name, actor
 `guest:<participant>`), `session.leave`, `session.join_requested`,
 `session.join_allowed`, `session.join_denied`, `session.control_requested`,
 `session.control_granted`, `session.control_released`,
-`session.control_taken`, `session.control_denied`, `session.kicked` (with
-`reason`: `kicked`, `revoked` or `expired`), `session.share`,
-`session.share_changed`, `session.share_revoked` and
-`session.sharing_stopped`.
+`session.control_taken`, `session.control_denied`,
+`session.control_expired` (a timed grant ended), `session.control_period`
+(see below), `session.kicked` (with `reason`: `kicked`, `revoked` or
+`expired`), `session.share`, `session.share_changed`,
+`session.share_revoked` and `session.sharing_stopped`.
+
+#### Who typed what
+
+One person drives at a time, so every input that reaches the terminal has
+an author: the owner, the driver, or the AI (on the owner's behalf).
+
+- **Audit**: each period someone other than the owner had the keyboard is
+  one `session.control_period` entry when it ends (not one per keystroke),
+  with actor `user:<id>` or `guest:<participant>` and `detail`
+  `{participant, name, kind, from, to, until?, bytes, owner_bytes, reason}`:
+  `from`/`to` in ms, `until` the end of a timed grant, `bytes` what they
+  typed, `owner_bytes` what the owner typed meanwhile, and `reason` why it
+  ended (`released`, `taken`, `granted` to someone else, `expired`, `left`,
+  `removed`, `permission` (their share went down to `view`) or
+  `session_ended`).
+- **Recordings** (sessions with `record`): the `.cast` file keeps the
+  standard asciicast v2 events and adds an author mark each time the author
+  changes, right before their input: an event of type `a` whose data is
+  the author as a JSON string,
+  `[12.5, "a", "{\"participant\":\"…\",\"name\":\"Zoe\",\"kind\":\"guest\"}"]`
+  (`kind`: `owner`, `user`, `guest` or `ai`; no `participant` for the AI).
+  It applies to all the input that follows until the next mark. Players
+  that do not know it skip it (asciinema ignores unknown event types). The
+  marks are written even when the input itself is not recorded
+  (`[sessions] record_input = false`, the default): they say who typed and
+  when, not what. `GET /sessions/{id}/recording/authors` returns them
+  already parsed: `{"started_at": 1791198048000, "authors": [{"time": 12.5,
+  "participant": "…", "name": "Zoe", "kind": "guest"}]}` (`time`: seconds
+  since `started_at`). Sessions kept by a session holder older than the
+  server have no marks until the holder is restarted.
 
 ### Files through the server
 

@@ -604,12 +604,16 @@ fn server_end_to_end() {
             no_expiry: false,
             require_approval: None,
             auto_grant: Some(true),
+            // Each automatic grant lasts 30 minutes at most.
+            control_minutes: Some(30),
+            no_control_limit: false,
         },
     ))
     .unwrap();
     assert!(changed.control && changed.auto_grant && changed.expires_at.is_some());
+    assert_eq!(changed.control_minutes, Some(30));
     guest.request_control();
-    guest_events.wait("keyboard", |e| {
+    let until = match guest_events.wait("keyboard", |e| {
         matches!(
             e,
             ServerTerminalEvent::Control {
@@ -617,7 +621,13 @@ fn server_end_to_end() {
                 ..
             }
         )
-    });
+    }) {
+        ServerTerminalEvent::Control { until, .. } => until.expect("a timed grant"),
+        _ => unreachable!(),
+    };
+    let left = until - termoak_core::time::now_ms();
+    assert!(left > 29 * 60_000 && left <= 30 * 60_000, "{left}");
+    assert_eq!(guest.control_until(), Some(until));
     assert!(guest.can_write() && guest.is_driver());
     guest.write_text("echo typed-by-$((40+2))\n".into());
     events.wait_output("typed-by-42");

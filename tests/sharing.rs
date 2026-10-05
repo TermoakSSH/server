@@ -1,10 +1,11 @@
 //! Session sharing "multiplayer": waiting room, one driver at a time,
 //! participants, kicks, live changes to shares, stop sharing, expiry,
 //! re-checking access, relay host (with the client library and a connection
-//! that drops), and the owner's notices (events WebSocket and push).
+//! that drops), the owner's notices (events WebSocket and push), timed
+//! grants of the keyboard and who typed what (recordings and audit).
 //!
-//! Relay sessions need no SSH server; the prompt test uses the system's
-//! `sshd` and is skipped without it.
+//! Relay sessions need no SSH server; the prompt and recording tests use
+//! the system's `sshd` and are skipped without it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +19,7 @@ use parking_lot::Mutex;
 use reqwest::Method;
 use serde_json::{Value, json};
 use termoak_server::config::{ApnsSection, Registration, ServerConfig};
+use termoak_server::state::AppState;
 use termoak_server::{build_state, routes};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -28,6 +30,7 @@ use common::{Ws, ws_wait_json, ws_wait_output};
 struct Srv {
     base: String,
     http: reqwest::Client,
+    state: AppState,
     _dir: tempfile::TempDir,
 }
 
@@ -43,10 +46,12 @@ impl Srv {
         config.server.registration = Registration::Open;
         f(&mut config, dir.path());
         let state = build_state(config).await.unwrap();
-        tokio::spawn(async move { axum::serve(listener, routes::router(state)).await.unwrap() });
+        let router = routes::router(state.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         Srv {
             base: format!("http://{addr}"),
             http: reqwest::Client::new(),
+            state,
             _dir: dir,
         }
     }
@@ -943,13 +948,15 @@ async fn relay_host_with_the_client_library() {
         _ => None,
     })
     .await;
-    share.grant_control(bea_id).await;
-    wait_for(&mut events, |e| match e {
-        RelayEvent::Control { driver, .. } if driver == Some(bea_id) => Some(()),
+    // A timed grant: the host and the driver know when it ends.
+    share.grant_control(bea_id, Some(20)).await;
+    let until = wait_for(&mut events, |e| match e {
+        RelayEvent::Control { driver, until, .. } if driver == Some(bea_id) => until,
         _ => None,
     })
     .await;
-    ws_wait_json(&mut b, "control").await;
+    let control = ws_wait_json(&mut b, "control").await;
+    assert_eq!(control["until"], until);
     b.send(WsMsg::Binary(b"whoami\r".to_vec().into()))
         .await
         .unwrap();
@@ -1175,4 +1182,355 @@ async fn owner_notices_and_push() {
     assert_eq!(notice["prompt"]["kind"], "hostkey");
     let push = wait_push(&mock, "session_prompt").await;
     assert_eq!(push["termoak"]["session_id"], opened["id"]);
+}
+
+// --- Timed keyboard and who typed what ---------------------------------------
+
+/// Audit entries with `action` once there are at least `n` of them (the
+/// control periods are written in the background).
+async fn audit_entries(srv: &Srv, token: &str, action: &str, n: usize) -> Vec<Value> {
+    for _ in 0..100 {
+        let found: Vec<Value> = srv
+            .audit(token)
+            .await
+            .into_iter()
+            .filter(|a| a["action"] == action)
+            .collect();
+        if found.len() >= n {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("fewer than {n} {action} in the audit log");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timed_keyboard_and_control_periods() {
+    let srv = Srv::start(|_, _| {}).await;
+    let (ana, _) = srv.user("ana@t.test", "Ana").await;
+    let (bea, bea_user) = srv.user("bea@t.test", "Bea").await;
+    let (cid, _) = srv.user("cid@t.test", "Cid").await;
+    let (rid, mut host) = srv.relay(&ana, "Laptop").await;
+    srv.share(
+        &ana,
+        &rid,
+        json!({"email": "bea@t.test", "permission": "control"}),
+    )
+    .await;
+    let mut owner = srv.ws(&session_ws(&rid), Some(&ana)).await;
+    ws_wait_json(&mut owner, "hello").await;
+    let mut b = srv.ws(&session_ws(&rid), Some(&bea)).await;
+    let hello = ws_wait_json(&mut b, "hello").await;
+    let bea_pid = hello["you"]["participant"].clone();
+    let mut bea_events = srv.ws("/api/v1/events/ws", Some(&bea)).await;
+    ws_wait_json(&mut bea_events, "hello").await;
+
+    // 1-240 minutes.
+    for bad in [0, 241] {
+        send(
+            &mut owner,
+            json!({"type": "control_grant", "participant": bea_pid, "minutes": bad}),
+        )
+        .await;
+        let err = ws_wait_json(&mut owner, "error").await;
+        assert_eq!(err["code"], "invalid_control_minutes");
+    }
+    let before = termoak_core::time::now_ms();
+    send(
+        &mut owner,
+        json!({"type": "control_grant", "participant": bea_pid, "minutes": 5}),
+    )
+    .await;
+    let control = ws_wait_json(&mut b, "control").await;
+    assert_eq!(control["driver"], bea_pid);
+    assert_eq!(control["can_write"], true);
+    let until = control["until"]
+        .as_i64()
+        .expect("a timed grant has `until`");
+    assert!(until >= before + 5 * 60_000 && until <= termoak_core::time::now_ms() + 5 * 60_000);
+    let session = srv
+        .ok(Method::GET, &format!("/api/v1/sessions/{rid}"), &ana, None)
+        .await;
+    assert_eq!(session["driver_until"], until);
+
+    // Bea and Ana type: counted in Bea's period.
+    b.send(WsMsg::Binary(b"bea12".to_vec().into()))
+        .await
+        .unwrap();
+    ws_wait_output(&mut host, "bea12").await;
+    owner
+        .send(WsMsg::Binary(b"ana".to_vec().into()))
+        .await
+        .unwrap();
+    ws_wait_output(&mut host, "ana").await;
+
+    // Time is up (the server checks every second; here the clock jumps).
+    srv.state.sessions.check_expiry(until + 1).await;
+    let control = ws_wait_json(&mut b, "control").await;
+    assert_eq!(control["driver"], Value::Null);
+    assert_eq!(control["can_write"], false);
+    assert!(control.get("until").is_none(), "{control}");
+    let expired = ws_wait_json(&mut b, "control_expired").await;
+    assert_eq!(expired["participant"], bea_pid);
+    assert_eq!(
+        ws_wait_json(&mut owner, "control_expired").await["participant"],
+        bea_pid
+    );
+    wait_notice(&mut bea_events, "control_revoked").await;
+    b.send(WsMsg::Binary(b"too-late".to_vec().into()))
+        .await
+        .unwrap();
+    ignored(&mut host, "too-late").await;
+
+    let periods = audit_entries(&srv, &ana, "session.control_period", 1).await;
+    let p = &periods[0]["detail"];
+    assert_eq!(periods[0]["actor"], format!("user:{bea_user}"));
+    assert_eq!(p["participant"], bea_pid);
+    assert_eq!(p["name"], "Bea");
+    assert_eq!(p["kind"], "user");
+    assert_eq!(
+        (p["bytes"].as_u64(), p["owner_bytes"].as_u64()),
+        (Some(5), Some(3))
+    );
+    assert_eq!(p["reason"], "expired");
+    assert_eq!(p["until"], until);
+    assert!(p["to"].as_i64().unwrap() >= p["from"].as_i64().unwrap());
+    audit_entries(&srv, &ana, "session.control_expired", 1).await;
+
+    // Shares with automatic grants can have a time limit.
+    let (s, err) = srv
+        .call(
+            Method::POST,
+            &format!("/api/v1/sessions/{rid}/shares"),
+            Some(&ana),
+            Some(json!({"email": "cid@t.test", "permission": "control", "auto_grant": true, "control_minutes": 241})),
+        )
+        .await;
+    assert_eq!(
+        (s, err["error"]["code"].as_str()),
+        (400, Some("invalid_control_minutes"))
+    );
+    let cid_share = srv
+        .share(
+            &ana,
+            &rid,
+            json!({"email": "cid@t.test", "permission": "control", "auto_grant": true, "control_minutes": 10}),
+        )
+        .await;
+    assert_eq!(cid_share["share"]["control_minutes"], 10);
+    let cid_share = cid_share["share"]["id"].as_str().unwrap().to_string();
+    let mut c = srv.ws(&session_ws(&rid), Some(&cid)).await;
+    ws_wait_json(&mut c, "hello").await;
+    send(&mut c, json!({"type": "control_request"})).await;
+    let control = ws_wait_json(&mut c, "control").await;
+    assert_eq!(control["can_write"], true);
+    let left = control["until"].as_i64().unwrap() - termoak_core::time::now_ms();
+    assert!(left > 9 * 60_000 && left <= 10 * 60_000, "{left}");
+    // Ana takes it back: a period ending with `taken`, without `until`
+    // afterwards.
+    send(&mut owner, json!({"type": "control_take"})).await;
+    let control = ws_wait_json(&mut c, "control").await;
+    assert_eq!(control["driver"], Value::Null);
+    let periods = audit_entries(&srv, &ana, "session.control_period", 2).await;
+    assert!(
+        periods
+            .iter()
+            .any(|p| p["detail"]["name"] == "Cid" && p["detail"]["reason"] == "taken"),
+        "{periods:?}"
+    );
+    // The limit can be removed (and set again) live.
+    let changed = srv
+        .ok(
+            Method::PATCH,
+            &format!("/api/v1/sessions/{rid}/shares/{cid_share}"),
+            &ana,
+            Some(json!({"no_control_limit": true})),
+        )
+        .await;
+    assert_eq!(changed["control_minutes"], Value::Null);
+    let changed = srv
+        .ok(
+            Method::PATCH,
+            &format!("/api/v1/sessions/{rid}/shares/{cid_share}"),
+            &ana,
+            Some(json!({"control_minutes": 30})),
+        )
+        .await;
+    assert_eq!(changed["control_minutes"], 30);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recordings_say_who_typed() {
+    let Some(sshd) = common::start_sshd() else {
+        eprintln!("sshd not available: test skipped");
+        return;
+    };
+    let srv = Srv::start(|c, _| {
+        c.sessions.host_key_policy = termoak_ssh::HostKeyPolicy::AcceptNew;
+        c.sessions.record = true;
+    })
+    .await;
+    let (ana, ana_user) = srv.user("ana@t.test", "Ana").await;
+    let (bea, _) = srv.user("bea@t.test", "Bea").await;
+    let key = srv
+        .ok(
+            Method::POST,
+            "/api/v1/keys/import",
+            &ana,
+            Some(json!({"label": "k", "private_key": sshd.private_key})),
+        )
+        .await;
+    let ident = srv
+        .ok(
+            Method::POST,
+            "/api/v1/identities",
+            &ana,
+            Some(json!({"label": "me", "username": sshd.user, "key_id": key["id"]})),
+        )
+        .await;
+    let host = srv
+        .ok(
+            Method::POST,
+            "/api/v1/hosts",
+            &ana,
+            Some(json!({"label": "local", "address": "127.0.0.1", "settings": {"port": sshd.port, "identity_id": ident["id"]}})),
+        )
+        .await;
+    let session = srv
+        .ok(
+            Method::POST,
+            "/api/v1/sessions",
+            &ana,
+            Some(json!({"host_id": host["id"], "title": "recorded"})),
+        )
+        .await;
+    let sid = session["id"].as_str().unwrap().to_string();
+    assert_eq!(session["recording"], true);
+    srv.share(
+        &ana,
+        &sid,
+        json!({"email": "bea@t.test", "permission": "control"}),
+    )
+    .await;
+    let mut owner = srv.ws(&session_ws(&sid), Some(&ana)).await;
+    let hello = ws_wait_json(&mut owner, "hello").await;
+    let ana_pid = hello["you"]["participant"].clone();
+    let mut b = srv.ws(&session_ws(&sid), Some(&bea)).await;
+    let bea_pid = ws_wait_json(&mut b, "hello").await["you"]["participant"].clone();
+    loop {
+        let s = ws_wait_json(&mut owner, "status").await;
+        if s["status"]["state"] == "running" {
+            break;
+        }
+    }
+
+    // Ana, then Bea (with the keyboard), then Ana again.
+    owner
+        .send(WsMsg::Binary(b"echo one-$((1+1))\n".to_vec().into()))
+        .await
+        .unwrap();
+    ws_wait_output(&mut owner, "one-2").await;
+    send(
+        &mut owner,
+        json!({"type": "control_grant", "participant": bea_pid}),
+    )
+    .await;
+    ws_wait_json(&mut b, "control").await;
+    b.send(WsMsg::Binary(b"echo two-$((1+2))\n".to_vec().into()))
+        .await
+        .unwrap();
+    ws_wait_output(&mut owner, "two-3").await;
+    b.send(WsMsg::Binary(b"echo again-$((2+2))\n".to_vec().into()))
+        .await
+        .unwrap();
+    ws_wait_output(&mut owner, "again-4").await;
+    owner
+        .send(WsMsg::Binary(b"echo three-$((1+3))\n".to_vec().into()))
+        .await
+        .unwrap();
+    ws_wait_output(&mut owner, "three-4").await;
+    send(&mut b, json!({"type": "control_release"})).await;
+    send(&mut owner, json!({"type": "close_session"})).await;
+    let status = ws_wait_json(&mut b, "status").await;
+    assert_eq!(status["status"]["state"], "closed");
+
+    // The recording has an author mark each time the author changes.
+    let mut authors = Value::Null;
+    for _ in 0..50 {
+        authors = srv
+            .ok(
+                Method::GET,
+                &format!("/api/v1/sessions/{sid}/recording/authors"),
+                &ana,
+                None,
+            )
+            .await;
+        if authors["authors"].as_array().unwrap().len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let list = authors["authors"].as_array().unwrap();
+    let who: Vec<(&Value, &str, &str)> = list
+        .iter()
+        .map(|a| {
+            (
+                &a["participant"],
+                a["name"].as_str().unwrap(),
+                a["kind"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        who,
+        vec![
+            (&ana_pid, "Ana", "owner"),
+            (&bea_pid, "Bea", "user"),
+            (&ana_pid, "Ana", "owner")
+        ],
+        "{authors}"
+    );
+    assert!(authors["started_at"].as_i64().unwrap() > 0);
+    let times: Vec<f64> = list.iter().map(|a| a["time"].as_f64().unwrap()).collect();
+    assert!(times.windows(2).all(|w| w[0] <= w[1]), "{times:?}");
+    // In the `.cast` file itself: `a` events, and no keystrokes (input is
+    // not recorded by default).
+    let cast = srv
+        .http
+        .get(format!("{}/api/v1/sessions/{sid}/recording", srv.base))
+        .bearer_auth(&ana)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let marks = cast.lines().filter(|l| l.contains(r#","a","{"#)).count();
+    assert_eq!(marks, 3, "{cast}");
+    assert!(!cast.lines().any(|l| l.contains(r#","i","#)));
+    // Bea cannot read the owner's recording.
+    let (s, _) = srv
+        .call(
+            Method::GET,
+            &format!("/api/v1/sessions/{sid}/recording/authors"),
+            Some(&bea),
+            None,
+        )
+        .await;
+    assert_eq!(s, 404);
+
+    // One audit entry for Bea's period, with what she typed.
+    let periods = audit_entries(&srv, &ana, "session.control_period", 1).await;
+    let p = &periods[0]["detail"];
+    assert_eq!(p["participant"], bea_pid);
+    assert_eq!(p["reason"], "released");
+    assert_eq!(
+        p["bytes"].as_u64(),
+        Some(("echo two-$((1+2))\n".len() + "echo again-$((2+2))\n".len()) as u64)
+    );
+    assert_eq!(
+        p["owner_bytes"].as_u64(),
+        Some("echo three-$((1+3))\n".len() as u64)
+    );
+    let _ = ana_user;
 }

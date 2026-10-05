@@ -29,7 +29,8 @@ use crate::routes::entities::{
     ExecRequest, ExecResult, GenerateKey, HostTest, ImportKey, SyncRequest, SyncResponse,
 };
 use crate::routes::sessions::{
-    CreateShare, OpenRelay, OpenSession, RenameSession, SessionList, UpdateShare,
+    CreateShare, OpenRelay, OpenSession, RecordingAuthor, RecordingAuthors, RenameSession,
+    SessionList, UpdateShare,
 };
 use crate::routes::sftp::{ChmodReq, DeleteReq, MkdirReq, RenameReq};
 use crate::routes::teams::{AddMember, CreateTeam, SetPlan, SetRole, TeamInviteRequest};
@@ -712,6 +713,14 @@ fn endpoints() -> Vec<Ep> {
         ),
         ep(
             Get,
+            "/api/v1/sessions/{id}/recording/authors",
+            "sessions",
+            "Who typed in the recording (its author marks, in order)",
+            None,
+            Ref("RecordingAuthors"),
+        ),
+        ep(
+            Get,
             "/api/v1/sessions/{id}/shares",
             "sessions",
             "Invitations of a session",
@@ -1307,6 +1316,8 @@ pub fn document() -> OpenApi {
         .schema_from::<RenameSession>()
         .schema_from::<CreateShare>()
         .schema_from::<UpdateShare>()
+        .schema_from::<RecordingAuthors>()
+        .schema_from::<RecordingAuthor>()
         .schema_from::<OpenRelay>()
         .schema_from::<SessionList>()
         .schema_from::<MkdirReq>()

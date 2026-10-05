@@ -69,6 +69,9 @@ async fn sessions_survive_a_server_restart() {
     config.server.data_dir = data.path().join("data");
     config.sessions.host_key_policy = termoak_ssh::HostKeyPolicy::AcceptNew;
     config.sessions.holder_socket = Some(socket.clone());
+    // Recorded by the holder, with who typed (the holder announces it
+    // understands author marks).
+    config.sessions.record = true;
     let http = reqwest::Client::new();
 
     // --- First server: account, host and a session ---
@@ -178,6 +181,31 @@ async fn sessions_survive_a_server_restart() {
     .unwrap();
     let status = ws_wait_json(&mut ws, "status").await;
     assert_eq!(status["status"]["state"], "closed", "{status}");
+
+    // One author mark per server (the second one does not know who typed
+    // last), both Ana's.
+    let mut authors = Value::Null;
+    for _ in 0..50 {
+        (_, authors) = call(
+            &http,
+            reqwest::Method::GET,
+            format!("{base2}/api/v1/sessions/{sid}/recording/authors"),
+            &token,
+            None,
+        )
+        .await;
+        if authors["authors"].as_array().is_some_and(|a| a.len() >= 2) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let list = authors["authors"].as_array().expect("authors");
+    assert_eq!(list.len(), 2, "{authors}");
+    assert!(
+        list.iter()
+            .all(|a| a["name"] == "Ana" && a["kind"] == "owner"),
+        "{authors}"
+    );
 
     stop.cancel();
     holder.await.unwrap().unwrap();

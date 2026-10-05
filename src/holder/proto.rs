@@ -24,10 +24,20 @@ use termoak_core::Id;
 use termoak_core::resolve::ResolvedHost;
 use termoak_ssh::SshError;
 use termoak_ssh::prompt::Prompt;
+use termoak_ssh::recording::InputAuthor;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Protocol version. Bump it on any incompatible change.
 pub const PROTOCOL: u32 = 1;
+
+/// Additions to [`PROTOCOL`] a holder announces in [`ToServer::Hello`]
+/// (`features`): the server only sends what the holder understands (an
+/// older holder that keeps running after the server is updated does not
+/// know them, and an unknown message would drop the connection).
+pub const FEATURE_INPUT_AUTHORS: &str = "input_authors";
+
+/// What this holder understands beyond [`PROTOCOL`].
+pub const FEATURES: &[&str] = &[FEATURE_INPUT_AUTHORS];
 
 /// Maximum frame size (a session's scrollback fits comfortably).
 const MAX_FRAME: usize = 64 << 20;
@@ -69,6 +79,12 @@ pub enum ToHolder {
         ask: u64,
         answer: Answer,
     },
+    /// Who types the input that follows (recording). Only to holders with
+    /// [`FEATURE_INPUT_AUTHORS`].
+    Author {
+        id: Id,
+        author: InputAuthor,
+    },
 }
 
 /// Everything needed to open a session.
@@ -109,6 +125,9 @@ pub enum ToServer {
         protocol: u32,
         version: String,
         pid: u32,
+        /// See [`FEATURES`] (absent in older holders).
+        #[serde(default)]
+        features: Vec<String>,
     },
     /// A session the holder already had (`Synced` follows the `Held`
     /// frames). If it is open, its scrollback comes next.

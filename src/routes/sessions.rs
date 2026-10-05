@@ -33,10 +33,12 @@ use uuid::Uuid;
 
 use crate::auth::{AuthUser, MaybeUser};
 use crate::error::{ApiError, ApiResult};
-use crate::room::{EndCode, Joiner, ParticipantKind, Request, better, clean_guest_key};
+use crate::room::{
+    EndCode, Joiner, MAX_CONTROL_MINUTES, ParticipantKind, Request, better, clean_guest_key,
+};
 use crate::sessions::{
     Access, EndTarget, LiveSession, PromptAnswer, SessionNotice, SessionState, SessionView, Signal,
-    Viewer, actor_of, grant_of,
+    Viewer, actor_of, author_of, grant_of,
 };
 use crate::state::AppState;
 
@@ -49,6 +51,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/v1/sessions/{id}/ws", get(ws))
         .route("/api/v1/sessions/{id}/recording", get(recording))
+        .route(
+            "/api/v1/sessions/{id}/recording/authors",
+            get(recording_authors),
+        )
         .route(
             "/api/v1/sessions/{id}/shares",
             get(list_shares)
@@ -247,6 +253,77 @@ async fn recording(
         .into_response())
 }
 
+/// Who typed in a recording: the author marks (`a` events) of the `.cast`
+/// file, in order. Each one applies to the input that follows it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RecordingAuthors {
+    /// When the recording started (ms; from the `.cast` header).
+    pub started_at: Option<i64>,
+    pub authors: Vec<RecordingAuthor>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RecordingAuthor {
+    /// Seconds since the start of the recording.
+    pub time: f64,
+    /// Participant of the shared session (absent for the AI).
+    pub participant: Option<Uuid>,
+    pub name: String,
+    /// `owner`, `user`, `guest` or `ai`.
+    pub kind: String,
+}
+
+async fn recording_authors(
+    State(st): State<AppState>,
+    u: AuthUser,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<RecordingAuthors>> {
+    use tokio::io::AsyncBufReadExt;
+    let info = st.store.session(id).await?;
+    if info.owner_id != u.id() {
+        return Err(ApiError::not_found(format!("session {id}")));
+    }
+    let path = st.sessions.recording_path(u.id(), id);
+    let file = tokio::fs::File::open(&path).await.map_err(|_| {
+        ApiError::not_found("this session has no recording").with_code("recording_not_found")
+    })?;
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    let started_at = match lines.next_line().await.ok().flatten() {
+        Some(header) => serde_json::from_str::<Value>(&header)
+            .ok()
+            .and_then(|h| h["timestamp"].as_i64())
+            .map(|t| t * 1000),
+        None => None,
+    };
+    let mut authors = Vec::new();
+    // A recording still being written may end in half a line: it stops there.
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(mark) = termoak_ssh::recording::parse_author_line(&line) {
+            authors.push(RecordingAuthor {
+                time: mark.time,
+                participant: mark.author.participant,
+                name: mark.author.name,
+                kind: mark.author.kind,
+            });
+        }
+    }
+    Ok(Json(RecordingAuthors {
+        started_at,
+        authors,
+    }))
+}
+
+/// A timed grant lasts 1-240 minutes.
+fn check_control_minutes(minutes: Option<u32>) -> ApiResult<()> {
+    match minutes {
+        Some(m) if !(1..=MAX_CONTROL_MINUTES).contains(&m) => Err(ApiError::bad_request(
+            "the keyboard can be handed over for 1 to 240 minutes",
+        )
+        .with_code("invalid_control_minutes")),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateShare {
     /// Invite a user of this server by email...
@@ -272,6 +349,10 @@ pub struct CreateShare {
     /// Requests for the keyboard are granted without asking you.
     #[serde(default)]
     pub auto_grant: bool,
+    /// With `auto_grant`: each automatic grant lasts at most this many
+    /// minutes (1-240); then the keyboard goes back to you.
+    #[serde(default)]
+    pub control_minutes: Option<u32>,
 }
 
 fn default_permission() -> SharePermission {
@@ -302,6 +383,7 @@ async fn create_share(
     if live.state().is_closed() {
         return Err(session_ended());
     }
+    check_control_minutes(req.control_minutes)?;
     let expires_at = req
         .expires_in_minutes
         .filter(|m| *m > 0)
@@ -342,13 +424,14 @@ async fn create_share(
     let opts = ShareOptions {
         require_approval: req.require_approval.unwrap_or(req.link),
         auto_grant: req.auto_grant,
+        control_minutes: req.control_minutes,
     };
     let (share, token) = st
         .store
         .create_share(id, u.id(), target, req.permission, expires_at, opts)
         .await?;
     st.store
-        .audit(u.id(), &u.actor(), "session.share", Some(id.to_string()), json!({"share": share.id, "permission": req.permission.as_str(), "link": share.is_link, "invitee": invitee.as_ref().map(|i| &i.email), "team": team.as_ref().map(|t| t.id), "require_approval": opts.require_approval, "auto_grant": opts.auto_grant, "expires_at": expires_at}))
+        .audit(u.id(), &u.actor(), "session.share", Some(id.to_string()), json!({"share": share.id, "permission": req.permission.as_str(), "link": share.is_link, "invitee": invitee.as_ref().map(|i| &i.email), "team": team.as_ref().map(|t| t.id), "require_approval": opts.require_approval, "auto_grant": opts.auto_grant, "control_minutes": opts.control_minutes, "expires_at": expires_at}))
         .await?;
     // Someone already inside may have a better share now.
     st.sessions.reevaluate(&live, EndCode::Revoked, None).await;
@@ -442,6 +525,12 @@ pub struct UpdateShare {
     pub require_approval: Option<bool>,
     #[serde(default)]
     pub auto_grant: Option<bool>,
+    /// New time limit of automatic grants (1-240 minutes).
+    #[serde(default)]
+    pub control_minutes: Option<u32>,
+    /// Remove the time limit of automatic grants.
+    #[serde(default)]
+    pub no_control_limit: bool,
 }
 
 /// Changes a share live: whoever uses it gets the new permission at once.
@@ -461,6 +550,7 @@ async fn update_share(
     if current.revoked {
         return Err(ApiError::conflict("the invitation was revoked").with_code("share_revoked"));
     }
+    check_control_minutes(req.control_minutes)?;
     let expires_at = if req.no_expiry {
         Some(None)
     } else if let Some(at) = req.expires_at {
@@ -475,6 +565,11 @@ async fn update_share(
         expires_at,
         require_approval: req.require_approval,
         auto_grant: req.auto_grant,
+        control_minutes: if req.no_control_limit {
+            Some(None)
+        } else {
+            req.control_minutes.map(Some)
+        },
     };
     let share = st.store.update_share(id, share_id, update).await?;
     st.store
@@ -483,7 +578,7 @@ async fn update_share(
             &u.actor(),
             "session.share_changed",
             Some(id.to_string()),
-            json!({"share": share_id, "permission": share.permission.as_str(), "expires_at": share.expires_at, "require_approval": share.require_approval, "auto_grant": share.auto_grant}),
+            json!({"share": share_id, "permission": share.permission.as_str(), "expires_at": share.expires_at, "require_approval": share.require_approval, "auto_grant": share.auto_grant, "control_minutes": share.control_minutes}),
         )
         .await?;
     st.sessions.reevaluate(&live, EndCode::Revoked, None).await;
@@ -816,6 +911,9 @@ enum ClientMsg {
     // --- Owner only ---
     ControlGrant {
         participant: Id,
+        /// Timed grant (1-240 minutes): the keyboard comes back by itself.
+        #[serde(default)]
+        minutes: Option<u32>,
     },
     ControlDeny {
         participant: Id,
@@ -864,12 +962,16 @@ fn participant_json(live: &LiveSession, pid: Id) -> Value {
 
 fn control_json(live: &LiveSession, ctx: &Ctx) -> Value {
     let room = live.room();
-    json!({
+    let mut v = json!({
         "type": "control",
         "driver": room.driver(),
         "driver_name": room.name_of_driver(),
         "can_write": room.can_write(ctx.me),
-    })
+    });
+    if let Some(until) = room.driver_until() {
+        v["until"] = json!(until);
+    }
+    v
 }
 
 fn render(live: &LiveSession, ctx: &Ctx, sig: Signal) -> Out {
@@ -913,6 +1015,10 @@ fn render(live: &LiveSession, ctx: &Ctx, sig: Signal) -> Out {
             }))
         }
         Signal::Control => Out::Send(control_json(live, ctx)),
+        Signal::ControlExpired { participant } if participant == ctx.me || ctx.owner => {
+            Out::Send(json!({"type": "control_expired", "participant": participant}))
+        }
+        Signal::ControlExpired { .. } => Out::Skip,
         Signal::JoinRequest { participant } if ctx.owner => Out::Send(
             json!({"type": "join_request", "participant": participant_json(live, participant)}),
         ),
@@ -977,7 +1083,7 @@ async fn ask_control(st: &AppState, live: &LiveSession, ctx: &Ctx) -> Request {
                     live,
                     &actor_for(live, ctx.me),
                     "session.control_granted",
-                    json!({"participant": ctx.me, "name": name, "automatic": true}),
+                    json!({"participant": ctx.me, "name": name, "automatic": true, "until": live.room().driver_until()}),
                 )
                 .await;
         }
@@ -1016,7 +1122,10 @@ async fn ask_control(st: &AppState, live: &LiveSession, ctx: &Ctx) -> Request {
 async fn input(st: &AppState, live: &LiveSession, ctx: &Ctx, data: Bytes) {
     let can = live.room().can_write(ctx.me);
     if can || (ctx.legacy && matches!(ask_control(st, live, ctx).await, Request::Granted { .. })) {
-        let _ = live.write(data).await;
+        let who = live.room().info(ctx.me);
+        if let Some(who) = who {
+            let _ = live.write_by(data, author_of(&who)).await;
+        }
     }
 }
 
@@ -1065,8 +1174,18 @@ async fn room_msg(
             }
         }
         _ if !ctx.owner => return Err(forbidden()),
-        ClientMsg::ControlGrant { participant } => {
-            let r = live.room().grant(participant);
+        ClientMsg::ControlGrant {
+            participant,
+            minutes,
+        } => {
+            if minutes.is_some_and(|m| !(1..=MAX_CONTROL_MINUTES).contains(&m)) {
+                return Err((
+                    "invalid_control_minutes",
+                    "the keyboard can be handed over for 1 to 240 minutes".into(),
+                ));
+            }
+            let until = minutes.map(|m| now_ms() + i64::from(m) * 60_000);
+            let r = live.room().grant(participant, until);
             match r {
                 Ok(previous) => {
                     live.signal(Signal::Control);
@@ -1079,7 +1198,7 @@ async fn room_msg(
                             live,
                             &owner_actor,
                             "session.control_granted",
-                            json!({"participant": participant, "name": name}),
+                            json!({"participant": participant, "name": name, "minutes": minutes}),
                         )
                         .await;
                 }
@@ -1183,13 +1302,15 @@ async fn room_msg(
             let Some(info) = kicked else {
                 return Err(("participant_not_found", "no such participant".into()));
             };
-            live.end(EndTarget::Participant(participant), EndCode::Kicked);
-            live.signal(Signal::Control);
-            live.signal(Signal::Room);
+            // The share is revoked before they are told, so whatever they
+            // (or the owner) do next already sees it revoked.
             let revoked = match info.share_id.filter(|_| revoke_share) {
                 Some(share) => st.store.revoke_share(live.id, share).await.is_ok(),
                 None => false,
             };
+            live.end(EndTarget::Participant(participant), EndCode::Kicked);
+            live.signal(Signal::Control);
+            live.signal(Signal::Room);
             if revoked && let Some(share) = info.share_id {
                 let using = live.room().with_share(share);
                 st.sessions

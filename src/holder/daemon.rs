@@ -24,7 +24,7 @@ use serde_json::Value;
 use termoak_core::Id;
 use termoak_ssh::keys::public_openssh;
 use termoak_ssh::prompt::{AuthPrompter, Prompt};
-use termoak_ssh::recording::Recorder;
+use termoak_ssh::recording::{InputAuthor, Recorder};
 use termoak_ssh::{
     ConnectOptions, Connection, HostKeyVerifier, PtyOptions, PublicKey, SshError, TermStatus,
     TerminalSession,
@@ -36,8 +36,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::proto::{
-    Answer, Frame, HeldStatus, OpenSession, PROTOCOL, Question, ToHolder, ToServer, read_frame,
-    write_frame,
+    Answer, FEATURES, Frame, HeldStatus, OpenSession, PROTOCOL, Question, ToHolder, ToServer,
+    read_frame, write_frame,
 };
 use crate::error::ApiError;
 
@@ -148,6 +148,7 @@ impl Link {
 enum Input {
     Data(Bytes),
     Resize(u16, u16),
+    Author(InputAuthor),
 }
 
 /// A session kept by the holder.
@@ -202,6 +203,7 @@ impl Holder {
             protocol: PROTOCOL,
             version: env!("CARGO_PKG_VERSION").into(),
             pid: std::process::id(),
+            features: FEATURES.iter().map(|f| f.to_string()).collect(),
         });
         if let Some(old) = self.link.lock().replace(link.clone()) {
             tracing::info!("another server connected: dropping the previous one");
@@ -285,6 +287,12 @@ impl Holder {
             ToHolder::Answer { ask, answer } => {
                 if let Some(tx) = link.asks.lock().remove(&ask) {
                     let _ = tx.send(answer);
+                }
+            }
+            // In the input queue, so it stays in order with the input.
+            ToHolder::Author { id, author } => {
+                if let Some(h) = self.get(id) {
+                    let _ = h.input.send(Input::Author(author));
                 }
             }
         }
@@ -403,6 +411,7 @@ impl Holder {
                 let res = match i {
                     Input::Data(d) => t.write(d).await,
                     Input::Resize(c, r) => t.resize(c, r).await,
+                    Input::Author(a) => t.set_input_author(a).await,
                 };
                 if res.is_err() {
                     break;
