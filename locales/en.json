@@ -46,5 +46,11 @@
   "push.session_prompt.title": "Your session needs an answer",
   "push.session_prompt.hostkey": "Confirm the fingerprint of %{host}.",
   "push.session_prompt.other": "%{host} is asking for an answer.",
-  "push.session_prompt.generic": "A server session is waiting for an answer (fingerprint or code)."
+  "push.session_prompt.generic": "A server session is waiting for an answer (fingerprint or code).",
+  "push.join_request.title": "Someone wants to join",
+  "push.join_request.body": "%{name} is waiting to join “%{title}”.",
+  "push.join_request.generic": "Someone is waiting to join a session you share.",
+  "push.control_request.title": "Keyboard requested",
+  "push.control_request.body": "%{name} asks for the keyboard of “%{title}”.",
+  "push.control_request.generic": "Someone asks for the keyboard of a session you share."
 }

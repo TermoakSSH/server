@@ -29,8 +29,13 @@ ago must keep working with a new server, so `/api/v1` only grows:
   (`#[serde(other)]`) shipped in every client.
 
 An incompatible change goes into a new API (`/api/v2`) that lives alongside
-the old one while clients still use it. `GET /info` returns the server
-version.
+the old one while clients still use it. One deliberate exception: since
+server 0.3, `control` on a session share means "can ask for the keyboard"
+(one person types at a time) instead of "can always type"; older clients
+keep a compatible behaviour, described in
+[WEBSOCKET-PROTOCOL.md](WEBSOCKET-PROTOCOL.md#older-clients).
+
+`GET /info` returns the server version.
 
 ## Errors
 
@@ -126,10 +131,15 @@ Server sessions:
 | `session_owner_only` | 403 | Only the owner of the session can do this |
 | `session_limit` | 409 | You reached the maximum number of active sessions (`[sessions] max_per_user`) |
 | `session_connecting` | 409 | The session is still connecting and its input buffer is full |
-| `session_ended` | 404 | The session is no longer active |
+| `session_ended` | 404 | The session is no longer active (also when sharing a session that just ended) |
 | `recording_not_found` | 404 | The session has no recording |
 | `title_required` | 400 | The title cannot be empty |
 | `cannot_invite_self` | 400 | You cannot share a session with yourself |
+| `share_revoked` | 409 | The invitation was revoked: it cannot be changed |
+
+The terminal WebSocket has its own codes (`revoked`, `kicked`, `expired`,
+`session_ended`, `join_denied`, `forbidden`), see
+[WEBSOCKET-PROTOCOL.md](WEBSOCKET-PROTOCOL.md#errors-and-close-codes).
 
 SSH and SFTP:
 
@@ -328,8 +338,11 @@ no cap).
 | POST | `/push/test` | Sends a test notification to this device |
 
 The notification data carries `type` (`ai_approval`, `ai_finished`,
-`session_shared`, `session_prompt`, `team_added`, `test`) and the relevant
-ids (`task_id`, `approval_id`, `session_id`, `prompt_id`, `team_id`). In
+`session_shared`, `session_prompt`, `join_request`, `control_request`,
+`team_added`, `test`) and the relevant ids (`task_id`, `approval_id`,
+`session_id`, `prompt_id`, `participant`, `team_id`). `session_prompt`,
+`join_request` and `control_request` are only sent when you are not watching
+that session (no device of yours attached to it). In
 APNs they go under the `termoak` key of the payload; in FCM, in `data`. The
 text is in the recipient's language.
 
@@ -442,15 +455,63 @@ All routes live under `/hosts/{id}/sftp/`:
 |---|---|---|
 | GET | `/sessions` | `{active, shared, recent}` |
 | POST | `/sessions` | `{host_id, cols, rows, title?, record?}`. Opens a session that lives on the server |
-| GET | `/sessions/{id}` | State, viewers and size |
+| GET | `/sessions/{id}` | State, size, `participants` and `driver` (see below) |
 | PATCH | `/sessions/{id}` | `{title}` |
 | DELETE | `/sessions/{id}` | Closes the session |
 | GET | `/sessions/{id}/ws` | Terminal WebSocket. See [WEBSOCKET-PROTOCOL.md](WEBSOCKET-PROTOCOL.md) |
 | GET | `/sessions/{id}/recording` | asciicast v2 recording (`.cast`) |
-| GET, POST | `/sessions/{id}/shares` | `{email? \| team_id? \| link: true, permission: view\|control, expires_in_minutes?}` |
-| DELETE | `/sessions/{id}/shares/{share_id}` | Revokes the share and kicks out whoever joined with it |
+| GET | `/sessions/{id}/shares` | Owner. Every share (also revoked and expired ones), with `user_email`/`user_name` or `team_name`, `active` (not revoked nor expired) and `participants` (people inside with it now) |
+| POST | `/sessions/{id}/shares` | Owner. `{email? \| team_id? \| link: true, permission: view\|control, expires_in_minutes?, require_approval?, auto_grant?}`. Returns `{share, token?, link?, app_link?}` (the token only once). `404 session_ended` if the session already ended |
+| DELETE | `/sessions/{id}/shares` | Owner. Stops sharing: revokes every share and sends everyone but the owner away (`revoked`). Returns `{ok, revoked}` (shares that were active) |
+| PATCH | `/sessions/{id}/shares/{share_id}` | Owner. `{permission?, expires_in_minutes?, expires_at?, no_expiry?, require_approval?, auto_grant?}`. Applied live to whoever uses it; returns the share as in the list |
+| DELETE | `/sessions/{id}/shares/{share_id}` | Owner. Revokes the share; whoever joined with it leaves, unless they have another valid share |
 | POST | `/relay` | `{title, cols, rows, host_id?}`. Shares a local terminal. Returns `host_ws_path` |
-| GET | `/join/{token}` | Public data of a link share (no authentication) |
+| GET | `/join/{token}` | Public data of a link share (no authentication): `{session: {id, title, kind, state, created_at, cols, rows, access, participants}, owner, permission, require_approval, expires_at, ws_path}`. `participants` is a count: it never lists who is inside |
+
+#### Sharing
+
+A session can be shared with users of the server (`email`), with every
+member of a team (`team_id`) or with a link (`link: true`, anyone who has it,
+no account needed; signed-in users can use links too). One person drives at
+a time: the owner always can, everyone else joins read-only and the share's
+`permission` is the most the owner can hand over (`view`: only watch;
+`control`: can ask for the keyboard). Details in
+[WEBSOCKET-PROTOCOL.md](WEBSOCKET-PROTOCOL.md#participants-and-the-keyboard).
+
+| Field | Default | Meaning |
+|---|---|---|
+| `permission` | `view` | `view` or `control` |
+| `expires_in_minutes` | none | Expiry. It also sends away whoever is already inside when it passes |
+| `require_approval` | `true` for links, `false` otherwise | Whoever joins waits until the owner lets them in |
+| `auto_grant` | `false` | Requests for the keyboard are granted without asking the owner |
+
+`PATCH` changes a share live: going down to `view` takes the keyboard away
+at once; `expires_at` (ms) or `expires_in_minutes` set a new expiry and
+`no_expiry: true` removes it; turning `require_approval` off lets in whoever
+is waiting with that share. A revoked share cannot be changed
+(`409 share_revoked`).
+
+When a share is revoked or changed, a team share is revoked, a member
+leaves a team or an account is deleted or disabled, the server checks again
+everyone affected: whoever has another valid share keeps the best one, the
+rest leave with `revoked` (or `expired`). The best share is the one with the
+highest permission, then one without a waiting room, then a direct one.
+
+`participants` in a session (`GET /sessions`, `GET /sessions/{id}`, the
+WebSocket `hello`) lists people, not sockets (see
+[Participant](WEBSOCKET-PROTOCOL.md#participant)); `driver` is the
+participant with the keyboard (`null`: the owner). Only the owner sees user
+ids and share ids, in `participants` and in the old `viewers` list.
+
+Everything is audited in the owner's log (`/audit`): `session.join` (once
+per person, not per reconnect; guests with their name, actor
+`guest:<participant>`), `session.leave`, `session.join_requested`,
+`session.join_allowed`, `session.join_denied`, `session.control_requested`,
+`session.control_granted`, `session.control_released`,
+`session.control_taken`, `session.control_denied`, `session.kicked` (with
+`reason`: `kicked`, `revoked` or `expired`), `session.share`,
+`session.share_changed`, `session.share_revoked` and
+`session.sharing_stopped`.
 
 ### Files through the server
 

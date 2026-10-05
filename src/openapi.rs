@@ -28,7 +28,9 @@ use crate::routes::ai::{
 use crate::routes::entities::{
     ExecRequest, ExecResult, GenerateKey, HostTest, ImportKey, SyncRequest, SyncResponse,
 };
-use crate::routes::sessions::{CreateShare, OpenRelay, OpenSession, RenameSession, SessionList};
+use crate::routes::sessions::{
+    CreateShare, OpenRelay, OpenSession, RenameSession, SessionList, UpdateShare,
+};
 use crate::routes::sftp::{ChmodReq, DeleteReq, MkdirReq, RenameReq};
 use crate::routes::teams::{AddMember, CreateTeam, SetPlan, SetRole, TeamInviteRequest};
 
@@ -683,7 +685,14 @@ fn endpoints() -> Vec<Ep> {
             Object,
         ),
         Ep {
-            query: &["access_token", "share_token", "role"],
+            query: &[
+                "access_token",
+                "share_token",
+                "role",
+                "proto",
+                "name",
+                "guest",
+            ],
             ..ep(
                 Get,
                 "/api/v1/sessions/{id}/ws",
@@ -719,9 +728,25 @@ fn endpoints() -> Vec<Ep> {
         ),
         ep(
             Delete,
+            "/api/v1/sessions/{id}/shares",
+            "sessions",
+            "Stop sharing: revoke every invitation and send everyone but the owner away",
+            None,
+            Object,
+        ),
+        ep(
+            Patch,
             "/api/v1/sessions/{id}/shares/{share_id}",
             "sessions",
-            "Revoke an invitation (kicks out whoever is using it)",
+            "Change an invitation live (permission, expiry, waiting room, automatic keyboard)",
+            Ref("UpdateShare"),
+            Object,
+        ),
+        ep(
+            Delete,
+            "/api/v1/sessions/{id}/shares/{share_id}",
+            "sessions",
+            "Revoke an invitation (whoever has no other valid one leaves)",
             None,
             Object,
         ),
@@ -1281,6 +1306,7 @@ pub fn document() -> OpenApi {
         .schema_from::<OpenSession>()
         .schema_from::<RenameSession>()
         .schema_from::<CreateShare>()
+        .schema_from::<UpdateShare>()
         .schema_from::<OpenRelay>()
         .schema_from::<SessionList>()
         .schema_from::<MkdirReq>()

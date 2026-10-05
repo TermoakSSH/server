@@ -15,9 +15,9 @@ name = "termoak-server"
 path = "src/main.rs"
 
 [dependencies]
-termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1", features = ["openapi"] }
-termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
-termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1", features = ["openapi"] }
+termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
+termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
 tokio = { version = "1.53", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io", "codec"] }
 futures = "0.3"
@@ -49,12 +49,14 @@ rust-i18n = "4"
 
 [dev-dependencies]
 # The engine of the mobile apps against this server (tests/ffi_*.rs).
-termoak-ffi = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
-termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
+termoak-ffi = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
+# The client library (relay host) against this server (tests/sharing.rs).
+termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1", default-features = false }
+termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
 data-encoding = "2"
 tokio-tungstenite = "0.28"
 tempfile = "3"
-termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
 
 # Own workspace: the crates of TermoakSSH/core come from git.
 [workspace]

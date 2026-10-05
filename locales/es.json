@@ -46,5 +46,11 @@
   "push.session_prompt.title": "Tu sesión necesita respuesta",
   "push.session_prompt.hostkey": "Confirma la huella de %{host}.",
   "push.session_prompt.other": "%{host} pide una respuesta.",
-  "push.session_prompt.generic": "Una sesión del servidor espera una respuesta (huella o código)."
+  "push.session_prompt.generic": "Una sesión del servidor espera una respuesta (huella o código).",
+  "push.join_request.title": "Alguien quiere entrar",
+  "push.join_request.body": "%{name} espera para entrar en «%{title}».",
+  "push.join_request.generic": "Alguien espera para entrar en una sesión que compartes.",
+  "push.control_request.title": "Piden el teclado",
+  "push.control_request.body": "%{name} pide el teclado de «%{title}».",
+  "push.control_request.generic": "Alguien pide el teclado de una sesión que compartes."
 }

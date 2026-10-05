@@ -850,6 +850,10 @@ async fn update_user(
     if let Some(v) = req.email_verified {
         user = st.store.set_email_verified(id, v).await?;
     }
+    if req.disabled == Some(true) {
+        // A disabled account leaves the sessions shared with it.
+        st.sessions.remove_user(id).await;
+    }
     st.store
         .audit(
             a.id(),

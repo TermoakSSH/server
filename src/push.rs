@@ -7,6 +7,8 @@
 //! - someone shared a session with you;
 //! - one of your sessions is waiting for an answer (server fingerprint, 2FA
 //!   code) and you are not watching it;
+//! - someone waits to join one of your shared sessions, or asks for its
+//!   keyboard, and you are not watching it;
 //! - you were added to a team.
 //!
 //! By default the text is generic (Apple and Google see it); with
@@ -669,7 +671,7 @@ impl Push {
                 // If the user is watching it, they already see the question in the app.
                 let watching = sessions
                     .get(*session_id)
-                    .is_some_and(|s| s.viewers().iter().any(|v| v.user_id == Some(user)));
+                    .is_some_and(|s| s.is_watching(user));
                 if watching {
                     return;
                 }
@@ -693,6 +695,50 @@ impl Push {
                     .with("session_id", session_id)
                     .with("prompt_id", prompt_id);
                     n.collapse = Some(format!("prompt-{prompt_id}"));
+                    n
+                });
+            }
+            SessionNotice::JoinRequest {
+                session_id,
+                title,
+                participant,
+            }
+            | SessionNotice::ControlRequest {
+                session_id,
+                title,
+                participant,
+            } => {
+                // Whoever is watching sees it in the app.
+                if sessions
+                    .get(*session_id)
+                    .is_some_and(|s| s.is_watching(user))
+                {
+                    return;
+                }
+                let join = matches!(notice, SessionNotice::JoinRequest { .. });
+                let (kind, key) = if join {
+                    ("join_request", "push.join_request")
+                } else {
+                    ("control_request", "push.control_request")
+                };
+                let (session_id, pid) = (*session_id, participant.id);
+                let (name, title) = (participant.name.clone(), title.clone());
+                self.notify(user, move |l| {
+                    let (k_title, k_body, k_generic) = (
+                        format!("{key}.title"),
+                        format!("{key}.body"),
+                        format!("{key}.generic"),
+                    );
+                    let body = t!(&k_body, locale = l, name = name, title = title).into_owned();
+                    let generic = t!(&k_generic, locale = l).into_owned();
+                    let mut n = Notification::new(
+                        kind,
+                        t!(&k_title, locale = l).into_owned(),
+                        Self::text(detailed, body, generic),
+                    )
+                    .with("session_id", session_id)
+                    .with("participant", pid);
+                    n.collapse = Some(format!("{kind}-{pid}"));
                     n
                 });
             }

@@ -796,6 +796,8 @@ pub async fn delete_account(
         let _ = st.sessions.close(&live, u.id()).await;
     }
     st.store.delete_user(u.id()).await?;
+    // Out of the sessions others shared with them.
+    st.sessions.remove_user(u.id()).await;
     let recordings = st
         .config
         .server

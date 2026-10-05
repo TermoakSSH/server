@@ -170,13 +170,18 @@ async fn remove(
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Value>> {
     require_role(&st, &u, id, TeamRole::Owner).await?;
-    // Kick out whoever is watching sessions thanks to the team.
-    for share in st.store.team_shares(id).await? {
+    let shares = st.store.team_shares(id).await?;
+    st.store.delete_team(id).await?;
+    // Out of the sessions shared with the team, unless they have another
+    // valid share.
+    for share in shares {
         if let Some(live) = st.sessions.get(share.session_id) {
-            live.revoke(share.id);
+            let using = live.room().with_share(share.id);
+            st.sessions
+                .reevaluate(&live, crate::room::EndCode::Revoked, Some(&using))
+                .await;
         }
     }
-    st.store.delete_team(id).await?;
     st.store
         .audit(
             u.id(),
@@ -451,17 +456,7 @@ async fn remove_member(
     st.store.remove_team_member(id, user_id).await?;
     // They lose access to the sessions shared with the team, unless they
     // have another invitation (direct or from another team).
-    for share in st.store.team_shares(id).await? {
-        if let Some(live) = st.sessions.get(share.session_id)
-            && st
-                .store
-                .share_for_user(share.session_id, user_id)
-                .await?
-                .is_none()
-        {
-            live.kick(user_id, share.id);
-        }
-    }
+    st.sessions.reevaluate_user(user_id).await;
     st.store
         .audit(
             u.id(),

@@ -18,6 +18,7 @@ pub mod i18n;
 pub mod limiter;
 pub mod openapi;
 pub mod push;
+pub mod room;
 pub mod routes;
 pub mod sessions;
 pub mod state;

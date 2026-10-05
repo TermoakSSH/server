@@ -397,7 +397,20 @@ async fn end_to_end() {
         .await
         .unwrap();
     assert_eq!(join["permission"], "view");
+    // Links wait in the waiting room; the link page says nothing about who is in.
+    assert_eq!(join["require_approval"], true);
+    assert!(join["session"].get("viewers").is_none() && join["session"].get("owner_id").is_none());
     let mut guest = ws_connect(&base, join["ws_path"].as_str().unwrap(), None).await;
+    ws_wait_json(&mut guest, "waiting").await;
+    let request = ws_wait_json(&mut ws, "join_request").await;
+    assert_eq!(request["participant"]["name"], "Guest 1");
+    ws.send(WsMsg::Text(
+        json!({"type": "join_allow", "participant": request["participant"]["id"]})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
     let gh = ws_wait_json(&mut guest, "hello").await;
     assert_eq!(gh["you"]["access"], "view");
     guest
@@ -457,6 +470,7 @@ async fn end_to_end() {
     assert_eq!(s, 200);
     let kicked = ws_wait_json(&mut guest, "error").await;
     assert!(kicked["message"].as_str().unwrap().contains("revoked"));
+    assert_eq!(kicked["code"], "revoked");
 
     // --- AI: read-only task (runs without asking) ---
     let task = ana

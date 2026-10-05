@@ -320,6 +320,28 @@ impl AuthHandler for TrustAll {
 }
 
 #[derive(Default)]
+struct SharedEvents {
+    events: Mutex<Vec<SharedTerminalEvent>>,
+    cv: Condvar,
+}
+
+impl SharedTerminalListener for SharedEvents {
+    fn on_event(&self, event: SharedTerminalEvent) {
+        self.events.lock().push(event);
+        self.cv.notify_all();
+    }
+}
+
+impl SharedEvents {
+    fn wait<T, F: Fn(&SharedTerminalEvent) -> Option<T>>(&self, what: &str, f: F) -> T {
+        wait_until(&self.events, &self.cv, what, |evs| {
+            evs.iter().any(|e| f(e).is_some())
+        });
+        self.events.lock().iter().find_map(f).unwrap()
+    }
+}
+
+#[derive(Default)]
 struct LocalTerm {
     out: Mutex<Vec<u8>>,
     cv: Condvar,
@@ -518,24 +540,107 @@ fn server_end_to_end() {
         ))
         .unwrap(),
     );
+    let token = share["token"].as_str().unwrap().to_string();
+    let invite = block_on(link_invite_info(base.clone(), token.clone())).unwrap();
+    assert_eq!(invite.owner, "Ana");
+    assert_eq!(invite.access, SessionAccess::View);
+    assert!(invite.require_approval);
     let guest_events = Arc::new(TermEvents::default());
-    let guest = block_on(join_shared_session(
+    let guest = block_on(join_shared_session_as(
         base.clone(),
-        share["token"].as_str().unwrap().to_string(),
+        token,
+        Some("Phone guest".into()),
         guest_events.clone(),
     ))
     .unwrap();
     assert_eq!(guest.session_id(), session.id);
+    // Links wait until the owner lets them in.
+    guest_events.wait("waiting room", |e| {
+        matches!(e, ServerTerminalEvent::Waiting { .. })
+    });
+    assert!(guest.is_waiting() && !guest.can_write());
+    let participant = match events.wait("join request", |e| {
+        matches!(e, ServerTerminalEvent::JoinRequest { .. })
+    }) {
+        ServerTerminalEvent::JoinRequest { participant } => participant,
+        _ => unreachable!(),
+    };
+    assert_eq!(participant.name, "Phone guest");
+    assert_eq!(participant.kind, ParticipantKind::Guest);
+    assert!(term.is_owner() && term.can_write() && term.is_driver());
+    term.allow_join(participant.id.clone()).unwrap();
     match guest_events.wait("guest hello", |e| {
         matches!(e, ServerTerminalEvent::Hello { .. })
     }) {
-        ServerTerminalEvent::Hello { session: s } => assert_eq!(s.access, SessionAccess::View),
+        ServerTerminalEvent::Hello { session: s } => {
+            assert_eq!(s.access, SessionAccess::View);
+            assert!(
+                s.participants
+                    .iter()
+                    .any(|p| p.you && p.name == "Phone guest")
+            );
+            assert!(s.participants.iter().all(|p| p.user_id.is_none()));
+        }
         _ => unreachable!(),
     }
+    assert_eq!(guest.participant_id(), Some(participant.id.clone()));
     guest.write_text("echo MUST-NOT-APPEAR\n".into());
     term.write_text("echo seen-by-guest\n".into());
     guest_events.wait_output("seen-by-guest");
     assert!(!guest_events.output().contains("MUST-NOT-APPEAR"));
+
+    // The owner's shares, changed live: the guest may now take the keyboard.
+    let shares = block_on(core.list_server_session_shares(session.id.clone())).unwrap();
+    assert_eq!(shares.len(), 1);
+    assert_eq!(shares[0].kind, ShareKind::Link);
+    assert!(shares[0].require_approval && shares[0].active && !shares[0].control);
+    assert_eq!(shares[0].participants, 1);
+    let changed = block_on(core.update_server_session_share(
+        session.id.clone(),
+        shares[0].id.clone(),
+        ShareChanges {
+            control: Some(true),
+            expires_in_minutes: Some(60),
+            no_expiry: false,
+            require_approval: None,
+            auto_grant: Some(true),
+        },
+    ))
+    .unwrap();
+    assert!(changed.control && changed.auto_grant && changed.expires_at.is_some());
+    guest.request_control();
+    guest_events.wait("keyboard", |e| {
+        matches!(
+            e,
+            ServerTerminalEvent::Control {
+                can_write: true,
+                ..
+            }
+        )
+    });
+    assert!(guest.can_write() && guest.is_driver());
+    guest.write_text("echo typed-by-$((40+2))\n".into());
+    events.wait_output("typed-by-42");
+    term.take_control();
+    guest_events.wait("keyboard back", |e| {
+        matches!(
+            e,
+            ServerTerminalEvent::Control {
+                can_write: false,
+                ..
+            }
+        )
+    });
+    // Stop sharing: the guest is sent away with a code.
+    assert_eq!(
+        block_on(core.stop_sharing_server_session(session.id.clone())).unwrap(),
+        1
+    );
+    match guest_events.wait("ended", |e| matches!(e, ServerTerminalEvent::Ended { .. })) {
+        ServerTerminalEvent::Ended { code, .. } => assert_eq!(code, "revoked"),
+        _ => unreachable!(),
+    }
+    guest_events.wait("closed", |e| matches!(e, ServerTerminalEvent::Closed));
     guest.detach();
 
     // --- Account events ---
@@ -620,6 +725,8 @@ fn server_end_to_end() {
     ))
     .unwrap();
     let shared = block_on(core.share_terminal(local.clone(), "from the phone".into())).unwrap();
+    let host_events = Arc::new(SharedEvents::default());
+    block_on(shared.set_listener(host_events.clone())).unwrap();
     let invite = block_on(shared.invite_link(false, Some(30))).unwrap();
     assert_eq!(invite.permission, "view");
     assert!(invite.app_link.unwrap().starts_with("termoak://join?"));
@@ -631,6 +738,12 @@ fn server_end_to_end() {
     ))
     .unwrap();
     assert_eq!(relay_guest.session_id(), shared.session_id());
+    // The phone that shares is asked to let the guest in.
+    let id = host_events.wait("join request", |e| match e {
+        SharedTerminalEvent::JoinRequest { participant } => Some(participant.id.clone()),
+        _ => None,
+    });
+    block_on(shared.allow_join(id)).unwrap();
     relay_events.wait("hello relay", |e| {
         matches!(e, ServerTerminalEvent::Hello { .. })
     });
@@ -638,12 +751,16 @@ fn server_end_to_end() {
     relay_events.wait_output("shared-9");
     block_on(shared.resize(100, 30)).unwrap();
     block_on(shared.revoke_invite(invite.share_id)).unwrap();
-    relay_events.wait("kicked out", |e| {
-        matches!(
-            e,
-            ServerTerminalEvent::Error { .. } | ServerTerminalEvent::Closed
-        )
-    });
+    relay_events.wait(
+        "kicked out",
+        |e| matches!(e, ServerTerminalEvent::Ended { code, .. } if code == "revoked"),
+    );
+    assert!(
+        block_on(shared.list_invites())
+            .unwrap()
+            .iter()
+            .all(|i| i.revoked)
+    );
     block_on(shared.stop()).unwrap();
     local.close_terminal();
 

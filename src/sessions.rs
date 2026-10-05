@@ -25,8 +25,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use termoak_ai::{SessionAccess, SessionSummary, TerminalOutput};
-use termoak_core::model::{Host, SessionInfo, SessionStatus, SharePermission};
+use termoak_core::model::{Host, SessionInfo, SessionShare, SessionStatus, SharePermission};
 use termoak_core::time::now_ms;
 use termoak_core::{Id, Store, new_id};
 use termoak_ssh::prompt::{AuthPrompter, Prompt};
@@ -44,6 +45,7 @@ use crate::holder::HolderClient;
 use crate::holder::proto::{
     Answer, HeldStatus, HostKeyError, OpenSession, Question, RecordingOptions, ToHolder,
 };
+use crate::room::{EndCode, Grant, Room};
 
 /// Visible state of a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,19 +93,34 @@ impl From<SharePermission> for Access {
     }
 }
 
-/// Person connected to a session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A socket connected to a session (old `presence` list; see
+/// [`crate::room`] for the participants).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Viewer {
     pub id: Id,
     pub name: String,
+    /// Owner's view only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<Id>,
     pub access: Access,
     /// `viewer` or `host` (host of a relay session).
     pub role: String,
     pub since: i64,
-    /// Share they joined with (to kick them if it is revoked).
+    /// Share they joined with (owner's view only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub share_id: Option<Id>,
+    /// Participant (person) this socket belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<Id>,
+}
+
+impl Viewer {
+    /// What someone who is not the owner may see: no user or share ids.
+    pub fn public(mut self) -> Self {
+        self.user_id = None;
+        self.share_id = None;
+        self
+    }
 }
 
 /// Authentication question forwarded to the owner's devices.
@@ -132,13 +149,17 @@ pub struct PromptAnswer {
     pub answers: Option<Vec<String>>,
 }
 
-/// Session signals for its viewers.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Who a [`Signal::End`] sends away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndTarget {
+    Participant(Id),
+    /// Everyone except the owner.
+    Guests,
+}
+
+/// Session signals for its sockets (each one renders them for itself).
+#[derive(Debug, Clone)]
 pub enum Signal {
-    Presence {
-        viewers: Vec<Viewer>,
-    },
     Status {
         status: SessionState,
     },
@@ -146,22 +167,46 @@ pub enum Signal {
     PromptDone {
         prompt_id: Id,
     },
+    /// New size. `from`: socket that caused it (it does not need it back).
     Resize {
         cols: u16,
         rows: u16,
+        from: Option<Id>,
+    },
+    /// Relay: the driver (or the owner on another device) asks the host
+    /// for a size.
+    ResizeRequest {
+        cols: u16,
+        rows: u16,
+        by: Id,
     },
     Title {
         title: String,
     },
-    /// A share was revoked: whoever joined with it must leave.
-    Revoked {
-        share_id: Id,
+    /// Participants changed (joined, left, waiting, devices, requests...).
+    Room,
+    /// The keyboard changed hands.
+    Control,
+    /// Someone is waiting to be let in (owner).
+    JoinRequest {
+        participant: Id,
     },
-    /// A user lost the access a team share gave them (they left the team):
-    /// only they leave, not the rest of the team.
-    Kicked {
-        user_id: Id,
-        share_id: Id,
+    /// Someone asks for the keyboard (owner).
+    ControlRequest {
+        participant: Id,
+    },
+    /// The owner said no to a request for the keyboard.
+    ControlDenied {
+        participant: Id,
+    },
+    /// The owner let someone in.
+    Admitted {
+        participant: Id,
+    },
+    /// Sends sockets away with a code.
+    End {
+        target: EndTarget,
+        code: EndCode,
     },
 }
 
@@ -285,8 +330,9 @@ pub struct LiveSession {
     title: Mutex<String>,
     pub backing: Backing,
     state: watch::Sender<SessionState>,
-    viewers: Mutex<HashMap<Id, Viewer>>,
+    room: Mutex<Room>,
     signals: broadcast::Sender<Signal>,
+    notices: broadcast::Sender<(Id, SessionNotice)>,
     prompts: Mutex<HashMap<Id, oneshot::Sender<PromptAnswer>>>,
     prompt_reqs: Mutex<HashMap<Id, PromptRequest>>,
     last_activity: AtomicI64,
@@ -302,7 +348,14 @@ pub struct SessionView {
     pub kind: String,
     pub state: SessionState,
     pub created_at: i64,
+    /// Sockets (user and share ids only in the owner's view).
     pub viewers: Vec<Viewer>,
+    /// People in the session (see `docs/WEBSOCKET-PROTOCOL.md`).
+    #[serde(default)]
+    pub participants: Vec<crate::room::ParticipantView>,
+    /// Participant with the keyboard (`null`: the owner).
+    #[serde(default)]
+    pub driver: Option<Id>,
     pub cols: u16,
     pub rows: u16,
     pub recording: bool,
@@ -384,41 +437,95 @@ impl LiveSession {
         }
     }
 
-    pub async fn resize(&self, cols: u16, rows: u16) {
+    /// New size from a socket that may write (the owner or the driver).
+    /// In a relay session the host's terminal decides: the request goes to
+    /// the host, and the size changes when the host reports it.
+    pub async fn resize(&self, cols: u16, rows: u16, from: Option<Id>) {
         match &self.backing {
             Backing::Server { term, .. } => {
                 if let Some(t) = term.get() {
                     t.resize(cols, rows).await;
-                    let _ = self.signals.send(Signal::Resize { cols, rows });
+                    let _ = self.signals.send(Signal::Resize { cols, rows, from });
                 }
             }
-            Backing::Relay { size, .. } => {
-                *size.lock() = (cols, rows);
-                let _ = self.signals.send(Signal::Resize { cols, rows });
+            Backing::Relay { .. } => {
+                if let Some(by) = from.and_then(|s| self.room.lock().participant_of(s)) {
+                    let _ = self.signals.send(Signal::ResizeRequest { cols, rows, by });
+                }
             }
         }
     }
 
+    /// Relay: the host reports the size of its terminal.
+    pub fn host_resized(&self, cols: u16, rows: u16, host_socket: Id) {
+        if let Backing::Relay { size, .. } = &self.backing {
+            let (cols, rows) = (cols.clamp(10, 1000), rows.clamp(2, 500));
+            *size.lock() = (cols, rows);
+            let _ = self.signals.send(Signal::Resize {
+                cols,
+                rows,
+                from: Some(host_socket),
+            });
+        }
+    }
+
+    /// Participants and keyboard (keep the lock short: no `.await` inside).
+    pub fn room(&self) -> parking_lot::MutexGuard<'_, Room> {
+        self.room.lock()
+    }
+
+    /// Sends a signal to the session's sockets.
+    pub fn signal(&self, s: Signal) {
+        let _ = self.signals.send(s);
+    }
+
+    /// Notice to a user (events WebSocket and push).
+    pub fn notify(&self, user: Id, notice: SessionNotice) {
+        let _ = self.notices.send((user, notice));
+    }
+
+    /// Admitted sockets, as `viewer` sees them.
     pub fn viewers(&self) -> Vec<Viewer> {
-        let mut v: Vec<Viewer> = self.viewers.lock().values().cloned().collect();
-        v.sort_by_key(|x| x.since);
-        v
+        self.room.lock().viewers()
     }
 
-    pub fn add_viewer(&self, viewer: Viewer) {
-        self.viewers.lock().insert(viewer.id, viewer);
-        self.touch();
-        let _ = self.signals.send(Signal::Presence {
-            viewers: self.viewers(),
-        });
+    /// A user has an admitted socket in the session.
+    pub fn is_watching(&self, user: Id) -> bool {
+        self.room.lock().is_watching(user)
     }
 
-    pub fn remove_viewer(&self, id: Id) {
-        self.viewers.lock().remove(&id);
-        self.touch();
-        let _ = self.signals.send(Signal::Presence {
-            viewers: self.viewers(),
-        });
+    /// Sends away participants (their sockets close with `code`).
+    pub fn end(&self, target: EndTarget, code: EndCode) {
+        let _ = self.signals.send(Signal::End { target, code });
+    }
+
+    /// Applies the best share someone has now (`None`: they are sent away
+    /// with `code`). Tells everyone what changed.
+    pub fn apply_grant(&self, participant: Id, grant: Option<Grant>, code: EndCode) {
+        // Without a waiting room any more: whoever was waiting comes in.
+        let let_in = grant.as_ref().is_some_and(|g| !g.require_approval);
+        let (applied, admitted) = {
+            let mut room = self.room.lock();
+            let applied = room.apply(participant, grant);
+            (applied, let_in && room.admit(participant, now_ms()))
+        };
+        if admitted {
+            self.signal(Signal::Admitted { participant });
+            self.signal(Signal::Room);
+        }
+        match applied {
+            crate::room::Applied::Unchanged => {}
+            crate::room::Applied::Removed => {
+                self.end(EndTarget::Participant(participant), code);
+                self.signal(Signal::Room);
+            }
+            crate::room::Applied::Changed { lost_drive } => {
+                if lost_drive {
+                    self.signal(Signal::Control);
+                }
+                self.signal(Signal::Room);
+            }
+        }
     }
 
     /// Answers a pending question (owner only).
@@ -437,16 +544,6 @@ impl LiveSession {
     /// Pending questions (for late joiners).
     pub fn pending_prompts(&self) -> Vec<PromptRequest> {
         self.prompt_reqs.lock().values().cloned().collect()
-    }
-
-    /// Tells viewers that a share was revoked.
-    pub fn revoke(&self, share_id: Id) {
-        let _ = self.signals.send(Signal::Revoked { share_id });
-    }
-
-    /// Kicks a user who joined with a given share.
-    pub fn kick(&self, user_id: Id, share_id: Id) {
-        let _ = self.signals.send(Signal::Kicked { user_id, share_id });
     }
 
     pub fn set_title(&self, title: String) {
@@ -473,8 +570,28 @@ impl LiveSession {
         .unwrap_or_default()
     }
 
+    /// The session as someone with `access` sees it (`me`: their
+    /// participant, if they are in).
     pub fn view(&self, access: Access) -> SessionView {
+        self.view_for(access, None)
+    }
+
+    pub fn view_for(&self, access: Access, me: Option<Id>) -> SessionView {
         let (cols, rows) = self.size();
+        let owner = access == Access::Owner;
+        let (viewers, participants, driver) = {
+            let room = self.room.lock();
+            let viewers = room.viewers();
+            (
+                if owner {
+                    viewers
+                } else {
+                    viewers.into_iter().map(Viewer::public).collect()
+                },
+                room.participants(owner, me),
+                room.driver(),
+            )
+        };
         SessionView {
             id: self.id,
             owner_id: self.owner,
@@ -483,7 +600,9 @@ impl LiveSession {
             kind: self.kind().to_string(),
             state: self.state(),
             created_at: self.created_at,
-            viewers: self.viewers(),
+            viewers,
+            participants,
+            driver,
             cols,
             rows,
             recording: self.recording,
@@ -514,6 +633,15 @@ struct SessionPrompter {
 }
 
 impl SessionPrompter {
+    fn new(session: &Arc<LiveSession>) -> Self {
+        Self {
+            session: Arc::downgrade(session),
+            last_prompt: Mutex::new(None),
+        }
+    }
+}
+
+impl SessionPrompter {
     async fn ask(&self, mut req: PromptRequest) -> Option<PromptAnswer> {
         let session = self.session.upgrade()?;
         let (tx, rx) = oneshot::channel();
@@ -525,6 +653,14 @@ impl SessionPrompter {
             .insert(req.prompt_id, req.clone());
         *self.last_prompt.lock() = Some(req.clone());
         let _ = session.signals.send(Signal::Prompt(req.clone()));
+        // The owner's devices (events WebSocket, and push if nobody is watching).
+        session.notify(
+            session.owner,
+            SessionNotice::PromptPending {
+                session_id: session.id,
+                prompt: req.clone(),
+            },
+        );
         let answer = tokio::time::timeout(Duration::from_secs(180), rx)
             .await
             .ok()?
@@ -643,6 +779,26 @@ pub enum SessionNotice {
         session_id: Id,
         prompt: PromptRequest,
     },
+    /// Someone is waiting to be let into one of your sessions.
+    JoinRequest {
+        session_id: Id,
+        title: String,
+        participant: crate::room::ParticipantView,
+    },
+    /// Someone asks for the keyboard of one of your sessions.
+    ControlRequest {
+        session_id: Id,
+        title: String,
+        participant: crate::room::ParticipantView,
+    },
+    /// You got the keyboard of a session shared with you.
+    ControlGranted {
+        session_id: Id,
+    },
+    /// You lost the keyboard of a session shared with you.
+    ControlRevoked {
+        session_id: Id,
+    },
 }
 
 /// Session manager.
@@ -673,6 +829,16 @@ impl SessionManager {
                 tick.tick().await;
                 let Some(m) = weak.upgrade() else { break };
                 m.reap().await;
+            }
+        });
+        // Expired shares also send away whoever is already inside.
+        let weak = Arc::downgrade(&mgr);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(EXPIRY_CHECK);
+            loop {
+                tick.tick().await;
+                let Some(m) = weak.upgrade() else { break };
+                m.expire().await;
             }
         });
         mgr
@@ -730,8 +896,9 @@ impl SessionManager {
             title: Mutex::new(title),
             backing,
             state,
-            viewers: Mutex::new(HashMap::new()),
+            room: Mutex::new(Room::default()),
             signals,
+            notices: self.notices.clone(),
             prompts: Mutex::new(HashMap::new()),
             prompt_reqs: Mutex::new(HashMap::new()),
             last_activity: AtomicI64::new(now_ms()),
@@ -860,10 +1027,7 @@ impl SessionManager {
     ) -> ApiResult<()> {
         let host_id = live.host_id.expect("server session with a host");
         let resolved = self.store.resolve_host(live.owner, host_id).await?;
-        let prompter = Arc::new(SessionPrompter {
-            session: Arc::downgrade(live),
-            last_prompt: Mutex::new(None),
-        });
+        let prompter = Arc::new(SessionPrompter::new(live));
         let opts = ConnectOptions::new(Arc::new(StoreVerifier {
             store: self.store.clone(),
             owner: live.owner,
@@ -1304,12 +1468,7 @@ impl SessionManager {
     /// Answers a holder question as if the session were local.
     pub(crate) async fn answer(&self, id: Id, question: Question) -> Answer {
         let live = self.get(id);
-        let prompter = live.as_ref().map(|l| {
-            Arc::new(SessionPrompter {
-                session: Arc::downgrade(l),
-                last_prompt: Mutex::new(None),
-            })
-        });
+        let prompter = live.as_ref().map(|l| Arc::new(SessionPrompter::new(l)));
         match question {
             Question::HostKey { host, port, key } => {
                 let target = format!("{host}:{port}");
@@ -1398,7 +1557,7 @@ impl SessionManager {
             .values()
             .filter(|s| {
                 !s.state().is_closed()
-                    && s.viewers.lock().is_empty()
+                    && s.room.lock().socket_count() == 0
                     && now - s.last_activity.load(Ordering::Relaxed) > limit
             })
             .cloned()
@@ -1419,6 +1578,160 @@ impl SessionManager {
             None => Err(ApiError::not_found(format!("session {}", live.id))),
         }
     }
+
+    /// Audit entry in the owner's log about one of their sessions.
+    pub async fn audit(&self, live: &LiveSession, actor: &str, action: &str, detail: Value) {
+        let _ = self
+            .store
+            .audit(live.owner, actor, action, Some(live.id.to_string()), detail)
+            .await;
+    }
+
+    /// Sends away participants whose share expired.
+    async fn expire(self: &Arc<Self>) {
+        let now = now_ms();
+        let live: Vec<Arc<LiveSession>> = self
+            .sessions
+            .read()
+            .values()
+            .filter(|s| !s.state().is_closed())
+            .cloned()
+            .collect();
+        for s in live {
+            let expired = s.room().expired(now);
+            for pid in expired {
+                let gone = s.room().kick(pid);
+                if let Some(info) = gone {
+                    s.end(EndTarget::Participant(pid), EndCode::Expired);
+                    s.signal(Signal::Control);
+                    s.signal(Signal::Room);
+                    self.audit(
+                        &s,
+                        &actor_of(&info),
+                        "session.kicked",
+                        serde_json::json!({"participant": pid, "name": info.name, "reason": "expired", "share": info.share_id}),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// The best share a participant has now (after a revocation, a change
+    /// or leaving a team).
+    async fn current_grant(
+        &self,
+        live: &LiveSession,
+        info: &crate::room::PersonInfo,
+    ) -> ApiResult<Option<Grant>> {
+        let now = now_ms();
+        let mut best: Option<Grant> = None;
+        if let Some(user) = info.user_id
+            && let Some(share) = self.store.share_for_user(live.id, user).await?
+        {
+            best = Some(grant_of(&share));
+        }
+        // A link they joined with (guests, or users who used a link).
+        if info.link
+            && let Some(id) = info.share_id
+            && let Some(share) = self.store.session_share(live.id, id).await?
+            && share.is_valid(now)
+        {
+            let link = grant_of(&share);
+            if best.as_ref().is_none_or(|b| crate::room::better(&link, b)) {
+                best = Some(link);
+            }
+        }
+        Ok(best)
+    }
+
+    /// Checks again the access of everyone in a session (a share was
+    /// revoked or changed, someone left a team...). Whoever has no share
+    /// left is sent away with `code`; the rest keep the best one they have.
+    /// `only`: just those participants.
+    pub async fn reevaluate(&self, live: &LiveSession, code: EndCode, only: Option<&[Id]>) {
+        let now = now_ms();
+        let guests = live.room().guests();
+        for info in guests {
+            if only.is_some_and(|o| !o.contains(&info.participant)) {
+                continue;
+            }
+            let Ok(grant) = self.current_grant(live, &info).await else {
+                continue;
+            };
+            // Expired rather than revoked, when that is the reason.
+            let code = match (&grant, info.share_id) {
+                (None, Some(id)) => match self.store.session_share(live.id, id).await {
+                    Ok(Some(s)) if !s.revoked && !s.is_valid(now) => EndCode::Expired,
+                    _ => code,
+                },
+                _ => code,
+            };
+            let removed = grant.is_none();
+            live.apply_grant(info.participant, grant, code);
+            if removed {
+                self.audit(
+                    live,
+                    &actor_of(&info),
+                    "session.kicked",
+                    serde_json::json!({"participant": info.participant, "name": info.name, "reason": code.as_str(), "share": info.share_id}),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// A user's account is gone (deleted or disabled): out of every session.
+    pub async fn remove_user(&self, user: Id) {
+        let live: Vec<Arc<LiveSession>> = self.sessions.read().values().cloned().collect();
+        for s in live {
+            let pid = s.room().of_user(user);
+            if let Some(pid) = pid
+                && s.owner != user
+                && s.room().kick(pid).is_some()
+            {
+                s.end(EndTarget::Participant(pid), EndCode::Revoked);
+                s.signal(Signal::Control);
+                s.signal(Signal::Room);
+            }
+        }
+    }
+
+    /// Re-checks a user's access to every live session (they left a team).
+    pub async fn reevaluate_user(&self, user: Id) {
+        let live: Vec<Arc<LiveSession>> = self.sessions.read().values().cloned().collect();
+        for s in live {
+            let pid = s.room().of_user(user);
+            if let Some(pid) = pid
+                && s.owner != user
+            {
+                self.reevaluate(&s, EndCode::Revoked, Some(&[pid])).await;
+            }
+        }
+    }
+}
+
+/// Interval of the expiry check.
+const EXPIRY_CHECK: Duration = Duration::from_secs(1);
+
+/// What a share gives.
+pub fn grant_of(share: &SessionShare) -> Grant {
+    Grant {
+        share_id: share.id,
+        access: share.permission.into(),
+        expires_at: share.expires_at,
+        require_approval: share.require_approval,
+        auto_grant: share.auto_grant,
+        link: share.is_link,
+    }
+}
+
+/// Audit actor of a participant.
+pub fn actor_of(info: &crate::room::PersonInfo) -> String {
+    match info.user_id {
+        Some(u) => format!("user:{u}"),
+        None => format!("guest:{}", info.participant),
+    }
 }
 
 #[async_trait]
@@ -1437,7 +1750,7 @@ impl SessionAccess for SessionManager {
                     SessionState::HostOffline => "host_offline".into(),
                     SessionState::Closed { .. } => "closed".into(),
                 },
-                viewers: s.viewers.lock().len(),
+                viewers: s.room.lock().viewers().len(),
             })
             .collect()
     }
