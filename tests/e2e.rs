@@ -163,6 +163,8 @@ async fn end_to_end() {
         .await
         .unwrap();
     assert_eq!(info["needs_setup"], true);
+    // Production: no environment name.
+    assert_eq!(info["environment"], Value::Null);
     let reg: Value = http
         .post(format!("{base}/api/v1/auth/register"))
         .json(&json!({"email": "ana@termoak.test", "name": "Ana", "password": "secure-password", "device_name": "Laptop", "platform": "desktop-linux"}))

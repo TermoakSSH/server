@@ -39,6 +39,9 @@ pub struct ServerSection {
     /// Take the client IP from `X-Forwarded-For` (only behind a trusted
     /// reverse proxy such as Caddy or nginx; otherwise it can be spoofed).
     pub trust_forwarded_for: bool,
+    /// Name of the environment (e.g. `preprod`), shown in `GET /info`; the
+    /// web apps show a banner when it is set.
+    pub environment: Option<String>,
 }
 
 impl Default for ServerSection {
@@ -54,6 +57,7 @@ impl Default for ServerSection {
             access_token_minutes: 60,
             refresh_token_days: 90,
             trust_forwarded_for: false,
+            environment: None,
         }
     }
 }
@@ -516,6 +520,9 @@ refresh_token_days = 90
 # Behind Caddy or nginx: use the IP from X-Forwarded-For to rate-limit sign-in
 # attempts per IP. Do not enable it if the server is exposed directly.
 trust_forwarded_for = false
+# Name of the environment, shown in GET /api/v1/info (the web apps show a
+# "pre-production" banner when it is set):
+# environment = "preprod"
 
 [sessions]
 scrollback_kb = 2048

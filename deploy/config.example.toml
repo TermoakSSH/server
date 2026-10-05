@@ -15,6 +15,9 @@ refresh_token_days = 90
 # Behind Caddy or nginx: use the IP from X-Forwarded-For to rate-limit sign-in
 # attempts per IP. Do not enable it if the server is exposed directly.
 trust_forwarded_for = false
+# Name of the environment, shown in GET /api/v1/info (the web apps show a
+# "pre-production" banner when it is set):
+# environment = "preprod"
 
 [sessions]
 scrollback_kb = 2048

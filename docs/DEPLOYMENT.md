@@ -95,6 +95,10 @@ per-IP sign-in rate limit uses the real client IP (Caddy adds
 `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`). Without a
 proxy, leave it `false`.
 
+On a test or pre-production server, set `environment = "preprod"` (any
+name) in `[server]`: `GET /api/v1/info` returns it as `environment` and the
+web apps show a "pre-production" banner. Leave it unset in production.
+
 ## Accounts
 
 `registration` in `[server]` decides who can create accounts:

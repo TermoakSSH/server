@@ -25,6 +25,7 @@ impl Srv {
         config.server.data_dir = data.path().to_path_buf();
         config.server.registration = Registration::Open;
         config.server.public_url = Some("https://ssh.example.test".into());
+        config.server.environment = Some("preprod".into());
         config.email.smtp_url = Some("log://".into());
         config.email.require_verification = true;
         // A limit to check that it is enforced.
@@ -145,6 +146,7 @@ async fn platform_accounts() {
     // --- Public information and plans ---
     let (_, info) = srv.call(Method::GET, "/api/v1/info", None, None).await;
     assert_eq!(info["registration"], "open");
+    assert_eq!(info["environment"], "preprod");
     assert_eq!(info["features"]["email"], true);
     assert_eq!(info["features"]["email_verification"], true);
     assert_eq!(info["features"]["web"], true);

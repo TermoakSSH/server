@@ -180,7 +180,7 @@ Sync, AI, push notifications and updates:
 
 | Method | Route | Description |
 |---|---|---|
-| GET | `/info` | Server version, registration state (`open`/`closed`), `needs_setup`, `features` and contact links |
+| GET | `/info` | Server version, registration state (`open`/`closed`), `needs_setup`, `features`, contact links and `environment` (e.g. `preprod` on a test server, `null` in production: show a banner when set) |
 | GET | `/locales` | Languages the server has for emails and notifications: `{default, locales: [{code, name}]}`. No authentication |
 | POST | `/auth/register` | `{email, name, password, device_name, platform, invite?, locale?, accept_terms?, terms_version?}` → `{user, tokens, verification_required}`. The first user becomes an administrator; with registration closed an invitation is needed. See [Terms of use](#terms-of-use) and [Email verification](#email-verification) |
 | POST | `/auth/login` | `{email, password, device_name, platform, totp_code?}` → `{user, tokens, verification_required}` |

@@ -410,6 +410,8 @@ async fn info(State(st): State<AppState>) -> ApiResult<Json<Value>> {
         "name": "Termoak",
         "version": env!("CARGO_PKG_VERSION"),
         "api": "v1",
+        // Set on test servers ("preprod"...): the web apps show a banner.
+        "environment": st.config.server.environment.as_deref().map(str::trim).filter(|e| !e.is_empty()),
         "needs_setup": users == 0,
         "registration": match st.config.server.registration {
             Registration::Open => "open",
