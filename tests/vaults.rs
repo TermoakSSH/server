@@ -559,12 +559,31 @@ async fn teams_own_vaults_and_take_them_away() {
 async fn account_deletion_lists_shared_vaults() {
     let w = world().await;
     let srv = &w.srv;
+    // With two-step on, the refusal must not spend the code: the same recovery
+    // code confirms the deletion afterwards.
+    let r = srv.post("/api/v1/me/2fa/setup", &w.ana, json!({})).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let secret =
+        termoak_core::totp::secret_from_base32(r.body["secret"].as_str().unwrap()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let code = format!(
+        "{:06}",
+        termoak_core::totp::code_at(&secret, termoak_core::totp::step_at(now))
+    );
+    let r = srv
+        .post("/api/v1/me/2fa/enable", &w.ana, json!({"code": code}))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let recovery = r.body["recovery_codes"][0].as_str().unwrap().to_string();
     let r = srv
         .req(
             reqwest::Method::DELETE,
             "/api/v1/me",
             &w.ana.token,
-            Some(json!({"password": "secure-password"})),
+            Some(json!({"password": "secure-password", "totp_code": recovery})),
         )
         .await;
     assert_eq!((r.status, r.code()), (409, "shared_vaults"));
@@ -576,7 +595,11 @@ async fn account_deletion_lists_shared_vaults() {
             reqwest::Method::DELETE,
             "/api/v1/me",
             &w.ana.token,
-            Some(json!({"password": "secure-password", "delete_shared_vaults": true})),
+            Some(json!({
+                "password": "secure-password",
+                "totp_code": recovery,
+                "delete_shared_vaults": true
+            })),
         )
         .await;
     assert_eq!(r.status, 200, "{}", r.body);

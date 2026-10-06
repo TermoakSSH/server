@@ -745,31 +745,26 @@ pub async fn delete_account(
     if !st.store.check_password(u.id(), &req.password).await? {
         return Err(ApiError::invalid_password("the password is not correct"));
     }
-    if u.user.totp_enabled {
-        let code = req
-            .totp_code
-            .as_deref()
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::UNAUTHORIZED,
-                    "totp_required",
-                    "enter the two-step verification code",
-                )
-            })?;
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if st.store.totp_check(u.id(), code, secs).await? == SecondFactor::Invalid {
-            return Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "totp_invalid",
-                "the verification code is not correct",
-            ));
-        }
-    }
+    // The two-step code is only checked after the conflicts below: checking it
+    // spends a recovery code (and an app code can't be reused), so a refusal
+    // for shared vaults would force a new code.
+    let totp_code = if u.user.totp_enabled {
+        Some(
+            req.totp_code
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::UNAUTHORIZED,
+                        "totp_required",
+                        "enter the two-step verification code",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
     if u.user.is_admin {
         let admins = st
             .store
@@ -809,6 +804,19 @@ pub async fn delete_account(
         )
         .with_code("shared_vaults")
         .with_detail("vaults", list));
+    }
+    if let Some(code) = totp_code {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if st.store.totp_check(u.id(), code, secs).await? == SecondFactor::Invalid {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "totp_invalid",
+                "the verification code is not correct",
+            ));
+        }
     }
     let owned: Vec<termoak_core::Id> = st
         .store
