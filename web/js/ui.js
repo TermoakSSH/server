@@ -370,6 +370,15 @@ export function checkbox({ label, name, checked = false, required = false, id })
   return wrap;
 }
 
+/** Switch with text. */
+export function switchInput({ label, checked = false, disabled = false, onChange }) {
+  const input = h('input', { type: 'checkbox', role: 'switch', checked, disabled });
+  if (onChange) input.addEventListener('change', () => onChange(input.checked, input));
+  const wrap = h('label', { class: 'switch' }, input, h('span', null, label));
+  wrap.input = input;
+  return wrap;
+}
+
 /** Segmented control (radio group). Returns the container with `.value`. */
 export function segmented({ name, options, value, label, onChange }) {
   const group = h('div', { class: 'segmented', role: 'radiogroup', 'aria-label': label });

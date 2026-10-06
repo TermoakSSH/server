@@ -47,6 +47,8 @@ const ROUTES = [
   { path: '/app/sessions/:id', ...page('app/terminal.js'), layout: 'app', nav: 'sessions', auth: true, full: true, title: 'title.terminal' },
   { path: '/app/teams', ...page('app/teams.js'), layout: 'app', nav: 'teams', auth: true, title: 'title.teams' },
   { path: '/app/teams/:id', ...page('app/team.js'), layout: 'app', nav: 'teams', auth: true, title: 'title.team' },
+  { path: '/app/vaults', ...page('app/vaults.js'), layout: 'app', nav: 'vaults', auth: true, title: 'title.vaults' },
+  { path: '/app/vaults/:id', ...page('app/vault.js'), layout: 'app', nav: 'vaults', auth: true, title: 'title.vault' },
   { path: '/app/account/:tab?', ...page('app/account.js'), layout: 'app', nav: 'account', auth: true, title: 'title.account' },
   { path: '/app/*', load: async () => ({ render: notFound }), layout: 'app', auth: true, title: 'title.not_found' },
   { path: '*', load: async () => ({ render: notFound }), layout: 'auth', title: 'title.not_found' },

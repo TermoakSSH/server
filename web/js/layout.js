@@ -50,9 +50,11 @@ function authShell(content) {
 
 const appNav = () => [
   ['/app/sessions', t('nav.sessions'), 'terminal', 'sessions'],
+  // Vaults: only on servers that have them (`/info` → `features.vaults`).
+  state.info && state.info.features && state.info.features.vaults ? ['/app/vaults', t('nav.vaults'), 'vault', 'vaults'] : null,
   ['/app/teams', t('nav.teams'), 'users', 'teams'],
   ['/app/account', t('nav.account'), 'user', 'account'],
-];
+].filter(Boolean);
 
 function userMenu(placement) {
   const u = currentUser() || {};

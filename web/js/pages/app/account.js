@@ -108,6 +108,25 @@ function emailCard() {
       form));
 }
 
+/** The vaults of a `shared_vaults` error: `[{id, name, member_count}]`. */
+function sharedVaultsOf(err) {
+  const src = (err.data && err.data.error) || {};
+  return Array.isArray(src.vaults) ? src.vaults : [];
+}
+
+/** Second confirmation when deleting the account deletes shared vaults. */
+function confirmSharedVaults(vaults) {
+  return confirmDialog({
+    title: t('account.delete.vaults_title', { count: vaults.length }),
+    message: h('div', { class: 'stack-sm' },
+      h('p', null, t('account.delete.vaults_text', { count: vaults.length })),
+      h('ul', { class: 'danger-list', dataset: { sharedVaults: '' } }, vaults.map((v) => h('li', null,
+        h('strong', null, v.name), ' · ', t('account.delete.vaults_members', { count: v.member_count || 0 }))))),
+    confirmLabel: t('account.delete.vaults_confirm'),
+    danger: true,
+  });
+}
+
 function deleteCard() {
   const u = currentUser();
   const open = () => {
@@ -117,6 +136,7 @@ function deleteCard() {
       ? field({ label: t('account.totp.code'), name: 'totp', required: true, inputmode: 'numeric', autocomplete: 'one-time-code', hint: t('account.delete.code_hint') })
       : null;
     const confirmField = field({ label: t('account.delete.confirm_label', { word }), name: 'confirm', required: true, autocomplete: 'off', spellcheck: 'false' });
+    let deleteShared = false;
     formDialog({
       title: t('account.delete.dialog_title'),
       description: t('account.delete.dialog_text'),
@@ -126,7 +146,24 @@ function deleteCard() {
       submitLabel: t('account.delete.submit'),
       onSubmit: async () => {
         if (confirmField.input.value.trim() !== word) throw new Error(t('account.delete.confirm_error', { word }));
-        await api.del('/me', { password: password.input.value, totp_code: code ? code.input.value.trim() : undefined }, { credential: true });
+        const body = { password: password.input.value, totp_code: code ? code.input.value.trim() : undefined };
+        if (deleteShared) body.delete_shared_vaults = true;
+        try {
+          await api.del('/me', body, { credential: true });
+        } catch (e) {
+          // Your shared vaults that have members go with the account: list
+          // them and ask again.
+          if (e.code !== 'shared_vaults') throw e;
+          if (!(await confirmSharedVaults(sharedVaultsOf(e)))) return false;
+          deleteShared = true;
+          // A two-step code is only accepted once: ask for a new one.
+          if (code) {
+            code.input.value = '';
+            code.input.focus();
+            throw new Error(t('account.delete.vaults_new_code'));
+          }
+          await api.del('/me', { ...body, delete_shared_vaults: true }, { credential: true });
+        }
         await signOut({ remote: false });
         toast(t('account.delete.done'), 'success', { timeout: 8000 });
         navigate('/');
@@ -137,6 +174,7 @@ function deleteCard() {
     h('div', { class: 'card-head' }, h('div', null, h('h2', { class: 'card-title' }, t('account.delete.title')), h('p', { class: 'card-sub' }, t('account.delete.subtitle')))),
     h('ul', { class: 'danger-list' },
       h('li', null, t('account.delete.item_data')),
+      h('li', null, t('account.delete.item_vaults')),
       h('li', null, t('account.delete.item_sessions')),
       h('li', null, t('account.delete.item_teams'))),
     h('div', { class: 'card-foot' }, h('button', { class: 'btn btn-danger', type: 'button', onclick: open }, icon('trash', { size: 16 }), t('account.delete.button'))));

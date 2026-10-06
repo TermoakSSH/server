@@ -1,5 +1,5 @@
 // Team page: members and their roles, inviting by email, pending
-// invitations, renaming, deleting and leaving.
+// invitations, the team's vaults, renaming, deleting and leaving.
 //
 // Permissions (the server checks them too):
 // - member < admin < owner. A server administrator acts as owner.
@@ -17,6 +17,7 @@ import {
   field, avatar, errorBox, copyField, alertBox, emptyState,
 } from '../../ui.js';
 import { t, tx, getLanguage } from '../../i18n.js';
+import { createVaultDialog, vaultTile, vaultName, vaultRoleBadge, itemCountsText, itemTotal } from './vaults.js';
 
 function roleOptions(acting) {
   const opts = [{ value: 'member', label: roleLabel('member') }, { value: 'admin', label: roleLabel('admin') }];
@@ -32,13 +33,15 @@ export function render(ctx) {
   let team = null;
   let members = [];
   let acting = null; // effective role: your own, or owner if you are a server admin
+  let vaults = []; // the team's vaults that you can see
 
   const load = async () => {
     try {
-      const data = await api.get(`/teams/${id}`);
+      const [data, all] = await Promise.all([api.get(`/teams/${id}`), api.get('/vaults').catch(() => [])]);
       if (!ctx.alive()) return;
       team = data.team;
       members = data.members;
+      vaults = all.filter((v) => v.kind === 'team' && v.owner_team_id === id);
       acting = me.is_admin ? 'owner' : team.role;
       ctx.setTitle(team.name);
       draw();
@@ -73,9 +76,17 @@ export function render(ctx) {
   };
 
   const remove = async () => {
+    // Its vaults are deleted with it: say which ones and what they hold.
+    const message = vaults.length
+      ? h('div', { class: 'stack-sm' },
+        h('p', null, t('team.delete.message')),
+        h('p', null, t('team.delete.vaults', { count: vaults.length })),
+        h('ul', { class: 'danger-list' }, vaults.map((v) => h('li', null, h('strong', null, vaultName(v)), ': ',
+          itemTotal(v.item_counts) ? itemCountsText(v.item_counts) : t('vaults.items.empty')))))
+      : t('team.delete.message');
     const ok = await confirmDialog({
       title: t('team.delete.title', { name: team.name }),
-      message: t('team.delete.message'),
+      message,
       confirmLabel: t('team.delete.confirm'),
       danger: true,
       typed: team.name,
@@ -252,6 +263,30 @@ export function render(ctx) {
     }
   };
 
+  // --- Vaults --------------------------------------------------------------------
+
+  const vaultsSection = () => {
+    const canCreate = team.role === 'owner' || team.role === 'admin';
+    const create = async () => {
+      const teams = await api.get('/teams').catch(() => [team]);
+      createVaultDialog({ teams: teams.filter((x) => x.role), teamId: id });
+    };
+    const rows = vaults.map((v) => h('a', { class: 'list-item list-item-link', href: `/app/vaults/${v.id}`, dataset: { vaultId: v.id } },
+      vaultTile(v, { size: 17 }),
+      h('div', { class: 'list-item-main' },
+        h('div', { class: 'list-item-title' }, h('span', { class: 'break' }, vaultName(v)), vaultRoleBadge(v.role)),
+        h('div', { class: 'list-item-meta' }, h('span', null, itemCountsText(v.item_counts)), v.member_count ? h('span', null, t('vaults.grants', { count: v.member_count })) : null)),
+      icon('chevron-right', { size: 18, class: 'faint' })));
+    return h('section', { class: 'section', 'aria-labelledby': 'team-vaults-title' },
+      h('div', { class: 'section-head' },
+        h('h2', { id: 'team-vaults-title' }, t('team.vaults.title'), h('span', { class: 'count' }, String(vaults.length))),
+        canCreate ? h('button', { class: 'btn btn-sm', type: 'button', onclick: create }, icon('plus', { size: 15 }), t('team.vaults.new')) : null),
+      vaults.length
+        ? h('div', { class: 'card card-flush' }, h('div', { class: 'list' }, rows))
+        : h('p', { class: 'small muted' }, canCreate ? t('team.vaults.empty_manager') : t('team.vaults.empty')),
+      h('p', { class: 'small muted' }, t('team.vaults.hint')));
+  };
+
   // --- Drawing -------------------------------------------------------------------
 
   function draw() {
@@ -276,6 +311,7 @@ export function render(ctx) {
         h('div', { class: 'section-head' }, h('h2', { id: 'members-title' }, t('team.members.title'), h('span', { class: 'count' }, String(members.length)))),
         h('div', { class: 'card card-flush' }, h('div', { class: 'list' }, sorted.map(memberRow))),
         !canManage() ? h('p', { class: 'small muted' }, t('team.members.manage_note')) : null),
+      vaultsSection(),
       canManage() ? inviteCard(pending) : null,
       canManage()
         ? h('section', { class: 'section', 'aria-labelledby': 'pending-title' },
