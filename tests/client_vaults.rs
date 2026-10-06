@@ -308,6 +308,49 @@ async fn two_accounts_share_a_vault() {
     assert!(!file.exists());
     assert_eq!(ws.accounts().len(), 1);
     assert!(c.store.locate_local(web).await.unwrap().is_some());
+
+    // Events per account: tagged with the account, and `vault` events sync it.
+    let mut events = ws.subscribe_events();
+    ws.start_events();
+    let wait = async |events: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+                      pred: &dyn Fn(&serde_json::Value) -> bool| {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let v = events.recv().await.unwrap();
+                if pred(&v) {
+                    return v;
+                }
+            }
+        })
+        .await
+        .expect("event")
+    };
+    let hello = wait(&mut events, &|v| v["type"] == "hello").await;
+    assert_eq!(hello["account_id"], c.id.to_string());
+    let resp = srv
+        .patch(
+            &format!("/api/v1/vaults/{ops}"),
+            &ana,
+            json!({"settings": {"use_only_local": true}}),
+        )
+        .await;
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let ev = wait(&mut events, &|v| {
+        v["type"] == "vault" && v["event"] == "access"
+    })
+    .await;
+    assert_eq!(ev["account_id"], c.id.to_string());
+    // The account synced by itself: Ops is no longer Strict here.
+    let ops_id: Id = ops.parse().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while c.is_strict(ops_id).await.unwrap() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no sync after the event"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    ws.stop_events();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
