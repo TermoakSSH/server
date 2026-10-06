@@ -120,7 +120,8 @@ export function render(ctx) {
           error.show(err);
           code.input.value = '';
           code.input.focus();
-        } else if (err.status === 401 && err.code === 'unauthorized' && totpStep.hidden) {
+        } else if (err.status === 401 && (err.code === 'invalid_credentials' || err.code === 'unauthorized') && totpStep.hidden) {
+          // Wrong email or password (`unauthorized` is kept as a fallback).
           error.show(t('login.error.invalid_credentials'));
           password.input.select();
         } else {

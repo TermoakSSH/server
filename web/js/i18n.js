@@ -227,10 +227,66 @@ export function tx(key, params = {}) {
 /**
  * Message of an error for the user: the translation of `error.<code>` if
  * there is one, else the (English) message from the server.
+ *
+ * The error's extra fields (`min`, `max`, `limit`, `retry_after`, `teams`...,
+ * see the server's API.md) are the placeholders of the text, and they choose
+ * a more specific text when there is one: `error.<code>.<limit>` for `limit`
+ * (`error.plan_limit.max_teams`) and `error.<code>.<field>` for any other
+ * field (`error.too_many_attempts.retry_after`). `retry_after` (seconds)
+ * arrives as a duration in words and lists (`teams`) as a list.
  */
 export function errorText(err, fallbackKey = 'error.unexpected') {
   if (!err) return t(fallbackKey);
   if (typeof err === 'string') return err;
-  if (err.code && has(`error.${err.code}`)) return t(`error.${err.code}`);
+  if (err.code) {
+    const base = `error.${err.code}`;
+    const details = errorDetails(err);
+    const keys = Object.entries(details).map(([field, value]) => (field === 'limit' && typeof value === 'string' ? `${base}.${value}` : `${base}.${field}`));
+    for (const key of [...keys, base]) {
+      if (has(key)) return t(key, errorParams(details));
+    }
+  }
   return err.message || t(fallbackKey);
+}
+
+// Extra fields of an API error (`ApiError.data.error`, or the error object
+// itself), without `code` and `message`.
+function errorDetails(err) {
+  const src = (err.data && err.data.error && typeof err.data.error === 'object' && err.data.error) || err;
+  const out = {};
+  for (const [k, v] of Object.entries(src)) {
+    if (k === 'code' || k === 'message' || k === 'data' || k === 'status' || k === 'name' || v == null) continue;
+    if (typeof v === 'string' || typeof v === 'number' || Array.isArray(v)) out[k] = v;
+  }
+  return out;
+}
+
+function errorParams(details) {
+  const params = {};
+  for (const [k, v] of Object.entries(details)) {
+    if (k === 'retry_after' && typeof v === 'number') params[k] = durationText(v);
+    else if (Array.isArray(v)) params[k] = listText(v.map(String));
+    else if (typeof v === 'number') params[k] = numberFmt.format(v);
+    else params[k] = v;
+  }
+  return params;
+}
+
+// "45 seconds", "2 minutes" in the current language.
+function durationText(seconds) {
+  const s = Math.max(1, Math.ceil(seconds));
+  const [n, unit] = s < 60 ? [s, 'second'] : s < 3600 ? [Math.ceil(s / 60), 'minute'] : [Math.ceil(s / 3600), 'hour'];
+  try {
+    return new Intl.NumberFormat(lang, { style: 'unit', unit, unitDisplay: 'long' }).format(n);
+  } catch {
+    return `${n} ${unit}${n === 1 ? '' : 's'}`;
+  }
+}
+
+function listText(items) {
+  try {
+    return new Intl.ListFormat(lang, { type: 'conjunction' }).format(items);
+  } catch {
+    return items.join(', ');
+  }
 }
