@@ -13,7 +13,7 @@ use termoak_core::store::users::SecondFactor;
 use termoak_core::time::now_ms;
 use utoipa::ToSchema;
 
-use crate::auth::{AuthResponse, AuthUser, ClientIp};
+use crate::auth::{AuthResponse, AuthUser, ClientIp, UserAgent};
 use crate::config::{Plan, PlanLimits, PlansSection};
 use crate::email;
 use crate::error::{ApiError, ApiResult};
@@ -450,6 +450,7 @@ async fn account_for(st: &AppState, email: &str) -> ApiResult<Option<User>> {
 async fn verify_code(
     State(st): State<AppState>,
     ClientIp(ip): ClientIp,
+    UserAgent(ua): UserAgent,
     Json(req): Json<VerifyCode>,
 ) -> ApiResult<Json<AuthResponse>> {
     if st.limiter.is_blocked(&req.email, ip) {
@@ -516,7 +517,13 @@ async fn verify_code(
     let user = st.store.set_email_verified(user.id, true).await?;
     let tokens = st
         .store
-        .issue_device(user.id, &req.device_name, &req.platform, st.ttl)
+        .issue_device_from(
+            user.id,
+            &req.device_name,
+            &req.platform,
+            st.ttl,
+            Some(&crate::auth::client_info(ip, &ua)),
+        )
         .await?;
     let actor = format!("user:{}", user.id);
     st.store
@@ -717,6 +724,7 @@ async fn reset_password(
         .ok_or_else(invalid_link)?;
     st.store.set_password(t.user_id, &req.password).await?;
     let signed_out = st.store.revoke_all_devices(t.user_id).await?;
+    st.sockets.sign_out_user(t.user_id);
     let user = st.store.user(t.user_id).await?;
     if user.email.eq_ignore_ascii_case(&t.email) {
         st.store.set_email_verified(user.id, true).await?;
@@ -833,6 +841,7 @@ pub async fn delete_account(
         let _ = st.sessions.close(&live, u.id()).await;
     }
     st.store.delete_user(u.id()).await?;
+    st.sockets.sign_out_user_events(u.id());
     for v in &owned {
         st.sessions.close_for_vault(None, *v).await;
         st.pool.invalidate_vault(*v, None).await;

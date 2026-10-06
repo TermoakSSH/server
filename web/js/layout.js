@@ -73,6 +73,7 @@ function userMenu(placement) {
       { header: u.email || '' },
       { label: t('layout.my_account'), icon: 'user', href: '/app/account' },
       { label: t('layout.menu.security'), icon: 'shield', href: '/app/account/security' },
+      { label: t('layout.menu.sessions'), icon: 'laptop', href: '/app/account/devices' },
       { separator: true },
       { header: t('theme.title') },
       ...[['system', t('theme.system'), 'monitor'], ['dark', t('theme.dark'), 'moon'], ['light', t('theme.light'), 'sun']].map(([value, label, ico]) => ({

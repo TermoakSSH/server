@@ -32,6 +32,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::auth::{AuthUser, MaybeUser};
+use crate::devices::{SocketGuard, SocketKind, signed_out};
 use crate::error::{ApiError, ApiResult};
 use crate::room::{
     EndCode, Joiner, MAX_CONTROL_MINUTES, ParticipantKind, Request, better, clean_guest_key,
@@ -810,13 +811,18 @@ async fn ws(
                 .with_code("session_owner_only"),
         );
     }
+    // Signed-in participants leave as soon as their device is signed out.
+    let guard = user.as_ref().map(|u| {
+        st.sockets
+            .register(u.id(), u.device.id, SocketKind::Session)
+    });
     Ok(upgrade
         .max_message_size(1 << 20)
         .on_upgrade(move |socket| async move {
             if is_host {
-                host_loop(st, live, socket, joiner).await
+                host_loop(st, live, socket, joiner, guard).await
             } else {
-                viewer_loop(st, live, socket, joiner).await
+                viewer_loop(st, live, socket, joiner, guard).await
             }
         }))
 }
@@ -1461,6 +1467,7 @@ async fn wait_for_owner(
     socket: &mut WebSocket,
     signals: &mut broadcast::Receiver<Signal>,
     ctx: &Ctx,
+    guard: &Option<SocketGuard>,
 ) -> bool {
     let owner = st
         .store
@@ -1517,6 +1524,10 @@ async fn wait_for_owner(
                     return false;
                 }
             }
+            _ = signed_out(guard) => {
+                send_end(socket, EndCode::SignedOut).await;
+                return false;
+            }
         }
     }
 }
@@ -1526,6 +1537,7 @@ async fn viewer_loop(
     live: std::sync::Arc<LiveSession>,
     mut socket: WebSocket,
     joiner: Joiner,
+    guard: Option<SocketGuard>,
 ) {
     let sid = new_id();
     // Subscribed before joining: nothing is missed.
@@ -1541,7 +1553,7 @@ async fn viewer_loop(
     live.touch();
     live.signal(Signal::Room);
     joined(&st, &live, &j, "viewer").await;
-    if !j.admitted && !wait_for_owner(&st, &live, &mut socket, &mut signals, &ctx).await {
+    if !j.admitted && !wait_for_owner(&st, &live, &mut socket, &mut signals, &ctx, &guard).await {
         leave(&st, &live, sid);
         return;
     }
@@ -1682,6 +1694,10 @@ async fn viewer_loop(
                     break;
                 }
             }
+            _ = signed_out(&guard) => {
+                send_end(&mut socket, EndCode::SignedOut).await;
+                break;
+            }
         }
     }
     leave(&st, &live, sid);
@@ -1692,6 +1708,7 @@ async fn host_loop(
     live: std::sync::Arc<LiveSession>,
     mut socket: WebSocket,
     joiner: Joiner,
+    guard: Option<SocketGuard>,
 ) {
     let Some(hub) = live.hub() else { return };
     let Some(mut input) = st.sessions.relay_input(&live) else {
@@ -1785,6 +1802,10 @@ async fn host_loop(
                         .await;
                     break;
                 }
+            }
+            _ = signed_out(&guard) => {
+                send_end(&mut socket, EndCode::SignedOut).await;
+                break;
             }
         }
     }

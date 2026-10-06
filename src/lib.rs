@@ -11,6 +11,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 pub mod account;
 pub mod auth;
 pub mod config;
+pub mod devices;
 pub mod email;
 pub mod error;
 pub mod holder;
@@ -176,5 +177,6 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
             60_000,
         ),
         instance_id,
+        sockets: devices::Sockets::new(),
     })))
 }

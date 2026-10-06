@@ -7,11 +7,14 @@
 // On the terminal page of that same session the terminal shows it already
 // (banners and the keyboard bar), so no toast there. Started by app.js: it
 // connects while there is a signed-in account and reconnects by itself.
+//
+// When this device is signed out from another one (`signed_out`, close code
+// 4007), the next request finds the session lost and goes to sign in.
 
 import { h } from './dom.js';
 import { icon } from './icons.js';
 import { freshAccessToken } from './api.js';
-import { state, subscribe, isLoggedIn } from './session.js';
+import { state, subscribe, isLoggedIn, loadMe } from './session.js';
 import { toast } from './ui.js';
 import { t } from './i18n.js';
 
@@ -60,6 +63,25 @@ function onSessionNotice(n) {
   }
 }
 
+// Close code of `signed_out`: this device was signed out.
+const SIGNED_OUT = 4007;
+
+/** This device was signed out on the server: check the session (a 401 sends to sign in). */
+function signedOut() {
+  disconnect();
+  // A moment for this tab's own "sign out everywhere" to finish first.
+  setTimeout(() => {
+    if (!isLoggedIn()) return;
+    loadMe().then(() => {
+      // Still signed in after all: listen again.
+      if (userId && !ws) {
+        stopped = false;
+        retry();
+      }
+    }).catch(() => {});
+  }, 400);
+}
+
 function disconnect() {
   stopped = true;
   clearTimeout(retryTimer);
@@ -100,9 +122,13 @@ async function connect() {
     }
     if (msg.type === 'session' && msg.notice) onSessionNotice(msg.notice);
   };
-  sock.onclose = () => {
+  sock.onclose = (ev) => {
     if (ws !== sock) return;
     ws = null;
+    if (ev.code === SIGNED_OUT) {
+      signedOut();
+      return;
+    }
     retry();
   };
 }

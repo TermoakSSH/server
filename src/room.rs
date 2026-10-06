@@ -66,6 +66,8 @@ pub enum EndCode {
     JoinDenied,
     /// No access.
     Forbidden,
+    /// The device of this connection was signed out.
+    SignedOut,
 }
 
 impl EndCode {
@@ -77,6 +79,7 @@ impl EndCode {
             EndCode::SessionEnded => "session_ended",
             EndCode::JoinDenied => "join_denied",
             EndCode::Forbidden => "forbidden",
+            EndCode::SignedOut => "signed_out",
         }
     }
 
@@ -89,6 +92,7 @@ impl EndCode {
             EndCode::SessionEnded => 4004,
             EndCode::JoinDenied => 4005,
             EndCode::Forbidden => 4006,
+            EndCode::SignedOut => 4007,
         }
     }
 
@@ -104,6 +108,7 @@ impl EndCode {
                 "the owner did not let you in; you have no access to this session"
             }
             EndCode::Forbidden => "you no longer have access to this session",
+            EndCode::SignedOut => "this device was signed out",
         }
     }
 }

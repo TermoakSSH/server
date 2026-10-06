@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use termoak_core::Id;
 use termoak_core::model::{Device, Invite, TeamRole, TokenPair, User};
-use termoak_core::store::users::SecondFactor;
+use termoak_core::store::users::{ClientInfo, SecondFactor};
 use utoipa::ToSchema;
 
 use crate::config::Registration;
@@ -75,7 +75,8 @@ impl FromRequestParts<AppState> for AuthUser {
     ) -> Result<Self, Self::Rejection> {
         let token =
             bearer_token(parts).ok_or_else(|| ApiError::unauthorized("missing access token"))?;
-        match state.store.authenticate(&token).await? {
+        let client = client_info(client_ip(parts, state), &user_agent(parts));
+        match state.store.authenticate_from(&token, Some(&client)).await? {
             Some((user, device)) => {
                 // Without a verified email (if the server requires it) the
                 // user can only manage their own account.
@@ -128,22 +129,56 @@ impl FromRequestParts<AppState> for ClientIp {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if state.config.server.trust_forwarded_for
-            && let Some(ip) = parts
-                .headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.rsplit(',').next())
-                .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        {
-            return Ok(ClientIp(Some(ip)));
-        }
-        Ok(ClientIp(
-            parts
-                .extensions
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|c| c.0.ip()),
-        ))
+        Ok(ClientIp(client_ip(parts, state)))
+    }
+}
+
+/// The client IP of a request (see [`ClientIp`]).
+pub fn client_ip(parts: &Parts, state: &AppState) -> Option<IpAddr> {
+    if state.config.server.trust_forwarded_for
+        && let Some(ip) = parts
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+    {
+        return Some(ip);
+    }
+    parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip())
+}
+
+/// Short description of the client from `User-Agent` (`Firefox 131 on Linux`).
+pub struct UserAgent(pub Option<String>);
+
+impl FromRequestParts<AppState> for UserAgent {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(UserAgent(user_agent(parts)))
+    }
+}
+
+fn user_agent(parts: &Parts) -> Option<String> {
+    parts
+        .headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::devices::describe_user_agent)
+}
+
+/// Where a device is used from, for its "last seen".
+pub fn client_info(ip: Option<IpAddr>, user_agent: &Option<String>) -> ClientInfo {
+    ClientInfo {
+        // IPv4-mapped IPv6 addresses (`::ffff:1.2.3.4`) as IPv4.
+        ip: ip.map(|ip| ip.to_canonical().to_string()),
+        user_agent: user_agent.clone(),
     }
 }
 
@@ -381,6 +416,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/me/2fa/enable", post(totp_enable))
         .route("/api/v1/me/2fa/disable", post(totp_disable))
         .route("/api/v1/devices", get(devices))
+        .route("/api/v1/devices/sign-out-all", post(sign_out_all))
         .route("/api/v1/devices/{id}", delete(revoke_device))
         .route("/api/v1/invites/{token}", get(invite_info))
         .route("/api/v1/admin/users", get(list_users).post(create_user))
@@ -477,6 +513,7 @@ fn requested_locale(locale: &str) -> ApiResult<&'static str> {
 async fn register(
     State(st): State<AppState>,
     ClientIp(ip): ClientIp,
+    UserAgent(ua): UserAgent,
     headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> ApiResult<Json<AuthResponse>> {
@@ -558,7 +595,13 @@ async fn register(
     }
     let tokens = st
         .store
-        .issue_device(user.id, &req.device_name, &req.platform, st.ttl)
+        .issue_device_from(
+            user.id,
+            &req.device_name,
+            &req.platform,
+            st.ttl,
+            Some(&client_info(ip, &ua)),
+        )
         .await?;
     let mut detail = json!({"platform": req.platform, "invite": invite.as_ref().map(|i| i.id)});
     if let Some(terms) = terms {
@@ -645,6 +688,7 @@ pub(crate) fn unix_secs() -> u64 {
 async fn login(
     State(st): State<AppState>,
     ClientIp(ip): ClientIp,
+    UserAgent(ua): UserAgent,
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Json<AuthResponse>> {
     if st.limiter.is_blocked(&req.email, ip) {
@@ -686,7 +730,13 @@ async fn login(
     st.limiter.success(&req.email);
     let tokens = st
         .store
-        .issue_device(user.id, &req.device_name, &req.platform, st.ttl)
+        .issue_device_from(
+            user.id,
+            &req.device_name,
+            &req.platform,
+            st.ttl,
+            Some(&client_info(ip, &ua)),
+        )
         .await?;
     st.store
         .audit(
@@ -712,10 +762,12 @@ async fn login(
 
 async fn refresh(
     State(st): State<AppState>,
+    ClientIp(ip): ClientIp,
+    UserAgent(ua): UserAgent,
     Json(req): Json<RefreshRequest>,
 ) -> ApiResult<Json<TokenPair>> {
     st.store
-        .refresh_device(&req.refresh_token, st.ttl)
+        .refresh_device_from(&req.refresh_token, st.ttl, Some(&client_info(ip, &ua)))
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::unauthorized("invalid or expired refresh token"))
@@ -723,6 +775,7 @@ async fn refresh(
 
 async fn logout(State(st): State<AppState>, u: AuthUser) -> ApiResult<Json<Value>> {
     st.store.revoke_device(u.id(), u.device.id).await?;
+    st.sockets.sign_out_device(u.device.id);
     Ok(Json(json!({"ok": true})))
 }
 
@@ -786,16 +839,48 @@ async fn revoke_device(
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Value>> {
     st.store.revoke_device(u.id(), id).await?;
+    st.sockets.sign_out_device(id);
     st.store
         .audit(
             u.id(),
             &u.actor(),
             "auth.device_revoked",
             Some(id.to_string()),
-            json!({}),
+            json!({"current": id == u.device.id}),
         )
         .await?;
     Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct SignOutAll {
+    /// Sign this device out too (`false` by default: only the others).
+    #[serde(default)]
+    pub include_current: bool,
+}
+
+/// `POST /api/v1/devices/sign-out-all`: signs out every device of the user
+/// but this one (or this one too with `include_current`) and closes their
+/// WebSockets.
+async fn sign_out_all(
+    State(st): State<AppState>,
+    u: AuthUser,
+    req: Option<Json<SignOutAll>>,
+) -> ApiResult<Json<Value>> {
+    let include_current = req.is_some_and(|Json(r)| r.include_current);
+    let keep = (!include_current).then_some(u.device.id);
+    let revoked = st.store.revoke_devices_except(u.id(), keep).await?;
+    st.sockets.sign_out_devices(&revoked);
+    st.store
+        .audit(
+            u.id(),
+            &u.actor(),
+            "auth.devices_revoked",
+            None,
+            json!({"count": revoked.len(), "include_current": include_current}),
+        )
+        .await?;
+    Ok(Json(json!({"revoked": revoked.len()})))
 }
 
 async fn list_users(State(st): State<AppState>, _a: AdminUser) -> ApiResult<Json<Vec<User>>> {
@@ -863,6 +948,7 @@ async fn update_user(
         // A disabled account leaves the sessions shared with it and loses
         // its server sessions and pooled connections on every vault.
         st.sessions.remove_user(id).await;
+        st.sockets.sign_out_user_events(id);
         if let Ok(access) = st.store.vault_access(id).await {
             crate::vaults::revoke_all(&st, id, &access).await;
         }
@@ -1109,6 +1195,7 @@ async fn admin_reset_password(
     crate::account::check_password_len(&req.password)?;
     st.store.set_password(id, &req.password).await?;
     let signed_out = st.store.revoke_all_devices(id).await?;
+    st.sockets.sign_out_user(id);
     st.store
         .audit(
             a.id(),
@@ -1155,6 +1242,7 @@ async fn admin_revoke_device(
     Path((id, device_id)): Path<(Id, Id)>,
 ) -> ApiResult<Json<Value>> {
     st.store.revoke_device(id, device_id).await?;
+    st.sockets.sign_out_device(device_id);
     st.store
         .audit(
             a.id(),

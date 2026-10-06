@@ -37,6 +37,8 @@ pub struct Inner {
     pub credentials_limiter: crate::limiter::RateLimiter,
     /// Random id of this server's database (`/info`).
     pub instance_id: String,
+    /// Open WebSockets per device (closed when the device is signed out).
+    pub sockets: Arc<crate::devices::Sockets>,
 }
 
 #[derive(Clone)]

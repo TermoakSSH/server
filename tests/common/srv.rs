@@ -43,6 +43,16 @@ impl Srv {
     }
 
     pub async fn start_with(configure: impl FnOnce(&mut ServerConfig)) -> Self {
+        Self::launch(configure, false).await
+    }
+
+    /// Like production: the server sees the client address (`ClientIp`), so
+    /// the per-IP limits apply.
+    pub async fn start_with_client_ip(configure: impl FnOnce(&mut ServerConfig)) -> Self {
+        Self::launch(configure, true).await
+    }
+
+    async fn launch(configure: impl FnOnce(&mut ServerConfig), client_ip: bool) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let data = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -56,7 +66,12 @@ impl Srv {
         configure(&mut config);
         let state = build_state(config).await.unwrap();
         let router = routes::router(state.clone());
-        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        if client_ip {
+            let app = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        } else {
+            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        }
         Srv {
             base: format!("http://{addr}"),
             http: reqwest::Client::new(),

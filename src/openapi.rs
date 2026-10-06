@@ -188,15 +188,23 @@ fn endpoints() -> Vec<Ep> {
             Get,
             "/api/v1/devices",
             "auth",
-            "Signed-in devices",
+            "Sessions and devices: `{current, devices: [Device]}` (with `last_ip` and `user_agent`)",
             None,
+            Object,
+        ),
+        ep(
+            Post,
+            "/api/v1/devices/sign-out-all",
+            "auth",
+            "Sign out every other device (or all, with `include_current`) and close their WebSockets: `{revoked}`",
+            Ref("SignOutAll"),
             Object,
         ),
         ep(
             Delete,
             "/api/v1/devices/{id}",
             "auth",
-            "Sign out a device",
+            "Sign out a device (its token stops working and its WebSockets close at once)",
             None,
             Object,
         ),
@@ -1421,6 +1429,7 @@ pub fn document() -> OpenApi {
         .schema_from::<crate::config::PlanLimits>()
         .schema_from::<crate::push::RegisterPush>()
         .schema_from::<Device>()
+        .schema_from::<SignOutAll>()
         .schema_from::<TokenPair>()
         .schema_from::<SessionInfo>()
         .schema_from::<SessionStatus>()

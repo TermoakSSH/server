@@ -68,6 +68,7 @@ const END_CODES = {
   session_ended: 4004,
   join_denied: 4005,
   forbidden: 4006,
+  signed_out: 4007,
 };
 const END_BY_CLOSE = Object.fromEntries(Object.entries(END_CODES).map(([k, v]) => [v, k]));
 
@@ -479,6 +480,7 @@ export function mountTerminal(opts) {
     session_ended: ['power', 'terminal.overlay.ended', 'terminal.end.session_ended_text'],
     join_denied: ['lock', 'terminal.end.join_denied_title', 'terminal.end.join_denied_text'],
     forbidden: ['lock', 'terminal.overlay.no_access', 'terminal.end.forbidden_text'],
+    signed_out: ['logout', 'terminal.end.signed_out_title', 'terminal.end.signed_out_text'],
   };
 
   const endWith = (code) => {

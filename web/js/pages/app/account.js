@@ -1,5 +1,5 @@
 // Account: profile and email, preferences (language), security (password and
-// two-step verification), devices, and deleting the account.
+// two-step verification), sessions and devices, and deleting the account.
 
 import { h, replace, uid } from '../../dom.js';
 import { icon } from '../../icons.js';
@@ -370,7 +370,59 @@ function totpCard(ctx) {
   return section;
 }
 
-// --- Devices -------------------------------------------------------------------
+// --- Sessions and devices --------------------------------------------------------
+
+/** This device was signed out on the server: forget it here and go to sign in. */
+async function signedOutHere(message) {
+  await signOut({ remote: false });
+  if (message) toast(message, 'success');
+  navigate('/login');
+}
+
+function deviceRow(d, current, reload) {
+  const revoke = h('button', { class: 'btn btn-sm btn-danger-ghost', type: 'button', dataset: { action: 'sign-out-device' } },
+    icon('logout', { size: 15 }), t('common.sign_out'));
+  revoke.addEventListener('click', async () => {
+    const ok = await confirmDialog({
+      title: current ? t('account.devices.sign_out_here_title') : t('account.devices.sign_out_device_title', { name: d.name }),
+      message: current ? t('account.devices.sign_out_here_text') : t('account.devices.sign_out_device_text'),
+      confirmLabel: t('common.sign_out'),
+      danger: !current,
+    });
+    if (!ok) return;
+    busy(revoke, async () => {
+      try {
+        await api.del(`/devices/${d.id}`);
+        if (current) {
+          await signedOutHere();
+          return;
+        }
+        toast(t('account.devices.signed_out_device', { name: d.name }), 'success');
+        reload();
+      } catch (e) {
+        toastError(e);
+      }
+    });
+  });
+  const meta = [
+    h('span', null, platformLabel(d.platform)),
+    d.user_agent ? h('span', { dataset: { field: 'client' } }, d.user_agent) : null,
+    d.last_ip ? h('span', { dataset: { field: 'ip' } }, t('account.devices.ip', { ip: d.last_ip })) : null,
+  ];
+  const times = [
+    h('span', null, current ? t('account.devices.active_now') : tx('account.devices.last_used', { time: timeEl(d.last_seen_at) })),
+    h('span', null, tx('account.devices.since', { time: timeEl(d.created_at) })),
+  ];
+  return h('div', { class: 'list-item', dataset: { deviceId: d.id, current: current ? 'true' : 'false' } },
+    h('span', { class: ['icon-tile', !current && 'muted-tile'] }, icon(platformIcon(d.platform), { size: 18 })),
+    h('div', { class: 'list-item-main' },
+      h('div', { class: 'list-item-title' }, h('span', { class: 'break' }, d.name),
+        current ? badge(t('account.devices.this_device'), 'accent') : null,
+        d.push ? badge(t('account.devices.notifications'), 'info', 'send') : null),
+      h('div', { class: 'list-item-meta' }, meta),
+      h('div', { class: 'list-item-meta' }, times)),
+    h('div', { class: 'list-item-actions keep-inline' }, revoke));
+}
 
 function devicesCard(ctx) {
   const body = h('div', null, loadingState(t('account.devices.loading')));
@@ -379,64 +431,52 @@ function devicesCard(ctx) {
       const data = await api.get('/devices');
       if (!ctx.alive()) return;
       const others = data.devices.filter((d) => d.id !== data.current);
-      const signOutOthers = h('button', { class: 'btn btn-sm btn-danger-ghost', type: 'button', disabled: !others.length }, t('account.devices.sign_out_others'));
+      // This device first, then the most recently used.
+      const rows = data.devices.filter((d) => d.id === data.current).concat(others);
+      const signOutOthers = h('button', { class: 'btn btn-sm', type: 'button', disabled: !others.length, dataset: { action: 'sign-out-others' } },
+        t('account.devices.sign_out_others'));
       signOutOthers.addEventListener('click', async () => {
-        const ok = await confirmDialog({ title: t('account.devices.sign_out_others_title'), message: t('account.devices.sign_out_others_text', { count: others.length }), confirmLabel: t('account.devices.sign_out_others_confirm'), danger: true });
+        const ok = await confirmDialog({
+          title: t('account.devices.sign_out_others_title'),
+          message: t('account.devices.sign_out_others_text', { count: others.length }),
+          confirmLabel: t('account.devices.sign_out_others_confirm'),
+          danger: true,
+        });
         if (!ok) return;
         busy(signOutOthers, async () => {
-          let fail = 0;
-          for (const d of others) {
-            try {
-              await api.del(`/devices/${d.id}`);
-            } catch {
-              fail += 1;
-            }
+          try {
+            const r = await api.post('/devices/sign-out-all', { include_current: false });
+            toast(t('account.devices.signed_out_others', { count: r.revoked || 0 }), 'success');
+            load();
+          } catch (e) {
+            toastError(e);
           }
-          toast(fail ? t('account.devices.sign_out_failed', { count: fail }) : t('account.devices.signed_out_others'), fail ? 'error' : 'success');
-          load();
         });
       });
-      const list = data.devices.map((d) => {
-        const current = d.id === data.current;
-        const revoke = h('button', { class: 'btn btn-sm btn-danger-ghost', type: 'button' }, current ? t('common.sign_out') : t('account.devices.disconnect'));
-        revoke.addEventListener('click', async () => {
-          const ok = await confirmDialog({
-            title: current ? t('account.devices.sign_out_here_title') : t('account.devices.disconnect_title', { name: d.name }),
-            message: current ? t('account.devices.sign_out_here_text') : t('account.devices.disconnect_text'),
-            confirmLabel: current ? t('common.sign_out') : t('account.devices.disconnect'),
-            danger: !current,
-          });
-          if (!ok) return;
-          busy(revoke, async () => {
-            try {
-              await api.del(`/devices/${d.id}`);
-              if (current) {
-                await signOut({ remote: false });
-                navigate('/login');
-                return;
-              }
-              toast(t('account.devices.disconnected', { name: d.name }), 'success');
-              load();
-            } catch (e) {
-              toastError(e);
-            }
-          });
+      const signOutEverywhere = h('button', { class: 'btn btn-sm btn-danger-ghost', type: 'button', dataset: { action: 'sign-out-everywhere' } },
+        icon('logout', { size: 15 }), t('account.devices.sign_out_everywhere'));
+      signOutEverywhere.addEventListener('click', async () => {
+        const ok = await confirmDialog({
+          title: t('account.devices.sign_out_everywhere_title'),
+          message: t('account.devices.sign_out_everywhere_text', { count: data.devices.length }),
+          confirmLabel: t('account.devices.sign_out_everywhere_confirm'),
+          danger: true,
         });
-        return h('div', { class: 'list-item' },
-          h('span', { class: ['icon-tile', !current && 'muted-tile'] }, icon(platformIcon(d.platform), { size: 18 })),
-          h('div', { class: 'list-item-main' },
-            h('div', { class: 'list-item-title' }, h('span', { class: 'break' }, d.name),
-              current ? badge(t('account.devices.this_device'), 'accent') : null,
-              d.push ? badge(t('account.devices.notifications'), 'info', 'send') : null),
-            h('div', { class: 'list-item-meta' },
-              h('span', null, platformLabel(d.platform)),
-              h('span', null, tx('account.devices.last_used', { time: timeEl(d.last_seen_at) })),
-              h('span', null, tx('account.devices.since', { time: timeEl(d.created_at) })))),
-          h('div', { class: 'list-item-actions keep-inline' }, revoke));
+        if (!ok) return;
+        busy(signOutEverywhere, async () => {
+          try {
+            await api.post('/devices/sign-out-all', { include_current: true });
+            await signedOutHere(t('account.devices.signed_out_everywhere'));
+          } catch (e) {
+            toastError(e);
+          }
+        });
       });
       replace(body, h('div', { class: 'stack' },
-        h('div', { class: 'card card-flush' }, h('div', { class: 'list' }, list)),
-        h('div', { class: 'row-between' }, h('span', { class: 'small muted' }, t('account.devices.count', { count: data.devices.length })), signOutOthers)));
+        h('div', { class: 'card card-flush' }, h('div', { class: 'list', dataset: { devices: '' } }, rows.map((d) => deviceRow(d, d.id === data.current, load)))),
+        h('div', { class: 'row-between' },
+          h('span', { class: 'small muted' }, t('account.devices.count', { count: data.devices.length })),
+          h('div', { class: 'row-wrap' }, signOutOthers, signOutEverywhere))));
     } catch (e) {
       if (ctx.alive()) replace(body, errorState(e, load));
     }

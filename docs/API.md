@@ -139,7 +139,7 @@ Server sessions:
 | `invalid_control_minutes` | 400 | A timed grant of the keyboard (`control_minutes`) must be 1 to 240 minutes |
 
 The terminal WebSocket has its own codes (`revoked`, `kicked`, `expired`,
-`session_ended`, `join_denied`, `forbidden`), see
+`session_ended`, `join_denied`, `forbidden`, `signed_out`), see
 [WEBSOCKET-PROTOCOL.md](WEBSOCKET-PROTOCOL.md#errors-and-close-codes).
 
 SSH and SFTP:
@@ -213,9 +213,38 @@ Sync, AI, push notifications and updates:
 | POST | `/me/2fa/setup` | → `{secret, otpauth_url, qr_svg}`. A new secret, not enabled yet |
 | POST | `/me/2fa/enable` | `{code}` → `{recovery_codes}` (10 single-use codes, shown only now) |
 | POST | `/me/2fa/disable` | `{password, code}` (current code or recovery code) |
-| GET | `/devices` | Devices signed in |
-| DELETE | `/devices/{id}` | Signs a device out |
+| GET | `/devices` | Sessions and devices: `{current, devices: [Device]}`. See [Sessions and devices](#sessions-and-devices) |
+| POST | `/devices/sign-out-all` | `{include_current?}` → `{revoked}`. Signs out every other device (all of them with `include_current: true`) |
+| DELETE | `/devices/{id}` | Signs a device out (this one too, if it is the current one) |
 | GET | `/invites/{token}` | Public data of an invitation (no authentication): `{email, team, expires_at}` |
+
+### Sessions and devices
+
+Every sign-in is a device with its own tokens. `GET /devices` lists them,
+most recently used first; `current` is the id of the device making the
+request. Each `Device` has `id`, `name` and `platform` (as sent on sign-in),
+`created_at` (signed in since), `last_seen_at`, `access_expires_at`,
+`refresh_expires_at`, `push` (`apns`/`fcm` when it receives notifications)
+and:
+
+- `last_ip`: the last address it was used from: the connection's or, with
+  `trust_forwarded_for`, the last one in `X-Forwarded-For` (the same one the
+  sign-in limits use).
+- `user_agent`: a short description of the client from its `User-Agent`
+  (`Firefox 131 on Linux`, `Safari 18 on iOS`, `Termoak 0.4.0`...).
+
+Both are recorded on sign-in and on refresh and, while the device is used,
+with `last_seen_at` (at most once a minute). They are `null` for devices
+signed in before the server recorded them, until they are used again.
+
+Signing a device out (`DELETE /devices/{id}`, `POST /auth/logout`, `POST
+/devices/sign-out-all`, a password reset, an administrator) takes effect at
+once: its access token gets `401` from the next request (not when it
+expires), its refresh token stops working, its push registration goes away
+and its WebSockets (events, terminal, sharing) close with `signed_out`
+(close code 4007). `POST /devices/sign-out-all` writes one audit entry
+`auth.devices_revoked` with `{count, include_current}`; signing out one
+device writes `auth.device_revoked`.
 
 ### Language
 
@@ -385,7 +414,7 @@ Server administrators only.
 | POST | `/admin/teams/{id}/plan` | `{plan}`. Plan of a team |
 | POST | `/admin/users/{id}/password` | `{password}`. Sets a new password and signs the user out |
 | POST | `/admin/users/{id}/2fa/reset` | Removes two-step verification |
-| GET | `/admin/users/{id}/devices` | The user's devices |
+| GET | `/admin/users/{id}/devices` | The user's devices (with `last_ip` and `user_agent`) |
 | DELETE | `/admin/users/{id}/devices/{device_id}` | Signs out one of the user's devices |
 | GET, POST | `/admin/invites` | Lists or creates invitations `{email?, team_id?, team_role?, is_admin, expires_in_hours?, send_email?}` → `{invite, token, server, url, web_url, emailed}` |
 | DELETE | `/admin/invites/{id}` | Revokes an unused invitation |

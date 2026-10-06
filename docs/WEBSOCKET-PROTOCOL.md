@@ -196,6 +196,7 @@ reason. Clients must not reconnect after these:
 | `session_ended` | 4004 | The session ended (the last `status` arrives first) |
 | `join_denied` | 4005 | The owner did not let them in |
 | `forbidden` | 4006 | No access any more |
+| `signed_out` | 4007 | The device of this connection was signed out (the access token no longer works: sign in again) |
 
 Other errors (`forbidden` for a single action, `bad_request`,
 `participant_not_found`, `invalid_control_minutes`, `internal`) do not close the socket and must not
@@ -254,7 +255,7 @@ Receive only, with user authentication. On connect:
 {"type":"hello","user":{…},"pending_approvals":[…]}
 ```
 
-and then three kinds of messages:
+and then three kinds of messages (plus `signed_out`, below):
 
 ```json
 {"type":"ai","task_id":"…","seq":42,"event":{"type":"approval_requested","approval_id":"…","tool":"run_command","summary":"…","input":{…}}}
@@ -289,6 +290,11 @@ and then three kinds of messages:
 |---|---|---|
 | `changed` | `vault_id`, `rev` | Items of a vault you can access changed: sync (v2). Coalesced per vault (one every 500 ms at most) and sent to every member online |
 | `access` | `vault_id`, `role`, `reason` | Your access changed. `role` is the new role (`manager`, `editor`, `use_only`) or `null` when you lost it; `reason` is `granted`, `role_changed`, `revoked`, `deleted` or `updated` (settings such as the Strict switch). Sync after it |
+
+When the device is signed out (from another device, a password reset or an
+administrator), the server sends `{"type":"signed_out","message":"…"}` and
+closes the socket with close code 4007 (`signed_out`): do not reconnect,
+the token no longer works.
 
 When access is revoked, your server sessions on hosts of that vault end with
 `session_closed` and `reason: "vault_access_revoked"`. Clients must ignore
