@@ -254,11 +254,12 @@ Receive only, with user authentication. On connect:
 {"type":"hello","user":{…},"pending_approvals":[…]}
 ```
 
-and then two kinds of messages:
+and then three kinds of messages:
 
 ```json
 {"type":"ai","task_id":"…","seq":42,"event":{"type":"approval_requested","approval_id":"…","tool":"run_command","summary":"…","input":{…}}}
 {"type":"session","notice":{"type":"session_shared","session":{…},"by":"Ana","team":"Ops"}}
+{"type":"vault","event":"changed","vault_id":"…","rev":1234}
 ```
 
 | `ai.event.type` | Meaning |
@@ -283,6 +284,15 @@ and then two kinds of messages:
 | `control_request` | `session_id`, `title`, `participant` | Someone asks for the keyboard of one of your sessions |
 | `control_granted` | `session_id` | You got the keyboard of a session shared with you |
 | `control_revoked` | `session_id` | You lost the keyboard of a session shared with you |
+
+| `vault.event` | Fields | Meaning |
+|---|---|---|
+| `changed` | `vault_id`, `rev` | Items of a vault you can access changed: sync (v2). Coalesced per vault (one every 500 ms at most) and sent to every member online |
+| `access` | `vault_id`, `role`, `reason` | Your access changed. `role` is the new role (`manager`, `editor`, `use_only`) or `null` when you lost it; `reason` is `granted`, `role_changed`, `revoked`, `deleted` or `updated` (settings such as the Strict switch). Sync after it |
+
+When access is revoked, your server sessions on hosts of that vault end with
+`session_closed` and `reason: "vault_access_revoked"`. Clients must ignore
+message types they do not know (older apps ignore `vault`).
 
 The same notices go out as push notifications (`prompt_pending` as
 `session_prompt`, `join_request`, `control_request`) when you are not

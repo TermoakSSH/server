@@ -161,6 +161,22 @@ Sync, AI, push notifications and updates:
 | Code | Status | Meaning |
 |---|---|---|
 | `too_many_changes` | 400 | Too many changes in a single sync request (maximum 5000) |
+| `vault_not_found` | 404 | The vault does not exist or you cannot see it |
+| `vault_read_only` | 403 | You can use the items of this vault (Use-only) but not change them |
+| `vault_manager_only` | 403 | Only the vault's managers (owner, team owners and admins) can do this |
+| `secret_hidden` | 403 | Use-only members never see the secrets of the vault |
+| `vault_personal` | 409 | The personal vault cannot be shared, deleted or left (and only its name, color and icon change) |
+| `use_transfer` | 409 | The item is in another vault: move it with `POST /vaults/{target}/transfer` |
+| `cross_vault_reference` | 422 | A reference points to an item of another vault. Extra field: `field` (`group_id`, `settings.key_id`...) |
+| `still_referenced` | 409 | You are moving a key or identity that other items still use (`force: true` detaches them). Extra field: `used_by` (`[{kind, id, field}]`) |
+| `use_only_strict` | 403 | Strict vault: Use-only members only connect through the server (no `/credentials`) |
+| `invalid_role` | 400 | Only `editor` and `use_only` can be granted |
+| `member_exists` | 409 | That user or team already has access to the vault |
+| `id_in_use` | 409 | The id belongs to an item you cannot see |
+| `not_team_member` | 403 | You can only share a vault with a team you belong to |
+| `confirmation_required` | 400 | Deleting a vault needs `?confirm=<its name>` |
+| `shared_vaults` | 409 | Deleting the account would delete your shared vaults with members: confirm with `delete_shared_vaults: true`. Extra field: `vaults` (`[{id, name, member_count}]`) |
+| `rate_limited` | 429 | Too many requests (`/hosts/{id}/credentials`: 30 per minute). Extra field: `retry_ms` |
 | `ai_not_configured` | 503 | The AI provider is not configured |
 | `ai_key_required` | 403 | The plan does not include the server's AI and you have no API key of your own that can be used: add one in Settings → AI (`PUT /me/ai/keys/{provider}`) |
 | `ai_budget_exceeded` | 403 | This month's AI credit for the server's providers is spent (your own API keys keep working) |
@@ -396,7 +412,97 @@ Roles: `member` (sees what is shared with the team), `admin` (also manages
 members and invitations and renames the team) and `owner` (also deletes the
 team and appoints or removes owners). A team always keeps at least one
 owner. Whoever leaves a team immediately loses access to the sessions shared
-with it.
+with it, and to its vaults (their server sessions on those hosts close).
+Deleting a team deletes its vaults with their items (`GET /vaults` shows the
+item counts first).
+
+## Vaults
+
+A **vault** is the unit of ownership, sharing and sync of entities (hosts,
+groups, identities, keys, snippets, forwards, known hosts, memories). Every
+item is in exactly one vault (`vault_id`).
+
+- Every user has a **personal** vault whose id is the user id. It cannot be
+  shared, deleted or left.
+- Users create **shared** vaults (they own them) and team owners and admins
+  create **team** vaults (the team owns them).
+- **Roles:** `use_only` < `editor` < `manager`. `manager` is computed: the
+  owner of a shared vault, the owners and admins of the team of a team
+  vault. Grants give `editor` or `use_only` to a user or to a team (you must
+  belong to it). Plain members of the owning team get the vault's
+  `team_member_role` (default `editor`; `null`: no access). The effective
+  role is the maximum of every grant.
+- **Use-only** members use the items (server sessions, SFTP, exec, the AI,
+  `/hosts/{id}/test`) but never see their secrets: no `secret` in sync,
+  `secret_hidden: true` in listings, `GET /{col}/{id}/secret` answers
+  `secret_hidden`. For connections from their own device the app asks for
+  just-in-time credentials (`POST /hosts/{id}/credentials`), unless the
+  vault is **Strict** (`settings.use_only_local: false`): then they only
+  connect through the server.
+- References (`group_id`, `parent_id`, `settings.identity_id`,
+  `settings.key_id`, `settings.jump_host_ids`, `settings.startup_snippet_id`,
+  an identity's `key_id`, `host_id` of forwards and memories) stay inside a
+  vault: REST refuses others (`cross_vault_reference`) and the server
+  resolves a reference outside the host's vault as missing.
+- Secrets are encrypted with a key per vault, wrapped with the server's
+  master key; deleting a vault deletes its key.
+
+| Method | Route | Who | Description |
+|---|---|---|---|
+| GET | `/vaults` | any | Vaults you can access (personal first) with `role`, `owner_name`, `member_count` and `item_counts` |
+| POST | `/vaults` | any (team: owners, admins) | `{name, description?, color?, icon?, team_id?, team_member_role?, settings?}` → `Vault` |
+| GET | `/vaults/{id}` | member | `Vault` |
+| PATCH | `/vaults/{id}` | manager | `{name?, description?, color?, icon?, team_member_role?, settings?}` (`null` clears `color`, `icon`, `team_member_role`). Personal: only name, color, icon |
+| DELETE | `/vaults/{id}?confirm=<name>` | manager | Deletes it with its items and keys. Members lose access (`vault/access` with `reason: deleted`) |
+| POST | `/vaults/{id}/leave` | member with a direct grant | Gives up your own grant |
+| GET | `/vaults/{id}/members` | member | `[VaultMember]`: implicit ones first (`implicit: true`: the owner or the team's owners and admins as managers, and the owning team with `team_member_role`), then the grants |
+| POST | `/vaults/{id}/members` | manager | `{email, role}` or `{team_id, role}` → `VaultMember`. Unknown email: `user_not_found` |
+| PATCH | `/vaults/{id}/members/{member_id}` | manager | `{role}` |
+| DELETE | `/vaults/{id}/members/{member_id}` | manager | Revokes the grant |
+| POST | `/vaults/{id}/transfer` | see below | Moves or copies items into this vault |
+| GET | `/vaults/{id}/audit` | manager | `?before=&limit=`: the vault's audit (`vault.*`, `secret.reveal`, `secret.use`, sessions...) |
+
+`Vault`: `{id, kind: personal|shared|team, name, description, color, icon,
+owner_user_id, owner_team_id, team_member_role, crypto: server, key_version,
+settings: {use_only_local}, rev, created_by, created_at, updated_at, role,
+owner_name, member_count, item_counts}`. New enum values may appear later:
+`kind`, `role` and `crypto` decode unknown values as `unknown` (a role
+`unknown` gives no access).
+
+When access is revoked (a grant removed, a vault or team deleted, a team
+member removed, an account disabled or deleted) the user's server sessions
+on hosts of that vault close (`session_closed` with reason
+`vault_access_revoked`) and the server drops its pooled connections. A
+downgrade to Use-only keeps the sessions running. Session shares are
+independent of vaults: sharing a terminal never grants its vault.
+
+### Move and copy
+
+```
+POST /vaults/{target}/transfer
+{"mode": "move" | "copy", "items": [{"kind": "host", "id": "…"}],
+ "dependencies": "auto" | "none", "dry_run": false, "force": false}
+→ {"moved": [{"kind", "id"}], "copied": [{"kind", "from", "to"}], "reused": [{"kind", "from", "to"}],
+   "detached": [{"kind", "id", "field"}], "warnings": [{"code", "kind", "id"}], "rev": 1234, "dry_run": false}
+```
+
+- A group brings its subgroups and their hosts; a host brings its forwards,
+  its memories and (copy; move if nothing else uses them) its known hosts.
+- `dependencies: auto`: the identity, key, jump hosts and startup snippet of
+  each host (from its effective settings). A move moves a dependency when
+  everything that uses it moves too, otherwise copies it (new id) and
+  rewrites the references; a copy copies it (a key with the same fingerprint
+  in the target is reused). `none` clears those references (`detached`).
+- An item that leaves its group behind gets the inherited settings written
+  into its own (`group_id: null`), so it connects the same way.
+- Moving a key or identity explicitly while items that stay still use it:
+  `still_referenced`, unless `force: true` (their references are detached).
+- Move: Editor on the source and target vaults; the ids are kept and the
+  source vault gets a departure (sync v2 `removed`, a deletion for old apps).
+  Copy: Editor on the target and the source (Use-only members can copy
+  snippets only); a copy never carries secrets out of a vault where you are
+  not Editor. Audited as `vault.transfer` in every vault involved.
+- `dry_run: true` answers the same without writing (for the confirmation).
 
 ## Entities
 
@@ -415,24 +521,95 @@ All of them follow the same CRUD pattern:
 
 | Method | Route | Description |
 |---|---|---|
-| GET | `/{col}` | List. Never includes secrets |
-| POST | `/{col}` | Create. The body is the entity plus `secret` (optional) and `sync_mode` (`synced` or `device_only`) |
-| GET | `/{col}/{id}` | One entity |
-| PUT | `/{col}/{id}` | Update. Without `secret` the current one is kept, `"secret": null` deletes it and an object replaces it |
-| DELETE | `/{col}/{id}` | Delete (leaves a tombstone for sync) |
-| GET | `/{col}/{id}/secret` | Reveals the secret. Audited |
+| GET | `/{col}` | List, from every vault you can use (`?vault_id=` for one). Each item has `vault_id`, `updated_by` and `secret_hidden`. Never includes secrets |
+| POST | `/{col}` | Create. The body is the entity plus `secret` (optional), `sync_mode` (`synced` or `device_only`) and `vault_id` (default: your personal vault; Editor) |
+| GET | `/{col}/{id}` | One entity. Without access to its vault: `404` |
+| PUT | `/{col}/{id}` | Update (Editor). Without `secret` the current one is kept, `"secret": null` deletes it and an object replaces it. Another `vault_id`: `use_transfer` |
+| DELETE | `/{col}/{id}` | Delete (Editor; leaves a tombstone for sync) |
+| GET | `/{col}/{id}/secret` | Reveals the secret (Editor; Use-only: `secret_hidden`). Audited as `secret.reveal` with the vault |
 
 Other entity routes:
 
 | Method | Route | Description |
 |---|---|---|
-| POST | `/keys/generate` | `{label, key_type, comment?, passphrase?, store_passphrase?}`. Generates the key on the server |
-| POST | `/keys/import` | `{label, private_key, passphrase?, store_passphrase?, certificate?, sync_mode?}` |
-| POST | `/hosts/{id}/test` | Tests the connection; returns the detected OS and the latency. `?trust=true` accepts a new host key |
-| GET | `/hosts/{id}/effective` | Effective settings after applying groups and identity |
-| POST | `/exec` | `{host_ids, command \| snippet_id + variables, timeout_secs?}`. Runs in parallel |
-| POST | `/sync` | `{since, changes: [SyncRecord]}` → `{rev, changes, accepted}` |
+| POST | `/keys/generate` | `{label, key_type, comment?, passphrase?, store_passphrase?, vault_id?}`. Generates the key on the server |
+| POST | `/keys/import` | `{label, private_key, passphrase?, store_passphrase?, certificate?, sync_mode?, vault_id?}` |
+| POST | `/hosts/{id}/test` | Tests the connection (any role); returns the detected OS (saved by Editors only) and the latency. `?trust=true` accepts a new host key: it is saved in the host's vault if you are Editor there, otherwise in your personal vault |
+| GET | `/hosts/{id}/effective` | Effective settings after applying groups and identity (any role) |
+| POST | `/hosts/{id}/credentials` | Just-in-time credentials for a connection from this device (below) |
+| POST | `/exec` | `{host_ids, command \| snippet_id + variables, timeout_secs?}`. Runs in parallel; any role, each host checked on its own |
+| POST | `/sync` | Legacy sync (below) |
+| POST | `/vaults/sync` | Sync v2 (below) |
 | GET | `/audit` | `?before=&limit=` |
+
+### Just-in-time credentials
+
+`POST /hosts/{id}/credentials {purpose: "ssh" | "sftp" | "forward"}` →
+`{vault_id, expires_at, hops: [{host_id, address, port, username, password?,
+key?: {private_key, passphrase?, certificate?}, proxy_password?}]}` with the
+jumps first and the host last. Editors always; Use-only members only if the
+vault is not Strict (`use_only_strict`). The answer has `Cache-Control:
+no-store`; the app keeps it in memory only until authentication ends and
+never stores or logs it. Limited to 30 per minute per user (`rate_limited`)
+and audited as `secret.use` (device and purpose) in the vault. This is
+interface protection plus auditing, not cryptography: anyone with the token
+can call it, which is what Strict vaults are for.
+
+### Sync v2
+
+`POST /vaults/sync` (when `/info` has `features.sync_v2`):
+
+```json
+{"vaults": [{"vault_id": "…", "cursor": 1234, "role": "editor"}],
+ "changes": [SyncRecord],
+ "limit": 2000}
+```
+
+→
+
+```json
+{"vaults": [Vault], "cursors": [{"vault_id", "cursor", "role"}],
+ "changes": [SyncRecord], "removed": [{"id", "vault_id", "kind", "rev"}],
+ "accepted": ["…"], "rejected": [{"id", "code", "message"}],
+ "warnings": [{"id", "code", "field"}], "resync": ["…"], "more": false}
+```
+
+- `vaults` is **authoritative**: a vault the store has that is not listed
+  was lost (revoked or deleted): delete its rows (no tombstones) and count
+  its unsynced changes as discarded.
+- Cursors are per vault: "the highest revision received for that vault"
+  (revisions are global to the server, so a newly granted vault starts at
+  0 without touching the others). Keep the returned `cursors`.
+- Pushed records carry `vault_id` (missing: the personal vault). Last writer
+  wins by `updated_at`. An item moved meanwhile is changed where it is now
+  if you are Editor there. Rejections: `vault_read_only`, `vault_not_found`,
+  `id_in_use` (an item you cannot see) and `invalid` (keep it dirty). A
+  reference to another vault is accepted with a `warnings` entry. A push
+  older than the server's version is accepted and the server's version comes
+  back in `changes`. `base_rev` (optional) is logged when the client
+  overwrites a newer revision.
+- `changes` always have `vault_id`. In Use-only vaults the `secret` is
+  withheld and `has_secret: true` says there is one.
+- `removed`: items that left a vault (moved): delete the local row where
+  `vault_id` matches.
+- `resync`: your role changed between Use-only and Editor in these vaults:
+  drop their local rows (secrets must come, or go). Their `changes` in this
+  response already start from 0.
+- `more: true`: the limit (default 2000, max 5000) cut the answer; call
+  again with the new cursors.
+- Sync on the `vault/changed` and `vault/access` events, after local saves,
+  periodically and after a `vault_read_only` from REST.
+
+### Legacy sync
+
+`POST /sync {since, changes: [SyncRecord]}` → `{rev, changes, accepted}` is
+what apps before vaults use. On a server with vaults it serves **only the
+personal vault**: `changes` are the personal vault's records after `since`,
+and items that left it (moved to another vault) come as deletions
+(`deleted: true`), so an old app drops them. Pushes land in the personal
+vault; an existing item that is now in another vault where you are Editor
+is changed there (and stays out of the answer). `rev` is the server's
+current revision.
 
 ## SFTP
 
@@ -689,5 +866,6 @@ the same `termoak-vX.Y.Z-…` archive carries both the server and the CLI.
 
 ## Events
 
-`GET /events/ws` is a WebSocket with the user's notices. See
+`GET /events/ws` is a WebSocket with the user's notices, including vault
+changes and access changes (`{"type":"vault",...}`). See
 [WEBSOCKET-PROTOCOL.md](WEBSOCKET-PROTOCOL.md).
