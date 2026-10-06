@@ -501,6 +501,23 @@ async fn registration_records_terms_acceptance() {
     let token = bea["tokens"]["access_token"].as_str().unwrap();
     assert!(terms_of(&srv.get("/api/v1/audit", token).await).is_null());
 
+    // The apps' client library records it (without a version).
+    let api = termoak_client::ApiClient::new(&srv.base).unwrap();
+    let auth = api
+        .register_accepting(
+            "dani@example.com",
+            "Dani",
+            "long-password",
+            None,
+            Some(None),
+            "Phone",
+            "android",
+        )
+        .await
+        .unwrap();
+    let terms = terms_of(&srv.get("/api/v1/audit", &auth.tokens.access_token).await);
+    assert_eq!(terms, json!({"accepted": true, "version": null}));
+
     // An explicit refusal or an over-long version is rejected (no account).
     let (s, e) = register("carla@example.com", json!({"accept_terms": false})).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);

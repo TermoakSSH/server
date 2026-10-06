@@ -126,6 +126,8 @@ fn vaults_from_mobile() {
         "Ana".into(),
         PW.into(),
         None,
+        false,
+        None,
     ))
     .unwrap();
     assert!(ana_acc.vaults_supported && ana_acc.is_current);
@@ -137,6 +139,8 @@ fn vaults_from_mobile() {
         "bea@termoak.test".into(),
         "Bea".into(),
         PW.into(),
+        None,
+        false,
         None,
     ))
     .unwrap();
@@ -313,6 +317,8 @@ fn vaults_from_mobile() {
         "carl@termoak.test".into(),
         "Carl".into(),
         PW.into(),
+        None,
+        false,
         None,
     ))
     .unwrap();
