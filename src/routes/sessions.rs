@@ -1798,8 +1798,9 @@ async fn host_loop(
 /// Helper so routes in other modules can resolve host labels.
 pub async fn host_label(st: &AppState, owner: Id, host_id: Option<Id>) -> Option<String> {
     let id = host_id?;
+    let access = st.store.vault_access(owner).await.ok()?;
     st.store
-        .get::<Host>(owner, id)
+        .get_in::<Host>(&access, id)
         .await
         .ok()
         .map(|h| h.data.label)

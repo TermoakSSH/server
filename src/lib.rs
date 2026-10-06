@@ -23,6 +23,7 @@ pub mod routes;
 pub mod sessions;
 pub mod state;
 pub mod updates;
+pub mod vaults;
 pub mod web;
 
 use std::path::Path;
@@ -103,6 +104,12 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
         .with_context(|| format!("could not create {}", config.server.data_dir.display()))?;
     let key = load_master_key(&config.server.data_dir)?;
     let store = Store::open(&config.server.data_dir.join("termoak.db"), key)?;
+    // New secrets are sealed with per-vault keys; older ones are resealed
+    // in the background.
+    store.enable_vault_keys();
+    vaults::spawn_reseal_job(store.clone());
+    let vault_events = vaults::VaultEvents::new(store.clone());
+    let instance_id = store.instance_id().await?;
     let pool = ConnectionPool::new(
         store.clone(),
         config.ai.host_key_policy,
@@ -163,5 +170,11 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
         updates,
         mailer,
         push,
+        vault_events,
+        credentials_limiter: limiter::RateLimiter::new(
+            routes::entities::CREDENTIALS_PER_MINUTE,
+            60_000,
+        ),
+        instance_id,
     })))
 }

@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 use termoak_ai::AiError;
 use termoak_core::CoreError;
+use termoak_core::error::codes;
 use termoak_ssh::SshError;
 
 #[derive(Debug)]
@@ -96,6 +97,28 @@ impl From<CoreError> for ApiError {
             CoreError::Conflict(m) => ApiError::conflict(m),
             CoreError::Invalid(m) => ApiError::bad_request(m),
             CoreError::Forbidden(m) => ApiError::forbidden(m),
+            CoreError::Vault {
+                code,
+                message,
+                detail,
+            } => {
+                let status = match code {
+                    codes::VAULT_NOT_FOUND => StatusCode::NOT_FOUND,
+                    codes::VAULT_PERSONAL
+                    | codes::USE_TRANSFER
+                    | codes::STILL_REFERENCED
+                    | codes::MEMBER_EXISTS
+                    | codes::ID_IN_USE => StatusCode::CONFLICT,
+                    codes::CROSS_VAULT_REFERENCE => StatusCode::UNPROCESSABLE_ENTITY,
+                    codes::INVALID_ROLE => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::FORBIDDEN,
+                };
+                let mut e = ApiError::new(status, code, message);
+                if let Some(Value::Object(map)) = detail {
+                    e.details.extend(map);
+                }
+                e
+            }
             other => ApiError::internal(other.to_string()),
         }
     }

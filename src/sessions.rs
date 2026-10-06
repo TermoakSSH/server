@@ -320,6 +320,9 @@ impl ServerTerm {
 struct HeldMeta {
     owner: Id,
     host_id: Option<Id>,
+    /// Vault of the host (sessions from before vaults: none).
+    #[serde(default)]
+    vault_id: Option<Id>,
     created_at: i64,
     recording: bool,
     title: String,
@@ -350,6 +353,8 @@ pub struct LiveSession {
     pub id: Id,
     pub owner: Id,
     pub host_id: Option<Id>,
+    /// Vault of the host (server sessions).
+    pub vault_id: Option<Id>,
     pub created_at: i64,
     pub recording: bool,
     title: Mutex<String>,
@@ -625,6 +630,7 @@ impl LiveSession {
         serde_json::to_value(HeldMeta {
             owner: self.owner,
             host_id: self.host_id,
+            vault_id: self.vault_id,
             created_at: self.created_at,
             recording: self.recording,
             title: self.title(),
@@ -943,7 +949,7 @@ impl SessionManager {
         id: Id,
         created_at: i64,
         owner: Id,
-        host_id: Option<Id>,
+        (host_id, vault_id): (Option<Id>, Option<Id>),
         title: String,
         backing: Backing,
         recording: bool,
@@ -955,6 +961,7 @@ impl SessionManager {
             id,
             owner,
             host_id,
+            vault_id,
             created_at,
             recording,
             title: Mutex::new(title),
@@ -1018,8 +1025,16 @@ impl SessionManager {
         if holder.as_ref().is_some_and(|h| !h.connected()) {
             return Err(holder_down());
         }
-        let host = self.store.get::<Host>(owner, host_id).await?.data;
-        let settings = self.store.effective_settings(owner, &host).await?;
+        // At least Use-only access to the host's vault; everything is
+        // resolved inside that vault. Session shares never grant the vault.
+        let access = self.store.vault_access(owner).await?;
+        let rec = self.store.get_in::<Host>(&access, host_id).await?;
+        let vault = rec.meta.vault_id.unwrap_or(owner);
+        let host = rec.data;
+        let settings = self
+            .store
+            .effective_settings_in(&access, vault, &host)
+            .await?;
         let record = record
             .or(settings.record_sessions)
             .unwrap_or(self.cfg.record);
@@ -1037,7 +1052,7 @@ impl SessionManager {
             id,
             now_ms(),
             owner,
-            Some(host_id),
+            (Some(host_id), Some(vault)),
             title
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_else(|| host.label.clone()),
@@ -1064,22 +1079,31 @@ impl SessionManager {
                 recording: record,
             })
             .await?;
+        self.store.set_session_vault(live.id, Some(vault)).await?;
         self.sessions.write().insert(live.id, live.clone());
         self.store
-            .audit(
+            .audit_vault(
                 owner,
                 &format!("user:{owner}"),
                 "session.open",
                 Some(host_id.to_string()),
                 serde_json::json!({"session": live.id, "kind": "server"}),
+                vault,
             )
             .await?;
 
         let mgr = self.clone();
         let session = live.clone();
+        // With a holder, the session is resolved and handed over before the
+        // client gets its id: what it types right away reaches a session the
+        // holder already knows.
+        let held = match &holder {
+            Some(h) => Some(mgr.open_held(&session, h, cols, rows).await),
+            None => None,
+        };
         tokio::spawn(async move {
-            let opened = match &holder {
-                Some(h) => mgr.open_held(&session, h, cols, rows).await,
+            let opened = match held {
+                Some(r) => r,
                 None => mgr.connect_server(&session, cols, rows).await,
             };
             match opened {
@@ -1108,14 +1132,15 @@ impl SessionManager {
         rows: u16,
     ) -> ApiResult<()> {
         let host_id = live.host_id.expect("server session with a host");
-        let resolved = self.store.resolve_host(live.owner, host_id).await?;
+        let (resolved, access, vault) = self.resolve_for(live, host_id).await?;
         let prompter = Arc::new(SessionPrompter::new(live));
-        let opts = ConnectOptions::new(Arc::new(StoreVerifier {
-            store: self.store.clone(),
-            owner: live.owner,
-            policy: self.cfg.host_key_policy,
-            prompter: Some(prompter.clone()),
-        }))
+        let opts = ConnectOptions::new(Arc::new(StoreVerifier::for_host(
+            self.store.clone(),
+            access,
+            vault,
+            self.cfg.host_key_policy,
+            Some(prompter.clone()),
+        )))
         .with_prompter(prompter);
         let conn = Connection::connect(&resolved, &opts).await?;
         live.set_state(SessionState::Connecting {
@@ -1165,19 +1190,29 @@ impl SessionManager {
             .set_session_status(live.id, SessionStatus::Running, None)
             .await?;
 
-        // Detect the host's OS if unknown.
+        // Detect the host's OS if unknown (saved only by Editors: it is
+        // just metadata).
         let store = self.store.clone();
         let owner = live.owner;
         tokio::spawn(async move {
-            if let Ok(rec) = store.get::<Host>(owner, host_id).await
+            if let Ok(access) = store.vault_access(owner).await
+                && let Ok(rec) = store.get_in::<Host>(&access, host_id).await
                 && (rec.data.os.is_none() || rec.data.os_version.is_none())
+                && let Some(vault) = rec.meta.vault_id
+                && access.role(vault).is_some_and(|r| r.can_write())
                 && let Some(os) = termoak_ssh::detect::detect_os_info(&conn).await
             {
                 let mut h = rec.data;
                 h.os_version = Some(os.display());
                 h.os = Some(os.id);
                 let _ = store
-                    .save(owner, h, termoak_core::model::SecretUpdate::Keep, None)
+                    .save_in(
+                        &access,
+                        vault,
+                        h,
+                        termoak_core::model::SecretUpdate::Keep,
+                        None,
+                    )
                     .await;
             }
         });
@@ -1223,7 +1258,7 @@ impl SessionManager {
             new_id(),
             now_ms(),
             owner,
-            host_id,
+            (host_id, None),
             if title.trim().is_empty() {
                 "Shared session".into()
             } else {
@@ -1392,7 +1427,7 @@ impl SessionManager {
         rows: u16,
     ) -> ApiResult<()> {
         let host_id = live.host_id.expect("server session with a host");
-        let resolved = self.store.resolve_host(live.owner, host_id).await?;
+        let (resolved, _, _) = self.resolve_for(live, host_id).await?;
         let detect_os = resolved.host.os.is_none() || resolved.host.os_version.is_none();
         let open = OpenSession {
             id: live.id,
@@ -1461,7 +1496,7 @@ impl SessionManager {
             id,
             meta.created_at,
             meta.owner,
-            meta.host_id,
+            (meta.host_id, meta.vault_id),
             meta.title,
             Backing::Server {
                 term,
@@ -1565,19 +1600,17 @@ impl SessionManager {
                         message: "the session no longer exists".into(),
                     }),
                     (_, Err(e)) => Some(HostKeyError::from_ssh(e, &target)),
-                    (Some(l), Ok(key)) => {
-                        let verifier = StoreVerifier {
-                            store: self.store.clone(),
-                            owner: l.owner,
-                            policy: self.cfg.host_key_policy,
-                            prompter: prompter.map(|p| p as Arc<dyn AuthPrompter>),
-                        };
-                        verifier
+                    (Some(l), Ok(key)) => match self.verifier_for(l, prompter).await {
+                        Ok(verifier) => verifier
                             .verify(&host, port, &key)
                             .await
                             .err()
-                            .map(|e| HostKeyError::from_ssh(e, &target))
-                    }
+                            .map(|e| HostKeyError::from_ssh(e, &target)),
+                        Err(e) => Some(HostKeyError::Other {
+                            host: target,
+                            message: e.message,
+                        }),
+                    },
                 };
                 Answer::HostKey { error }
             }
@@ -1614,15 +1647,106 @@ impl SessionManager {
     pub(crate) async fn held_os(&self, id: Id, os: String, display: String) {
         let Some(live) = self.get(id) else { return };
         let Some(host_id) = live.host_id else { return };
-        if let Ok(rec) = self.store.get::<Host>(live.owner, host_id).await {
+        let Ok(access) = self.store.vault_access(live.owner).await else {
+            return;
+        };
+        if let Ok(rec) = self.store.get_in::<Host>(&access, host_id).await
+            && let Some(vault) = rec.meta.vault_id
+            && access.role(vault).is_some_and(|r| r.can_write())
+        {
             let mut h = rec.data;
             h.os_version = Some(display);
             h.os = Some(os);
             let _ = self
                 .store
-                .save(live.owner, h, termoak_core::model::SecretUpdate::Keep, None)
+                .save_in(
+                    &access,
+                    vault,
+                    h,
+                    termoak_core::model::SecretUpdate::Keep,
+                    None,
+                )
                 .await;
         }
+    }
+
+    /// Resolves the host of a server session with the owner's current
+    /// access, inside the session's vault (the host must still be there).
+    async fn resolve_for(
+        &self,
+        live: &LiveSession,
+        host_id: Id,
+    ) -> ApiResult<(
+        termoak_core::resolve::ResolvedHost,
+        Arc<termoak_core::store::VaultAccess>,
+        Id,
+    )> {
+        let access = self.store.vault_access(live.owner).await?;
+        let vault = self.store.vault_of::<Host>(&access, host_id).await?;
+        if live.vault_id.is_some_and(|v| v != vault) {
+            return Err(ApiError::not_found(format!("host {host_id}")));
+        }
+        let resolved = self
+            .store
+            .resolve_in(&access, host_id, termoak_core::store::SecretUse::Server)
+            .await?;
+        Ok((resolved, access, vault))
+    }
+
+    /// Host key verifier of a session (its host's vault, then personal).
+    async fn verifier_for(
+        &self,
+        live: &LiveSession,
+        prompter: Option<Arc<SessionPrompter>>,
+    ) -> ApiResult<StoreVerifier> {
+        let access = self.store.vault_access(live.owner).await?;
+        let vault = live.vault_id.unwrap_or(live.owner);
+        Ok(StoreVerifier::for_host(
+            self.store.clone(),
+            access,
+            vault,
+            self.cfg.host_key_policy,
+            prompter.map(|p| p as Arc<dyn AuthPrompter>),
+        ))
+    }
+
+    /// Closes the server sessions on hosts of `vault` (of one user, or of
+    /// everyone): access was revoked or the vault is gone. Returns how many.
+    pub async fn close_for_vault(self: &Arc<Self>, user: Option<Id>, vault: Id) -> usize {
+        let affected: Vec<Arc<LiveSession>> = self
+            .sessions
+            .read()
+            .values()
+            .filter(|s| {
+                s.vault_id == Some(vault)
+                    && user.is_none_or(|u| s.owner == u)
+                    && matches!(s.backing, Backing::Server { .. })
+                    && !s.state().is_closed()
+            })
+            .cloned()
+            .collect();
+        for s in &affected {
+            if let Backing::Server { term, .. } = &s.backing
+                && let Some(t) = term.get()
+            {
+                t.close().await;
+            }
+            self.finish(
+                s,
+                SessionStatus::Closed,
+                None,
+                Some(termoak_core::error::codes::VAULT_ACCESS_REVOKED.into()),
+            )
+            .await;
+            self.audit(
+                s,
+                "system",
+                "session.close",
+                serde_json::json!({"reason": termoak_core::error::codes::VAULT_ACCESS_REVOKED}),
+            )
+            .await;
+        }
+        affected.len()
     }
 
     pub fn recording_path(&self, owner: Id, id: Id) -> PathBuf {

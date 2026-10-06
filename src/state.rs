@@ -31,6 +31,12 @@ pub struct Inner {
     pub mailer: Arc<crate::email::Mailer>,
     /// Push notifications (if APNs or FCM is configured).
     pub push: Option<Arc<crate::push::Push>>,
+    /// `vault` events (changed, access) for the events WebSocket.
+    pub vault_events: Arc<crate::vaults::VaultEvents>,
+    /// Just-in-time credentials (`POST /hosts/{id}/credentials`) per user.
+    pub credentials_limiter: crate::limiter::RateLimiter,
+    /// Random id of this server's database (`/info`).
+    pub instance_id: String,
 }
 
 #[derive(Clone)]

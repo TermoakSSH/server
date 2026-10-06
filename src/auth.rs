@@ -410,6 +410,8 @@ async fn info(State(st): State<AppState>) -> ApiResult<Json<Value>> {
         "name": "Termoak",
         "version": env!("CARGO_PKG_VERSION"),
         "api": "v1",
+        // Random id of this server's database: apps tell servers apart with it.
+        "instance_id": st.instance_id,
         // Set on test servers ("preprod"...): the web apps show a banner.
         "environment": st.config.server.environment.as_deref().map(str::trim).filter(|e| !e.is_empty()),
         "needs_setup": users == 0,
@@ -429,6 +431,11 @@ async fn info(State(st): State<AppState>) -> ApiResult<Json<Value>> {
             "totp": true,
             "invites": true,
             "teams": true,
+            // Vaults (`/vaults`), sync v2 (`POST /vaults/sync`) and just-in-time
+            // credentials (`POST /hosts/{id}/credentials`).
+            "vaults": true,
+            "sync_v2": true,
+            "credentials": true,
             "plans": true,
             "web": st.config.web.enabled,
             "email": st.mailer.enabled(),
@@ -853,8 +860,12 @@ async fn update_user(
         user = st.store.set_email_verified(id, v).await?;
     }
     if req.disabled == Some(true) {
-        // A disabled account leaves the sessions shared with it.
+        // A disabled account leaves the sessions shared with it and loses
+        // its server sessions and pooled connections on every vault.
         st.sessions.remove_user(id).await;
+        if let Ok(access) = st.store.vault_access(id).await {
+            crate::vaults::revoke_all(&st, id, &access).await;
+        }
     }
     st.store
         .audit(

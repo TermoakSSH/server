@@ -36,10 +36,9 @@ struct PathQuery {
     path: String,
 }
 
+/// SFTP through the server: any role in the host's vault (Use-only
+/// included; the pool checks the access on every call).
 async fn open(st: &AppState, u: &AuthUser, host: Id) -> ApiResult<Sftp> {
-    st.store
-        .get::<termoak_core::model::Host>(u.id(), host)
-        .await?;
     let conn = st.pool.get(u.id(), host).await?;
     match conn.sftp().await {
         Ok(s) => Ok(s),

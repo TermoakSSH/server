@@ -15,12 +15,17 @@ use termoak_core::model::*;
 use termoak_core::{Id, new_id};
 use termoak_ssh::exec::ExecOptions;
 use termoak_ssh::keys::{self, KeyType};
-use termoak_ssh::{ConnectOptions, Connection, StoreVerifier};
+use termoak_ssh::{ConnectOptions, Connection, HostKeyPolicy, StoreVerifier};
 use utoipa::ToSchema;
+
+use axum::http::header;
+use axum::response::IntoResponse;
+use termoak_core::store::{SecretUse, VaultChange};
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::vaults::AccessCtx;
 
 pub fn routes() -> Router<AppState> {
     let mut r = Router::new();
@@ -36,6 +41,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/keys/import", post(import_key))
         .route("/api/v1/hosts/{id}/test", post(test_host))
         .route("/api/v1/hosts/{id}/effective", get(effective))
+        .route("/api/v1/hosts/{id}/credentials", post(credentials))
         .route("/api/v1/sync", post(sync))
         .route("/api/v1/audit", get(audit))
         .route("/api/v1/exec", post(exec_many))
@@ -52,9 +58,7 @@ fn crud<T: Entity>(r: Router<AppState>, name: &str) -> Router<AppState> {
 
 /// Splits `secret` and `sync_mode` off the body. `secret` missing = keep,
 /// `null` = clear, object = replace.
-fn split_body<T: Entity>(
-    mut body: Value,
-) -> ApiResult<(T, SecretUpdate<T::Secret>, Option<SyncMode>)> {
+fn split_body<T: Entity>(mut body: Value) -> ApiResult<Split<T>> {
     let obj = body
         .as_object_mut()
         .ok_or_else(|| ApiError::bad_request("expected a JSON object"))?;
@@ -72,75 +76,134 @@ fn split_body<T: Entity>(
             Some(serde_json::from_value(v).map_err(|e| ApiError::bad_request(e.to_string()))?)
         }
     };
-    for meta in ["owner_id", "rev", "updated_at", "deleted", "has_secret"] {
+    let vault_id = match obj.remove("vault_id") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            serde_json::from_value::<Id>(v)
+                .map_err(|e| ApiError::bad_request(format!("invalid vault_id: {e}")))?,
+        ),
+    };
+    for meta in [
+        "owner_id",
+        "rev",
+        "updated_at",
+        "deleted",
+        "has_secret",
+        "updated_by",
+        "secret_hidden",
+    ] {
         obj.remove(meta);
     }
     let data: T = serde_json::from_value(body)
         .map_err(|e| ApiError::bad_request(format!("invalid data: {e}")))?;
-    Ok((data, secret, sync_mode))
+    Ok(Split {
+        data,
+        secret,
+        sync_mode,
+        vault_id,
+    })
 }
 
+/// A create/update body taken apart.
+struct Split<T: Entity> {
+    data: T,
+    secret: SecretUpdate<T::Secret>,
+    sync_mode: Option<SyncMode>,
+    vault_id: Option<Id>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListQuery {
+    vault_id: Option<Id>,
+}
+
+/// Items of every vault you can use (or of `?vault_id=`), each with
+/// `vault_id` and `secret_hidden`. Never secrets.
 async fn list<T: Entity>(
     State(st): State<AppState>,
-    u: AuthUser,
+    ctx: AccessCtx,
+    Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<Record<T>>>> {
-    Ok(Json(st.store.list::<T>(u.id()).await?))
+    Ok(Json(st.store.list_in::<T>(&ctx.access, q.vault_id).await?))
 }
 
 async fn one<T: Entity>(
     State(st): State<AppState>,
-    u: AuthUser,
+    ctx: AccessCtx,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Record<T>>> {
-    Ok(Json(st.store.get::<T>(u.id(), id).await?))
+    Ok(Json(st.store.get_in::<T>(&ctx.access, id).await?))
 }
 
+/// Creates in `vault_id` (default: your personal vault); needs Editor.
 async fn create<T: Entity>(
     State(st): State<AppState>,
-    u: AuthUser,
+    ctx: AccessCtx,
     Json(body): Json<Value>,
 ) -> ApiResult<Json<Record<T>>> {
-    let (mut data, secret, mode) = split_body::<T>(body)?;
-    data.set_id(Id::nil());
-    let rec = st.store.save(u.id(), data, secret, mode).await?;
+    let mut b = split_body::<T>(body)?;
+    b.data.set_id(Id::nil());
+    let vault = b.vault_id.unwrap_or(ctx.personal());
+    let rec = st
+        .store
+        .save_in(&ctx.access, vault, b.data, b.secret, b.sync_mode)
+        .await?;
     Ok(Json(rec))
 }
 
+/// Updates in place (Editor). Another `vault_id` → 409 `use_transfer`.
 async fn update<T: Entity>(
     State(st): State<AppState>,
-    u: AuthUser,
+    ctx: AccessCtx,
     Path(id): Path<Id>,
     Json(body): Json<Value>,
 ) -> ApiResult<Json<Record<T>>> {
-    st.store.get::<T>(u.id(), id).await?;
-    let (mut data, secret, mode) = split_body::<T>(body)?;
-    data.set_id(id);
-    Ok(Json(st.store.save(u.id(), data, secret, mode).await?))
+    let current = st.store.get_in::<T>(&ctx.access, id).await?;
+    let vault = current.meta.vault_id.unwrap_or(ctx.personal());
+    let mut b = split_body::<T>(body)?;
+    if b.vault_id.is_some_and(|v| v != vault) {
+        return Err(ApiError::conflict(
+            "the item is in another vault: move it with POST /vaults/{target}/transfer",
+        )
+        .with_code("use_transfer"));
+    }
+    b.data.set_id(id);
+    Ok(Json(
+        st.store
+            .save_in(&ctx.access, vault, b.data, b.secret, b.sync_mode)
+            .await?,
+    ))
 }
 
 async fn remove<T: Entity>(
     State(st): State<AppState>,
-    u: AuthUser,
+    ctx: AccessCtx,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Value>> {
-    st.store.delete::<T>(u.id(), id).await?;
+    st.store.delete_in::<T>(&ctx.access, id).await?;
     Ok(Json(json!({"ok": true})))
 }
 
-/// Reveals the secret (only the user's own; audited).
+/// Reveals the secret (Editors only; Use-only → 403 `secret_hidden`).
+/// Audited with the vault.
 async fn reveal<T: Entity>(
     State(st): State<AppState>,
-    u: AuthUser,
+    ctx: AccessCtx,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<T::Secret>> {
-    let secret = st.store.secret::<T>(u.id(), id).await?;
+    let vault = st.store.vault_of::<T>(&ctx.access, id).await?;
+    let secret = st
+        .store
+        .secret_in::<T>(&ctx.access, id, SecretUse::Reveal)
+        .await?;
     st.store
-        .audit(
-            u.id(),
-            &u.actor(),
+        .audit_vault(
+            ctx.id(),
+            &ctx.actor(),
             "secret.reveal",
             Some(format!("{}:{id}", T::KIND.as_str())),
-            json!({"device": u.device.name}),
+            json!({"device": ctx.user.device.name}),
+            vault,
         )
         .await?;
     Ok(Json(secret))
@@ -161,6 +224,9 @@ pub struct GenerateKey {
     pub store_passphrase: bool,
     #[serde(default)]
     pub sync_mode: Option<SyncMode>,
+    /// Vault to store it in (default: your personal vault; Editor).
+    #[serde(default)]
+    pub vault_id: Option<Uuid>,
 }
 
 fn default_key_type() -> String {
@@ -179,12 +245,16 @@ pub struct ImportKey {
     pub certificate: Option<String>,
     #[serde(default)]
     pub sync_mode: Option<SyncMode>,
+    /// Vault to store it in (default: your personal vault; Editor).
+    #[serde(default)]
+    pub vault_id: Option<Uuid>,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn save_key(
     st: &AppState,
-    u: &AuthUser,
+    ctx: &AccessCtx,
+    vault: Option<Id>,
     label: String,
     material: keys::KeyMaterial,
     passphrase: Option<String>,
@@ -192,10 +262,12 @@ async fn save_key(
     certificate: Option<String>,
     sync_mode: Option<SyncMode>,
 ) -> ApiResult<Record<SshKey>> {
+    let vault = vault.unwrap_or(ctx.personal());
     let rec = st
         .store
-        .save(
-            u.id(),
+        .save_in(
+            &ctx.access,
+            vault,
             SshKey {
                 id: Id::nil(),
                 label,
@@ -214,12 +286,13 @@ async fn save_key(
         )
         .await?;
     st.store
-        .audit(
-            u.id(),
-            &u.actor(),
+        .audit_vault(
+            ctx.id(),
+            &ctx.actor(),
             "key.create",
             Some(rec.data.id.to_string()),
             json!({"fingerprint": rec.data.fingerprint}),
+            vault,
         )
         .await?;
     Ok(rec)
@@ -227,9 +300,12 @@ async fn save_key(
 
 async fn generate_key(
     State(st): State<AppState>,
-    u: AuthUser,
+    ctx: AccessCtx,
     Json(req): Json<GenerateKey>,
 ) -> ApiResult<Json<Record<SshKey>>> {
+    let vault = req.vault_id.unwrap_or(ctx.personal());
+    ctx.access.require(vault, VaultRole::Editor)?;
+    let u = &ctx.user;
     let kind =
         KeyType::parse(&req.key_type).ok_or_else(|| ApiError::bad_request("invalid key type"))?;
     let comment = req
@@ -245,7 +321,8 @@ async fn generate_key(
     Ok(Json(
         save_key(
             &st,
-            &u,
+            &ctx,
+            Some(vault),
             req.label,
             material,
             pass,
@@ -259,7 +336,7 @@ async fn generate_key(
 
 async fn import_key(
     State(st): State<AppState>,
-    u: AuthUser,
+    ctx: AccessCtx,
     Json(req): Json<ImportKey>,
 ) -> ApiResult<Json<Record<SshKey>>> {
     let pass = req.passphrase.clone().filter(|p| !p.is_empty());
@@ -267,7 +344,8 @@ async fn import_key(
     Ok(Json(
         save_key(
             &st,
-            &u,
+            &ctx,
+            req.vault_id,
             req.label,
             material,
             pass,
@@ -281,11 +359,16 @@ async fn import_key(
 
 async fn effective(
     State(st): State<AppState>,
-    u: AuthUser,
+    ctx: AccessCtx,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<HostSettings>> {
-    let host = st.store.get::<Host>(u.id(), id).await?.data;
-    Ok(Json(st.store.effective_settings(u.id(), &host).await?))
+    let rec = st.store.get_in::<Host>(&ctx.access, id).await?;
+    let vault = rec.meta.vault_id.unwrap_or(ctx.personal());
+    Ok(Json(
+        st.store
+            .effective_settings_in(&ctx.access, vault, &rec.data)
+            .await?,
+    ))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -300,39 +383,49 @@ pub struct HostTest {
     pub error_code: Option<String>,
 }
 
-/// Tests the connection (from the server). With `?trust=true` it accepts a new key.
+/// Tests the connection (from the server). With `?trust=true` it accepts a
+/// new key (saved in the host's vault if you are Editor there, otherwise in
+/// your personal vault). Use-only members can test.
 async fn test_host(
     State(st): State<AppState>,
-    u: AuthUser,
+    ctx: AccessCtx,
     Path(id): Path<Id>,
     Query(q): Query<BTreeMap<String, String>>,
 ) -> ApiResult<Json<HostTest>> {
-    let resolved = st.store.resolve_host(u.id(), id).await?;
+    let vault = st.store.vault_of::<Host>(&ctx.access, id).await?;
+    let resolved = st
+        .store
+        .resolve_in(&ctx.access, id, SecretUse::Server)
+        .await?;
     let trust = q.get("trust").is_some_and(|v| v == "true" || v == "1");
-    let opts = ConnectOptions::new(Arc::new(StoreVerifier {
-        store: st.store.clone(),
-        owner: u.id(),
-        policy: if trust {
-            termoak_ssh::HostKeyPolicy::AcceptNew
+    let opts = ConnectOptions::new(Arc::new(StoreVerifier::for_host(
+        st.store.clone(),
+        ctx.access.clone(),
+        vault,
+        if trust {
+            HostKeyPolicy::AcceptNew
         } else {
-            termoak_ssh::HostKeyPolicy::Strict
+            HostKeyPolicy::Strict
         },
-        prompter: None,
-    }));
+        None,
+    )));
     let started = Instant::now();
     match Connection::connect(&resolved, &opts).await {
         Ok(conn) => {
             let latency = started.elapsed().as_millis() as u64;
             let info_os = termoak_ssh::detect::detect_os_info(&conn).await;
             let os = info_os.as_ref().map(|i| i.id.clone());
-            if let Some(i) = &info_os {
+            // The detected OS is saved only by Editors (it is just metadata).
+            if let Some(i) = &info_os
+                && ctx.access.role(vault).is_some_and(|r| r.can_write())
+            {
                 let mut host = resolved.host.clone();
                 let version = Some(i.display());
                 if host.os.as_deref() != Some(i.id.as_str()) || host.os_version != version {
                     host.os = Some(i.id.clone());
                     host.os_version = version;
                     st.store
-                        .save(u.id(), host, SecretUpdate::Keep, None)
+                        .save_in(&ctx.access, vault, host, SecretUpdate::Keep, None)
                         .await?;
                 }
             }
@@ -401,10 +494,13 @@ pub struct SyncResponse {
     pub accepted: Vec<Uuid>,
 }
 
-/// Two-way sync (last writer wins).
+/// Legacy two-way sync (apps before vaults): only the personal vault.
+/// Items that left it (moved to another vault) come as deletions, so old
+/// apps drop them; pushes land in the personal vault, or where the item is
+/// now if you are Editor there.
 async fn sync(
     State(st): State<AppState>,
-    u: AuthUser,
+    ctx: AccessCtx,
     Json(req): Json<SyncRequest>,
 ) -> ApiResult<Json<SyncResponse>> {
     if req.changes.len() > 5000 {
@@ -413,14 +509,64 @@ async fn sync(
                 .with_code("too_many_changes"),
         );
     }
-    let applied = st.store.apply_remote(u.id(), req.changes).await?;
-    let changes = st.store.changes_since(u.id(), req.since, true).await?;
-    let rev = st.store.max_rev(u.id()).await?;
+    let mut pushed = req.changes;
+    for c in &mut pushed {
+        c.vault_id = None;
+        c.has_secret = None;
+    }
+    let report = st.store.apply_remote_v2(&ctx.access, pushed).await?;
+    let personal = ctx.personal();
+    let page = st
+        .store
+        .vault_changes(&ctx.access, personal, req.since, 1_000_000)
+        .await?;
+    let mut changes: Vec<SyncRecord> = page
+        .items
+        .into_iter()
+        .map(|c| match c {
+            VaultChange::Record(mut r) => {
+                r.vault_id = None;
+                r
+            }
+            VaultChange::Departed { id, kind, rev, at } => tombstone(id, kind, rev, at),
+        })
+        .collect();
+    // Stale pushes: the server's newer version goes back.
+    if !report.stale.is_empty() {
+        for mut r in st
+            .store
+            .sync_records_in(&ctx.access, report.stale.clone())
+            .await?
+        {
+            if r.vault_id == Some(personal) && !changes.iter().any(|c| c.id == r.id) {
+                r.vault_id = None;
+                changes.push(r);
+            }
+        }
+    }
     Ok(Json(SyncResponse {
-        rev,
-        accepted: applied.iter().map(|r| r.id).collect(),
+        rev: page.head.max(req.since),
+        accepted: report.accepted,
         changes,
     }))
+}
+
+/// A departure as an old app understands it: a deletion.
+pub fn tombstone(id: Id, kind: EntityKind, rev: i64, at: i64) -> SyncRecord {
+    SyncRecord {
+        id,
+        kind,
+        data: json!({}),
+        secret: None,
+        sync_mode: SyncMode::Synced,
+        updated_at: at,
+        deleted: true,
+        rev,
+        vault_id: None,
+        has_secret: None,
+        sealed: None,
+        base_rev: None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,6 +585,126 @@ async fn audit(
             .audit_list(u.id(), q.before, q.limit.unwrap_or(100).clamp(1, 1000))
             .await?,
     ))
+}
+
+/// Just-in-time credentials, for a connection from the user's device.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CredentialsRequest {
+    /// `ssh`, `sftp` or `forward` (audited).
+    #[serde(default = "default_purpose")]
+    pub purpose: String,
+}
+
+fn default_purpose() -> String {
+    "ssh".into()
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CredentialKey {
+    pub private_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
+}
+
+/// Credentials of one hop (the jumps first, the host last).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CredentialHop {
+    pub host_id: Uuid,
+    pub address: String,
+    pub port: u16,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<CredentialKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct Credentials {
+    pub vault_id: Uuid,
+    /// Keep them in memory until this time (ms) at most.
+    pub expires_at: i64,
+    pub hops: Vec<CredentialHop>,
+}
+
+/// Uses per user and minute of `/credentials`.
+pub const CREDENTIALS_PER_MINUTE: usize = 30;
+
+fn hop(r: &termoak_core::resolve::ResolvedHost) -> CredentialHop {
+    CredentialHop {
+        host_id: r.host.id,
+        address: r.host.address.clone(),
+        port: r.port,
+        username: r.username.clone(),
+        password: r.password.clone(),
+        key: r.key.as_ref().map(|k| CredentialKey {
+            private_key: k.private_key.clone(),
+            passphrase: k.passphrase.clone(),
+            certificate: k.certificate.clone(),
+        }),
+        proxy_password: r.proxy.as_ref().and_then(|p| p.password.clone()),
+    }
+}
+
+/// `POST /hosts/{id}/credentials`: the resolved credentials of a host and
+/// its jumps, for a connection made by the app. Editors always; Use-only
+/// members only when the vault is not Strict (`use_only_strict`).
+/// `Cache-Control: no-store`, rate limited and audited (`secret.use`).
+async fn credentials(
+    State(st): State<AppState>,
+    ctx: AccessCtx,
+    Path(id): Path<Id>,
+    body: Option<Json<CredentialsRequest>>,
+) -> ApiResult<axum::response::Response> {
+    let purpose = body.map(|b| b.0.purpose).unwrap_or_else(default_purpose);
+    if !matches!(purpose.as_str(), "ssh" | "sftp" | "forward") {
+        return Err(ApiError::bad_request(
+            "purpose must be ssh, sftp or forward",
+        ));
+    }
+    let key = format!("credentials:{}", ctx.id());
+    if !st.credentials_limiter.allow(&key) {
+        return Err(ApiError::new(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many credential requests: try again in a minute",
+        )
+        .with_detail("retry_ms", st.credentials_limiter.wait_ms(&key)));
+    }
+    let vault = st.store.vault_of::<Host>(&ctx.access, id).await?;
+    let resolved = st
+        .store
+        .resolve_in(&ctx.access, id, SecretUse::Credentials)
+        .await?;
+    let mut hops: Vec<CredentialHop> = resolved.jumps.iter().map(hop).collect();
+    hops.push(hop(&resolved));
+    st.store
+        .audit_vault(
+            ctx.id(),
+            &ctx.actor(),
+            "secret.use",
+            Some(format!("host:{id}")),
+            json!({"device": ctx.user.device.name, "purpose": purpose}),
+            vault,
+        )
+        .await?;
+    let body = Credentials {
+        vault_id: vault,
+        expires_at: termoak_core::time::now_ms() + 60_000,
+        hops,
+    };
+    Ok((
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(body),
+    )
+        .into_response())
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -470,9 +736,10 @@ pub struct ExecResult {
 }
 
 /// Runs a command or snippet on several hosts at once (from the server).
+/// Use-only members can run it; each host is checked on its own.
 async fn exec_many(
     State(st): State<AppState>,
-    u: AuthUser,
+    ctx: AccessCtx,
     Json(req): Json<ExecRequest>,
 ) -> ApiResult<Json<Vec<ExecResult>>> {
     if req.host_ids.is_empty() || req.host_ids.len() > 200 {
@@ -482,7 +749,7 @@ async fn exec_many(
         (Some(c), None) if !c.trim().is_empty() => c.clone(),
         (None, Some(sid)) => st
             .store
-            .get::<Snippet>(u.id(), sid)
+            .get_in::<Snippet>(&ctx.access, sid)
             .await?
             .data
             .render(&req.variables)?,
@@ -496,8 +763,8 @@ async fn exec_many(
     let batch_id = new_id();
     st.store
         .audit(
-            u.id(),
-            &u.actor(),
+            ctx.id(),
+            &ctx.actor(),
             "exec.batch",
             Some(batch_id.to_string()),
             json!({"hosts": req.host_ids, "command": command}),
@@ -506,11 +773,12 @@ async fn exec_many(
     let futures = req.host_ids.iter().map(|&host_id| {
         let st = st.clone();
         let command = command.clone();
-        let owner = u.id();
+        let owner = ctx.id();
+        let access = ctx.access.clone();
         async move {
             let label = st
                 .store
-                .get::<Host>(owner, host_id)
+                .get_in::<Host>(&access, host_id)
                 .await
                 .map(|h| h.data.label)
                 .unwrap_or_else(|_| host_id.to_string());

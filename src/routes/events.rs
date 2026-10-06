@@ -1,5 +1,6 @@
 //! User event WebSocket (`/api/v1/events/ws`): AI task progress, pending
-//! approvals, opened/closed sessions and sessions shared with you. The mobile
+//! approvals, opened/closed sessions, sessions shared with you and vault
+//! changes (`{"type":"vault","event":"changed"|"access",...}`). The mobile
 //! app uses it for notifications.
 
 use axum::Router;
@@ -25,6 +26,7 @@ async fn run(st: AppState, u: AuthUser, mut socket: WebSocket) {
     let owner = u.id();
     let mut ai = st.ai.subscribe();
     let mut sessions = st.sessions.notices();
+    let mut vaults = st.vault_events.subscribe();
     // Initial state: pending approvals.
     let pending = st.ai.pending_approvals(owner).await.unwrap_or_default();
     let hello = json!({"type": "hello", "user": u.user, "pending_approvals": pending});
@@ -60,6 +62,17 @@ async fn run(st: AppState, u: AuthUser, mut socket: WebSocket) {
                     if socket.send(Message::Text(v.to_string().into())).await.is_err() { break; }
                 }
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            },
+            ev = vaults.recv() => match ev {
+                Ok((user, v)) if user == owner => {
+                    if socket.send(Message::Text(v.to_string().into())).await.is_err() { break; }
+                }
+                Ok(_) => {}
+                Err(RecvError::Lagged(n)) => {
+                    let v = json!({"type": "lagged", "missed": n});
+                    let _ = socket.send(Message::Text(v.to_string().into())).await;
+                }
                 Err(RecvError::Closed) => break,
             },
             _ = ping.tick() => {
