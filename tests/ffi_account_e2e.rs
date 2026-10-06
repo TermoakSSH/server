@@ -263,7 +263,7 @@ Host web-1
         .unwrap();
     assert_eq!(preview.hosts_created, ["bastion", "web-1"]);
     assert!(
-        c.list_hosts().unwrap().is_empty(),
+        c.list_hosts(None).unwrap().is_empty(),
         "the preview does not save"
     );
     let report = c
@@ -276,7 +276,7 @@ Host web-1
         )
         .unwrap();
     assert_eq!(report.forwards_created, 1);
-    let hosts = c.list_hosts().unwrap();
+    let hosts = c.list_hosts(None).unwrap();
     let web = hosts.iter().find(|h| h.label == "web-1").unwrap();
     assert_eq!(web.settings.username.as_deref(), Some("deploy"));
     // Repeating does not duplicate.

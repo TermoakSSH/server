@@ -425,8 +425,16 @@ fn server_end_to_end() {
     ));
 
     // --- Sync ---
-    let key = block_on(core.import_key("e2e".into(), sshd.private_key.clone(), None, false, None))
-        .unwrap();
+    let key = block_on(core.import_key(
+        "e2e".into(),
+        sshd.private_key.clone(),
+        None,
+        false,
+        None,
+        None,
+        None,
+    ))
+    .unwrap();
     let host = core
         .save_host(
             SshHost {
@@ -449,6 +457,10 @@ fn server_end_to_end() {
                 sync_mode: None,
                 has_password: false,
                 updated_at: 0,
+                account_id: None,
+                vault_id: None,
+                access: None,
+                secret_hidden: false,
             },
             SecretChange::Keep,
         )
@@ -483,16 +495,22 @@ fn server_end_to_end() {
     let report = block_on(core.sync_now()).unwrap();
     assert!(report.pulled >= 1, "{report:?}");
     assert!(
-        core.list_snippets()
+        core.list_snippets(None)
             .unwrap()
             .iter()
             .any(|s| s.name == "from-server")
     );
 
     // --- Persistent server session, with the fingerprint confirmed from the phone ---
-    let session =
-        block_on(core.open_server_session(host.id.clone(), 100, 30, Some("test".into()), None))
-            .unwrap();
+    let session = block_on(core.open_server_session(
+        host.id.clone(),
+        100,
+        30,
+        Some("test".into()),
+        None,
+        None,
+    ))
+    .unwrap();
     assert_eq!(session.access, SessionAccess::Owner);
     assert_eq!(session.title, "test");
     assert_eq!(session.host_id.as_deref(), Some(host.id.as_str()));
@@ -732,6 +750,7 @@ fn server_end_to_end() {
         24,
         Arc::new(TrustAll),
         local_listener.clone(),
+        None,
     ))
     .unwrap();
     let shared = block_on(core.share_terminal(local.clone(), "from the phone".into())).unwrap();
@@ -778,7 +797,7 @@ fn server_end_to_end() {
     let files = tempfile::tempdir().unwrap();
     let local_file = files.path().join("upload.txt");
     std::fs::write(&local_file, b"content-through-the-server").unwrap();
-    let home = block_on(core.server_sftp_home(host.id.clone())).unwrap();
+    let home = block_on(core.server_sftp_home(host.id.clone(), None)).unwrap();
     let remote = format!("{home}/termoak-ffi-{}.txt", std::process::id());
     let progress = Arc::new(Progress::default());
     let sent = block_on(core.server_sftp_upload(
@@ -786,11 +805,12 @@ fn server_end_to_end() {
         local_file.to_string_lossy().into_owned(),
         remote.clone(),
         Some(progress.clone()),
+        None,
     ))
     .unwrap();
     assert_eq!(sent, 26);
     assert_eq!(*progress.0.lock(), 26);
-    let listed = block_on(core.server_sftp_list(host.id.clone(), home.clone())).unwrap();
+    let listed = block_on(core.server_sftp_list(host.id.clone(), home.clone(), None)).unwrap();
     assert!(listed.iter().any(|f| f.path == remote), "{listed:?}");
     let back = files.path().join("download.txt");
     *progress.0.lock() = 0;
@@ -799,13 +819,14 @@ fn server_end_to_end() {
         remote.clone(),
         back.to_string_lossy().into_owned(),
         Some(progress.clone()),
+        None,
     ))
     .unwrap();
     assert_eq!(got, 26);
     assert_eq!(*progress.0.lock(), 26);
     assert_eq!(std::fs::read(&back).unwrap(), b"content-through-the-server");
     assert!(!files.path().join("download.txt.part").exists());
-    block_on(core.server_sftp_delete(host.id.clone(), remote.clone(), false)).unwrap();
+    block_on(core.server_sftp_delete(host.id.clone(), remote.clone(), false, None)).unwrap();
     // A file that does not exist: an error and no half-written file.
     let missing = files.path().join("no.txt");
     assert!(
@@ -813,6 +834,7 @@ fn server_end_to_end() {
             host.id.clone(),
             remote,
             missing.to_string_lossy().into_owned(),
+            None,
             None,
         ))
         .is_err()
@@ -835,6 +857,7 @@ fn server_end_to_end() {
         24,
         Some("recorded".into()),
         Some(true),
+        None,
     ))
     .unwrap();
     for _ in 0..100 {
