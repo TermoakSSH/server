@@ -77,6 +77,10 @@ pub struct DeleteAccount {
     /// 2FA code (or recovery code) if the account has it enabled.
     #[serde(default)]
     pub totp_code: Option<String>,
+    /// Your shared vaults that have members are deleted with the account:
+    /// without this, the request fails with `shared_vaults` and lists them.
+    #[serde(default)]
+    pub delete_shared_vaults: bool,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -792,10 +796,40 @@ pub async fn delete_account(
         .with_code("last_team_owner")
         .with_detail("teams", names));
     }
+    // Their shared vaults with members go with the account: confirm first.
+    let shared = st.store.shared_vaults_with_members(u.id()).await?;
+    if !shared.is_empty() && !req.delete_shared_vaults {
+        let list: Vec<Value> = shared
+            .iter()
+            .map(|v| json!({"id": v.id, "name": v.name, "member_count": v.member_count}))
+            .collect();
+        return Err(ApiError::conflict(
+            "your shared vaults with members will be deleted with the account: \
+             confirm with delete_shared_vaults",
+        )
+        .with_code("shared_vaults")
+        .with_detail("vaults", list));
+    }
+    let owned: Vec<termoak_core::Id> = st
+        .store
+        .vaults_for(u.id())
+        .await?
+        .into_iter()
+        .filter(|v| v.owner_user_id == Some(u.id()))
+        .map(|v| v.id)
+        .collect();
+    let mut others = crate::vaults::vault_users(&st, &owned).await;
+    others.retain(|x| *x != u.id());
+    let before = crate::vaults::snapshot(&st, others).await;
     for live in st.sessions.owned_by(u.id()) {
         let _ = st.sessions.close(&live, u.id()).await;
     }
     st.store.delete_user(u.id()).await?;
+    for v in &owned {
+        st.sessions.close_for_vault(None, *v).await;
+        st.pool.invalidate_vault(*v, None).await;
+    }
+    crate::vaults::apply_revocations(&st, before, &owned).await;
     // Out of the sessions others shared with them.
     st.sessions.remove_user(u.id()).await;
     let recordings = st

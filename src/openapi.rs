@@ -26,7 +26,8 @@ use crate::routes::ai::{
     SuggestReq, TaskMessage, TestAiKey,
 };
 use crate::routes::entities::{
-    ExecRequest, ExecResult, GenerateKey, HostTest, ImportKey, SyncRequest, SyncResponse,
+    CredentialHop, CredentialKey, Credentials, CredentialsRequest, ExecRequest, ExecResult,
+    GenerateKey, HostTest, ImportKey, SyncRequest, SyncResponse,
 };
 use crate::routes::sessions::{
     CreateShare, OpenRelay, OpenSession, RecordingAuthor, RecordingAuthors, RenameSession,
@@ -34,6 +35,10 @@ use crate::routes::sessions::{
 };
 use crate::routes::sftp::{ChmodReq, DeleteReq, MkdirReq, RenameReq};
 use crate::routes::teams::{AddMember, CreateTeam, SetPlan, SetRole, TeamInviteRequest};
+use crate::routes::vaults::{
+    AddVaultMember, CreateVault, RemovedRecord, SetVaultMemberRole, SyncV2Request, SyncV2Response,
+    UpdateVault, VaultCursor,
+};
 
 /// Shape of a request or response body.
 #[derive(Clone, Copy)]
@@ -620,12 +625,136 @@ fn endpoints() -> Vec<Ep> {
         ),
         ep(
             Post,
+            "/api/v1/hosts/{id}/credentials",
+            "hosts",
+            "Just-in-time credentials of a host and its jumps for a connection from this \
+             device (keep them in memory only). Editors; Use-only members unless the vault \
+             is Strict (`use_only_strict`). `Cache-Control: no-store`, 30 per minute, \
+             audited as `secret.use`",
+            Ref("CredentialsRequest"),
+            Ref("Credentials"),
+        ),
+        ep(
+            Post,
             "/api/v1/sync",
             "sync",
-            "Sync changes (last writer wins)",
+            "Legacy sync (apps before vaults): only the personal vault; items that left it \
+             come as deletions (last writer wins)",
             Ref("SyncRequest"),
             Ref("SyncResponse"),
         ),
+        ep(
+            Post,
+            "/api/v1/vaults/sync",
+            "sync",
+            "Sync v2: per-vault cursors, the authoritative list of vaults, departures, \
+             rejections, resync and paging (`more`)",
+            Ref("SyncV2Request"),
+            Ref("SyncV2Response"),
+        ),
+        ep(
+            Get,
+            "/api/v1/vaults",
+            "vaults",
+            "Vaults you can access, with your role, owner, members and item counts",
+            None,
+            List("Vault"),
+        ),
+        ep(
+            Post,
+            "/api/v1/vaults",
+            "vaults",
+            "Create a shared vault, or a team vault with `team_id` (team owners and admins)",
+            Ref("CreateVault"),
+            Ref("Vault"),
+        ),
+        ep(
+            Get,
+            "/api/v1/vaults/{id}",
+            "vaults",
+            "A vault you can access",
+            None,
+            Ref("Vault"),
+        ),
+        ep(
+            Patch,
+            "/api/v1/vaults/{id}",
+            "vaults",
+            "Change a vault (managers; personal vault: only name, color and icon)",
+            Ref("UpdateVault"),
+            Ref("Vault"),
+        ),
+        Ep {
+            query: &["confirm"],
+            ..ep(
+                Delete,
+                "/api/v1/vaults/{id}",
+                "vaults",
+                "Delete a vault with its items and keys (managers; `?confirm=<name>`)",
+                None,
+                Object,
+            )
+        },
+        ep(
+            Post,
+            "/api/v1/vaults/{id}/leave",
+            "vaults",
+            "Give up your own direct access",
+            None,
+            Object,
+        ),
+        ep(
+            Get,
+            "/api/v1/vaults/{id}/members",
+            "vaults",
+            "Members, including the implicit ones (owner, team admins: `implicit`)",
+            None,
+            List("VaultMember"),
+        ),
+        ep(
+            Post,
+            "/api/v1/vaults/{id}/members",
+            "vaults",
+            "Share with a user (`email`) or a team you belong to (`team_id`) as `editor` or \
+             `use_only` (managers)",
+            Ref("AddVaultMember"),
+            Ref("VaultMember"),
+        ),
+        ep(
+            Patch,
+            "/api/v1/vaults/{id}/members/{member_id}",
+            "vaults",
+            "Change the role of a member (managers)",
+            Ref("SetVaultMemberRole"),
+            Ref("VaultMember"),
+        ),
+        ep(
+            Delete,
+            "/api/v1/vaults/{id}/members/{member_id}",
+            "vaults",
+            "Revoke a member's access (managers): their server sessions on its hosts close",
+            None,
+            Object,
+        ),
+        ep(
+            Post,
+            "/api/v1/vaults/{id}/transfer",
+            "vaults",
+            "Move or copy items into this vault (with their dependencies; `dry_run` plans)",
+            Ref("TransferRequest"),
+            Ref("TransferResult"),
+        ),
+        Ep {
+            query: &["before", "limit"],
+            ..ep(
+                Get,
+                "/api/v1/vaults/{id}/audit",
+                "vaults",
+                "Audit of a vault (managers)",
+                None,
+                List("AuditEntry"),
+            )
+        },
         Ep {
             query: &["before", "limit"],
             ..ep(
@@ -1061,7 +1190,8 @@ fn endpoints() -> Vec<Ep> {
             Post,
             list,
             name_tag(name),
-            "Create (fields + optional `secret` + `sync_mode`)",
+            "Create (fields + optional `secret` + `sync_mode` + `vault_id`, default your \
+             personal vault; Editor)",
             Ref(schema),
             Record(schema),
         ));
@@ -1079,7 +1209,7 @@ fn endpoints() -> Vec<Ep> {
             Get,
             secret,
             name_tag(name),
-            "Reveal the secret (audited)",
+            "Reveal the secret (Editors; Use-only: `secret_hidden`; audited)",
             None,
             Object,
         ));
@@ -1335,6 +1465,36 @@ pub fn document() -> OpenApi {
         .schema_from::<AiKeyTestResult>()
         .schema_from::<AiKeyProvider>()
         .schema_from::<AiAccess>()
+        .schema_from::<Vault>()
+        .schema_from::<VaultKind>()
+        .schema_from::<VaultRole>()
+        .schema_from::<VaultCrypto>()
+        .schema_from::<VaultSettings>()
+        .schema_from::<VaultMember>()
+        .schema_from::<VaultPrincipal>()
+        .schema_from::<SealedSecret>()
+        .schema_from::<CreateVault>()
+        .schema_from::<UpdateVault>()
+        .schema_from::<AddVaultMember>()
+        .schema_from::<SetVaultMemberRole>()
+        .schema_from::<VaultCursor>()
+        .schema_from::<SyncV2Request>()
+        .schema_from::<SyncV2Response>()
+        .schema_from::<RemovedRecord>()
+        .schema_from::<termoak_core::store::SyncRejection>()
+        .schema_from::<termoak_core::store::SyncWarning>()
+        .schema_from::<termoak_core::transfer::TransferRequest>()
+        .schema_from::<termoak_core::transfer::TransferResult>()
+        .schema_from::<termoak_core::transfer::TransferMode>()
+        .schema_from::<termoak_core::transfer::Dependencies>()
+        .schema_from::<termoak_core::transfer::ItemRef>()
+        .schema_from::<termoak_core::transfer::CopiedItem>()
+        .schema_from::<termoak_core::transfer::DetachedRef>()
+        .schema_from::<termoak_core::transfer::TransferWarning>()
+        .schema_from::<CredentialsRequest>()
+        .schema_from::<Credentials>()
+        .schema_from::<CredentialHop>()
+        .schema_from::<CredentialKey>()
         .build();
 
     let tags = [
@@ -1359,6 +1519,10 @@ pub fn document() -> OpenApi {
         ("audit", "Action log"),
         ("admin", "User administration"),
         ("teams", "Teams and sessions shared with teams"),
+        (
+            "vaults",
+            "Vaults: ownership, sharing (editor / use only) and sync of items",
+        ),
         (
             "account",
             "Platform: plans, email, password recovery and downloads",
@@ -1402,6 +1566,10 @@ mod tests {
         assert!(json["paths"]["/api/v1/hosts"]["post"].is_object());
         assert!(json["paths"]["/api/v1/me/ai/keys/{provider}"]["put"].is_object());
         assert!(json["paths"]["/api/v1/me/ai/access"]["get"].is_object());
+        assert!(json["paths"]["/api/v1/vaults/sync"]["post"].is_object());
+        assert!(json["paths"]["/api/v1/vaults/{id}/members/{member_id}"]["patch"].is_object());
+        assert!(json["paths"]["/api/v1/hosts/{id}/credentials"]["post"].is_object());
+        assert!(schemas["VaultRole"].is_object());
         let register = &schemas["RegisterRequest"]["properties"];
         assert!(register["accept_terms"].is_object());
         assert_eq!(register["terms_version"]["maxLength"], 16);

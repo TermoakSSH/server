@@ -171,7 +171,21 @@ async fn remove(
 ) -> ApiResult<Json<Value>> {
     require_role(&st, &u, id, TeamRole::Owner).await?;
     let shares = st.store.team_shares(id).await?;
+    // Its vaults go with it (and the grants it had on other vaults).
+    let team_vaults: Vec<Id> = st
+        .store
+        .team_vaults(id)
+        .await?
+        .into_iter()
+        .map(|v| v.id)
+        .collect();
+    let before = crate::vaults::snapshot(&st, st.store.team_member_ids(id).await?).await;
     st.store.delete_team(id).await?;
+    for v in &team_vaults {
+        st.sessions.close_for_vault(None, *v).await;
+        st.pool.invalidate_vault(*v, None).await;
+    }
+    crate::vaults::apply_revocations(&st, before, &team_vaults).await;
     // Out of the sessions shared with the team, unless they have another
     // valid share.
     for share in shares {
@@ -230,7 +244,9 @@ async fn add_existing(
     }
     let team = st.store.team_for(team_id, u.id()).await?;
     crate::account::check_team_size(st, &team.plan, team.member_count)?;
+    let before = crate::vaults::snapshot(st, [user.id]).await;
     st.store.set_team_member(team_id, user.id, role).await?;
+    crate::vaults::apply_revocations(st, before, &[]).await;
     st.store
         .audit(
             u.id(),
@@ -423,7 +439,9 @@ async fn set_role(
         )
         .with_code("last_team_owner"));
     }
+    let before = crate::vaults::snapshot(&st, [user_id]).await;
     st.store.set_team_member(id, user_id, req.role).await?;
+    crate::vaults::apply_revocations(&st, before, &[]).await;
     st.store
         .audit(
             u.id(),
@@ -453,10 +471,13 @@ async fn remove_member(
             );
         }
     }
+    let before = crate::vaults::snapshot(&st, [user_id]).await;
     st.store.remove_team_member(id, user_id).await?;
     // They lose access to the sessions shared with the team, unless they
-    // have another invitation (direct or from another team).
+    // have another invitation (direct or from another team), and to the
+    // team's vaults (server sessions on their hosts close).
     st.sessions.reevaluate_user(user_id).await;
+    crate::vaults::apply_revocations(&st, before, &[]).await;
     st.store
         .audit(
             u.id(),

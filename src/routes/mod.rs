@@ -6,6 +6,7 @@ pub mod events;
 pub mod sessions;
 pub mod sftp;
 pub mod teams;
+pub mod vaults;
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Method, header};
@@ -47,6 +48,7 @@ pub fn router(state: AppState) -> Router {
         .merge(ai::routes())
         .merge(events::routes())
         .merge(teams::routes())
+        .merge(vaults::routes())
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .merge(uploads)
         .merge(crate::updates::routes())
