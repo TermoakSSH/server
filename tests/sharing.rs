@@ -391,6 +391,95 @@ async fn waiting_room_names_and_links() {
         && a["actor"].as_str().unwrap().starts_with("guest:")));
 }
 
+/// What the released apps (Termoak libraries 0.2, `User-Agent:
+/// Termoak/0.2.1`: desktop 0.2, Android and iOS 0.3) share keeps its old
+/// meaning: they cannot let anyone in nor hand over the keyboard, so their
+/// links do not wait and a `control` invitee gets the keyboard on asking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shares_from_released_apps_keep_their_old_meaning() {
+    let srv = Srv::start(|_, _| {}).await;
+    let (ana, _) = srv.user("ana@t.test", "Ana").await;
+    let (bea, _) = srv.user("bea@t.test", "Bea").await;
+    // A relay hosted by an old desktop: protocol 1 (no `proto=2`).
+    let relay = srv
+        .ok(
+            Method::POST,
+            "/api/v1/relay",
+            &ana,
+            Some(json!({"title": "Old desktop", "cols": 80, "rows": 24})),
+        )
+        .await;
+    let rid = relay["session"]["id"].as_str().unwrap().to_string();
+    let mut host = srv
+        .ws(relay["host_ws_path"].as_str().unwrap(), Some(&ana))
+        .await;
+    host.send(WsMsg::Binary(b"old-host-screen\r\n".to_vec().into()))
+        .await
+        .unwrap();
+    let old_app = |body: Value| {
+        srv.http
+            .post(format!("{}/api/v1/sessions/{rid}/shares", srv.base))
+            .bearer_auth(&ana)
+            .header("user-agent", "Termoak/0.2.1")
+            .json(&body)
+            .send()
+    };
+
+    // A link from the old app: no waiting room.
+    let link: Value =
+        old_app(json!({"link": true, "permission": "view", "expires_in_minutes": 60}))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(link["share"]["require_approval"], false, "{link}");
+    let token = link["token"].as_str().unwrap();
+    let mut guest = srv
+        .ws(
+            &format!("/api/v1/sessions/{rid}/ws?share_token={token}&proto=2&guest=web-guest-0001"),
+            None,
+        )
+        .await;
+    ws_wait_json(&mut guest, "hello").await;
+    ws_wait_output(&mut guest, "old-host-screen").await;
+
+    // A `control` invitation from the old app: asking gives the keyboard
+    // (the old host cannot grant it), and the typing reaches the host.
+    let share: Value = old_app(json!({"email": "bea@t.test", "permission": "control"}))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(share["share"]["auto_grant"], true, "{share}");
+    assert_eq!(share["share"]["require_approval"], false);
+    let mut b = srv.ws(&session_ws(&rid), Some(&bea)).await;
+    assert_eq!(
+        ws_wait_json(&mut b, "hello").await["you"]["can_write"],
+        false
+    );
+    send(&mut b, json!({"type": "control_request"})).await;
+    assert_eq!(ws_wait_json(&mut b, "control").await["can_write"], true);
+    b.send(WsMsg::Binary(b"bea-typed".to_vec().into()))
+        .await
+        .unwrap();
+    ws_wait_output(&mut host, "bea-typed").await;
+
+    // The same requests from a current client keep today's defaults.
+    let (s, link) = srv
+        .call(
+            Method::POST,
+            &format!("/api/v1/sessions/{rid}/shares"),
+            Some(&ana),
+            Some(json!({"link": true, "permission": "control"})),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(link["share"]["require_approval"], true);
+    assert_eq!(link["share"]["auto_grant"], false);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_driver_at_a_time() {
     let srv = Srv::start(|_, _| {}).await;

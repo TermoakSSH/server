@@ -20,6 +20,7 @@ use utoipa::ToSchema;
 
 use axum::http::header;
 use axum::response::IntoResponse;
+use termoak_core::error::codes;
 use termoak_core::store::{SecretUse, VaultChange};
 
 use crate::auth::AuthUser;
@@ -514,6 +515,12 @@ async fn sync(
         c.vault_id = None;
         c.has_secret = None;
     }
+    // What the old app has: its copy of each pushed item (for the deletions
+    // below, which must not be older than it).
+    let sent: BTreeMap<Id, (EntityKind, i64)> = pushed
+        .iter()
+        .map(|c| (c.id, (c.kind, c.updated_at)))
+        .collect();
     let report = st.store.apply_remote_v2(&ctx.access, pushed).await?;
     let personal = ctx.personal();
     let page = st
@@ -531,18 +538,68 @@ async fn sync(
             VaultChange::Departed { id, kind, rev, at } => tombstone(id, kind, rev, at),
         })
         .collect();
-    // Stale pushes: the server's newer version goes back.
+    // Pushes of items that are not in the personal vault (an old app's
+    // copy of an item moved to another vault since): an edit applies where
+    // the item is now if the user may change it there, a stale or refused
+    // one does not; either way the old app must drop its copy. Its store
+    // keeps the newest `updated_at`, so the deletion it gets is at least as
+    // new as what it sent (the departure alone may be older than its edit).
+    let mut gone: BTreeMap<Id, SyncRecord> = BTreeMap::new();
+    for a in &report.applied {
+        if a.vault_id.is_some_and(|v| v != personal) {
+            gone.insert(a.id, tombstone(a.id, a.kind, a.rev, a.updated_at));
+        }
+    }
+    // Stale pushes: the server's newer version goes back (personal), or
+    // the deletion (elsewhere).
     if !report.stale.is_empty() {
         for mut r in st
             .store
             .sync_records_in(&ctx.access, report.stale.clone())
             .await?
         {
-            if r.vault_id == Some(personal) && !changes.iter().any(|c| c.id == r.id) {
-                r.vault_id = None;
-                changes.push(r);
+            if r.vault_id == Some(personal) {
+                if !changes.iter().any(|c| c.id == r.id) {
+                    r.vault_id = None;
+                    changes.push(r);
+                }
+            } else {
+                let at = sent
+                    .get(&r.id)
+                    .map_or(r.updated_at, |s| s.1.max(r.updated_at));
+                gone.insert(r.id, tombstone(r.id, r.kind, r.rev, at));
             }
         }
+    }
+    // Refused because the id lives in a vault where the user cannot change
+    // it (Use only) or cannot see it (never for a personal item).
+    let refused: Vec<Id> = report
+        .rejected
+        .iter()
+        .filter(|r| matches!(r.code.as_str(), codes::VAULT_READ_ONLY | codes::ID_IN_USE))
+        .map(|r| r.id)
+        .collect();
+    if !refused.is_empty() {
+        let in_personal: Vec<Id> = st
+            .store
+            .sync_records_in(&ctx.access, refused.clone())
+            .await?
+            .into_iter()
+            .filter(|r| r.vault_id == Some(personal))
+            .map(|r| r.id)
+            .collect();
+        for id in refused {
+            if let Some((kind, at)) = sent.get(&id)
+                && !in_personal.contains(&id)
+            {
+                gone.entry(id)
+                    .or_insert_with(|| tombstone(id, *kind, page.head, *at));
+            }
+        }
+    }
+    if !gone.is_empty() {
+        changes.retain(|c| !gone.contains_key(&c.id));
+        changes.extend(gone.into_values());
     }
     Ok(Json(SyncResponse {
         rev: page.head.max(req.since),

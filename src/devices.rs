@@ -130,6 +130,26 @@ pub async fn signed_out(guard: &Option<SocketGuard>) {
     }
 }
 
+/// The client is one of the released apps from before the waiting room and
+/// the keyboard requests (sharing protocol 2): desktop 0.2, Android 0.3 and
+/// iOS 0.3 are built on the Termoak libraries 0.2 (`User-Agent:
+/// Termoak/0.2.1`), and AceitunoakSSH before them. They cannot let a guest
+/// in nor hand over the keyboard, so what they share keeps its old meaning.
+pub fn is_legacy_app(user_agent: &str) -> bool {
+    let product = user_agent.split_whitespace().next().unwrap_or("");
+    let Some((name, version)) = product.split_once('/') else {
+        return false;
+    };
+    if name.eq_ignore_ascii_case("AceitunoakSSH") || name.eq_ignore_ascii_case("Aceitunoak") {
+        return true;
+    }
+    if name != "Termoak" {
+        return false;
+    }
+    let mut parts = version.split(['.', '-']).map(|p| p.parse::<u64>().ok());
+    matches!((parts.next(), parts.next()), (Some(Some(0)), Some(Some(minor))) if minor < 3)
+}
+
 /// Longest client description kept.
 const CLIENT_MAX: usize = 100;
 
@@ -216,6 +236,30 @@ fn describe_browser(ua: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_apps() {
+        for ua in [
+            "Termoak/0.2.1",
+            "Termoak/0.2.0",
+            "Termoak/0.1.9",
+            "AceitunoakSSH/0.1.4",
+        ] {
+            assert!(is_legacy_app(ua), "{ua}");
+        }
+        for ua in [
+            "Termoak/0.4.0-next.4",
+            "Termoak/0.3.0-next.3",
+            "Termoak/1.0.0",
+            "Termoak-updater/0.2.1",
+            "Termoak",
+            "Mozilla/5.0 (X11; Linux x86_64) Termoak/0.2.1",
+            "curl/8.5.0",
+            "",
+        ] {
+            assert!(!is_legacy_app(ua), "{ua}");
+        }
+    }
 
     #[test]
     fn user_agents() {

@@ -344,10 +344,12 @@ pub struct CreateShare {
     #[serde(default)]
     pub expires_in_minutes: Option<i64>,
     /// Whoever joins waits until you let them in. Default: yes for links,
-    /// no for users and teams.
+    /// no for users and teams (no for everything shared from the released
+    /// apps before the waiting room, `User-Agent: Termoak/0.2.x`).
     #[serde(default)]
     pub require_approval: Option<bool>,
-    /// Requests for the keyboard are granted without asking you.
+    /// Requests for the keyboard are granted without asking you (always for
+    /// `control` shares from the released apps before keyboard requests).
     #[serde(default)]
     pub auto_grant: bool,
     /// With `auto_grant`: each automatic grant lasts at most this many
@@ -377,6 +379,7 @@ async fn create_share(
     State(st): State<AppState>,
     u: AuthUser,
     Path(id): Path<Id>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CreateShare>,
 ) -> ApiResult<Json<Value>> {
     let (live, access) = live_for(&st, &u, id).await?;
@@ -422,9 +425,18 @@ async fn create_share(
             ));
         }
     };
+    // The released apps (desktop 0.2, Android and iOS 0.3) can neither let
+    // anyone in nor hand over the keyboard: what they share keeps its old
+    // meaning (guests come in at once, `control` can type), or their links
+    // would leave guests in the waiting room for good and a `control`
+    // invitee could never get the keyboard. They send neither option.
+    let legacy = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(crate::devices::is_legacy_app);
     let opts = ShareOptions {
-        require_approval: req.require_approval.unwrap_or(req.link),
-        auto_grant: req.auto_grant,
+        require_approval: req.require_approval.unwrap_or(req.link && !legacy),
+        auto_grant: req.auto_grant || (legacy && req.permission == SharePermission::Control),
         control_minutes: req.control_minutes,
     };
     let (share, token) = st

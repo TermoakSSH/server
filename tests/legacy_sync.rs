@@ -70,6 +70,9 @@ async fn legacy_sync_sees_only_the_personal_vault() {
 
     // An old app that still has it pushes an edit: it is applied where the
     // item is now (Ana is Editor of Ops) and stays out of the personal vault.
+    // The answer deletes the old app's copy, with a time no older than its
+    // edit (its store keeps the newest version: the departure is older).
+    let edited_at = termoak_core::time::now_ms() + 1000;
     let r = srv
         .ok(
             "/api/v1/sync",
@@ -77,16 +80,70 @@ async fn legacy_sync_sees_only_the_personal_vault() {
             json!({"since": rev2, "changes": [{
                 "id": mine, "kind": "host",
                 "data": {"label": "renamed by old app", "address": "mine.example.com"},
-                "sync_mode": "synced", "updated_at": termoak_core::time::now_ms() + 1000,
+                "sync_mode": "synced", "updated_at": edited_at,
                 "deleted": false
             }]}),
         )
         .await;
     assert_eq!(r["accepted"], json!([mine]));
-    assert!(find(&r["changes"], &mine).is_none(), "{r}");
+    let gone = find(&r["changes"], &mine).expect("a deletion for the old copy");
+    assert_eq!(gone["deleted"], true, "{r}");
+    assert!(gone["updated_at"].as_i64().unwrap() >= edited_at, "{gone}");
+    assert!(!r.to_string().contains("renamed by old app"), "{r}");
     let h = srv.get(&format!("/api/v1/hosts/{mine}"), &bea).await;
     assert_eq!(h.body["label"], "renamed by old app");
     assert_eq!(h.body["vault_id"], ops);
+
+    // An older edit of it (stale): the old app still gets the deletion.
+    let r = srv
+        .ok(
+            "/api/v1/sync",
+            &ana,
+            json!({"since": r["rev"], "changes": [{
+                "id": mine, "kind": "host",
+                "data": {"label": "older edit", "address": "mine.example.com"},
+                "sync_mode": "synced", "updated_at": edited_at - 500, "deleted": false
+            }]}),
+        )
+        .await;
+    let gone = find(&r["changes"], &mine).expect("a deletion for the stale copy");
+    assert_eq!(gone["deleted"], true, "{r}");
+    assert!(gone["updated_at"].as_i64().unwrap() >= edited_at, "{gone}");
+    let h = srv.get(&format!("/api/v1/hosts/{mine}"), &bea).await;
+    assert_eq!(h.body["label"], "renamed by old app");
+
+    // A member who may only use Ops (or an outsider) pushing that id
+    // changes nothing and is told to drop it; their own items stay.
+    let cid = srv.user("Cid").await;
+    srv.share(&bea, &ops, &cid, "use_only").await;
+    let dan = srv.user("Dan").await;
+    let cids = srv.host(&cid, &cid.id, "cid-own", "cid-secret").await;
+    for who in [&cid, &dan] {
+        let r = srv
+            .ok(
+                "/api/v1/sync",
+                who,
+                json!({"since": 0, "changes": [{
+                    "id": in_ops, "kind": "host",
+                    "data": {"label": "hijacked", "address": "evil.example.com"},
+                    "sync_mode": "synced", "updated_at": termoak_core::time::now_ms() + 5000,
+                    "deleted": false
+                }]}),
+            )
+            .await;
+        let gone = find(&r["changes"], &in_ops).expect("a deletion for the refused push");
+        assert_eq!(gone["deleted"], true, "{r}");
+        assert!(!r.to_string().contains("team-secret"), "{r}");
+    }
+    let h = srv.get(&format!("/api/v1/hosts/{in_ops}"), &bea).await;
+    assert_eq!(h.body["label"], "team-host");
+    let r = srv
+        .ok("/api/v1/sync", &cid, json!({"since": 0, "changes": []}))
+        .await;
+    assert!(
+        find(&r["changes"], &cids).is_some_and(|c| c["deleted"] == false),
+        "{r}"
+    );
 
     // The legacy sync never pulls other vaults, whatever `since` says.
     let all = srv
