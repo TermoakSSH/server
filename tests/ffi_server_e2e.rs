@@ -753,6 +753,7 @@ fn server_end_to_end() {
         Arc::new(TrustAll),
         local_listener.clone(),
         None,
+        true,
     ))
     .unwrap();
     let shared = block_on(core.share_terminal(local.clone(), "from the phone".into())).unwrap();

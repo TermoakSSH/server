@@ -2,7 +2,7 @@
 name = "termoak-server"
 description = "Termoak server: REST + WebSocket API, persistent and shared sessions, background AI and sync"
 # Released separately (server-vX.Y.Z tag): it has its own version.
-version = "0.6.0-next.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.89"
 authors = ["Oihalitz <oihalitz@ohz.es>"]
@@ -15,9 +15,9 @@ name = "termoak-server"
 path = "src/main.rs"
 
 [dependencies]
-termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.5.0-next.4", features = ["openapi"] }
-termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.5.0-next.4" }
-termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.5.0-next.4" }
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.6.0", features = ["openapi"] }
+termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.6.0" }
+termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.6.0" }
 tokio = { version = "1.53", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io", "codec"] }
 futures = "0.3"
@@ -49,16 +49,16 @@ rust-i18n = "4"
 
 [dev-dependencies]
 # The engine of the mobile apps against this server (tests/ffi_*.rs).
-termoak-ffi = { git = "https://github.com/TermoakSSH/core", tag = "v0.5.0-next.4" }
+termoak-ffi = { git = "https://github.com/TermoakSSH/core", tag = "v0.6.0" }
 # The client library (relay host) against this server (tests/sharing.rs).
-termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.5.0-next.4", default-features = false }
-termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.5.0-next.4" }
+termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.6.0", default-features = false }
+termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.6.0" }
 data-encoding = "2"
 tokio-tungstenite = "0.28"
 tempfile = "3"
 # Old-schema databases for the migration tests (same version as the core).
 rusqlite = { version = "0.37", features = ["bundled"] }
-termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.5.0-next.4" }
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.6.0" }
 
 # Own workspace: the crates of TermoakSSH/core come from git.
 [workspace]
