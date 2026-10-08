@@ -398,6 +398,19 @@ async fn test_host(
         .store
         .resolve_in(&ctx.access, id, SecretUse::Server)
         .await?;
+    // The server only tests SSH (the apps test Telnet hosts themselves).
+    if let Err(e) = crate::sessions::check_server_protocol(&resolved.host) {
+        return Ok(Json(HostTest {
+            ok: false,
+            latency_ms: 0,
+            fingerprint: None,
+            key_type: None,
+            os: None,
+            banner: None,
+            error: Some(e.message),
+            error_code: Some(e.code.into()),
+        }));
+    }
     let trust = q.get("trust").is_some_and(|v| v == "true" || v == "1");
     let opts = ConnectOptions::new(Arc::new(StoreVerifier::for_host(
         st.store.clone(),
@@ -647,7 +660,9 @@ async fn audit(
 /// Just-in-time credentials, for a connection from the user's device.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CredentialsRequest {
-    /// `ssh`, `sftp` or `forward` (audited).
+    /// `ssh`, `sftp`, `forward` or `telnet` (audited). Apps send `ssh` for
+    /// Telnet hosts too: the answer is the same (the password for the
+    /// automatic login, no key).
     #[serde(default = "default_purpose")]
     pub purpose: String,
 }
@@ -708,8 +723,9 @@ fn hop(r: &termoak_core::resolve::ResolvedHost) -> CredentialHop {
 }
 
 /// `POST /hosts/{id}/credentials`: the resolved credentials of a host and
-/// its jumps, for a connection made by the app. Editors always; Use-only
-/// members only when the vault is not Strict (`use_only_strict`).
+/// its jumps, for a connection made by the app (SSH or Telnet: a Telnet host
+/// gets its username and password for the automatic login). Editors always;
+/// Use-only members only when the vault is not Strict (`use_only_strict`).
 /// `Cache-Control: no-store`, rate limited and audited (`secret.use`).
 async fn credentials(
     State(st): State<AppState>,
@@ -718,9 +734,9 @@ async fn credentials(
     body: Option<Json<CredentialsRequest>>,
 ) -> ApiResult<axum::response::Response> {
     let purpose = body.map(|b| b.0.purpose).unwrap_or_else(default_purpose);
-    if !matches!(purpose.as_str(), "ssh" | "sftp" | "forward") {
+    if !matches!(purpose.as_str(), "ssh" | "sftp" | "forward" | "telnet") {
         return Err(ApiError::bad_request(
-            "purpose must be ssh, sftp or forward",
+            "purpose must be ssh, sftp, forward or telnet",
         ));
     }
     let key = format!("credentials:{}", ctx.id());

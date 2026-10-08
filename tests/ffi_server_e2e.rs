@@ -454,6 +454,8 @@ fn server_end_to_end() {
                 os: None,
                 os_version: None,
                 favorite: true,
+                protocol: "ssh".into(),
+                icon: None,
                 sync_mode: None,
                 has_password: false,
                 updated_at: 0,

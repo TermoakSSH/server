@@ -68,6 +68,8 @@ fn host(label: &str, account: Option<&str>, vault: Option<&str>) -> SshHost {
         os: None,
         os_version: None,
         favorite: false,
+        protocol: "ssh".into(),
+        icon: None,
         sync_mode: None,
         has_password: false,
         updated_at: 0,

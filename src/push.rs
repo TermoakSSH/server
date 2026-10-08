@@ -563,7 +563,7 @@ impl Push {
             loop {
                 tokio::select! {
                     ev = ai_rx.recv() => match ev {
-                        Ok(ev) => self.on_ai(ev.owner, ev.task_id, &ev.event).await,
+                        Ok(ev) => self.on_ai(&ai, ev.owner, ev.task_id, &ev.event).await,
                         Err(RecvError::Lagged(n)) => tracing::warn!(n, "push: AI events lost"),
                         Err(RecvError::Closed) => break,
                     },
@@ -577,7 +577,7 @@ impl Push {
         });
     }
 
-    async fn on_ai(self: &Arc<Self>, owner: Id, task_id: Id, event: &TaskEvent) {
+    async fn on_ai(self: &Arc<Self>, ai: &AiEngine, owner: Id, task_id: Id, event: &TaskEvent) {
         let detailed = self.detailed;
         match event {
             TaskEvent::ApprovalRequested {
@@ -608,14 +608,15 @@ impl Push {
                     TaskStatus::Failed => ("push.ai_finished.title_failed", "failed"),
                     _ => return,
                 };
-                let name = if detailed {
-                    self.store
-                        .ai_task(owner, task_id)
-                        .await
-                        .map(|t| t.title)
-                        .unwrap_or_default()
-                } else {
-                    String::new()
+                // A host's conversation of a multi-host task: only the task
+                // itself (the parent) notifies when everything is done.
+                let task = ai.get(owner, task_id, false).await.ok();
+                if task.as_ref().is_some_and(|t| t.parent_id.is_some()) {
+                    return;
+                }
+                let name = match task {
+                    Some(t) if detailed => t.title,
+                    _ => String::new(),
                 };
                 self.notify(owner, move |l| {
                     let mut n = Notification::new(

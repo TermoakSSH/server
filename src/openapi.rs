@@ -22,8 +22,9 @@ use utoipa::openapi::{
 
 use crate::auth::*;
 use crate::routes::ai::{
-    AiAccess, AiKeyProvider, AiKeyTestResult, AiKeyView, Decision, ExplainReq, SetAiKey, SetMode,
-    SuggestReq, TaskMessage, TestAiKey,
+    AiAccess, AiKeyProvider, AiKeyTestResult, AiKeyView, ApprovalPreview, Decision, ExecutedStep,
+    ExplainReq, HostRun, NewTask, PendingApproval, RiskReasonDoc, RunbookView, SaveRunbook,
+    SetAiKey, SetMode, SuggestReq, TaskMessage, TaskPlan, TaskViewDoc, TestAiKey,
 };
 use crate::routes::entities::{
     CredentialHop, CredentialKey, Credentials, CredentialsRequest, ExecRequest, ExecResult,
@@ -1011,15 +1012,23 @@ fn endpoints() -> Vec<Ep> {
         ),
         Ep {
             query: &["limit"],
-            ..ep(Get, "/api/v1/ai/tasks", "ai", "AI tasks", None, Object)
+            ..ep(
+                Get,
+                "/api/v1/ai/tasks",
+                "ai",
+                "AI tasks",
+                None,
+                List("TaskView"),
+            )
         },
         ep(
             Post,
             "/api/v1/ai/tasks",
             "ai",
-            "Create a background task",
-            Object,
-            Object,
+            "Create a background task (on one host, several, a group or a tag; `fan_out`: one \
+             conversation per host; `plan_first`: a plan to approve first)",
+            Ref("NewTask"),
+            Ref("TaskView"),
         ),
         Ep {
             query: &["messages"],
@@ -1027,9 +1036,10 @@ fn endpoints() -> Vec<Ep> {
                 Get,
                 "/api/v1/ai/tasks/{id}",
                 "ai",
-                "Task (with the conversation)",
+                "Task (with the conversation, the pending approvals with their preview and, \
+                 for a multi-host task, the per-host table)",
                 None,
-                Object,
+                Ref("TaskView"),
             )
         },
         ep(
@@ -1046,7 +1056,7 @@ fn endpoints() -> Vec<Ep> {
             "ai",
             "Continue the conversation",
             Ref("TaskMessage"),
-            Object,
+            Ref("TaskView"),
         ),
         ep(
             Post,
@@ -1079,17 +1089,34 @@ fn endpoints() -> Vec<Ep> {
             Post,
             "/api/v1/ai/tasks/{id}/approvals/{approval_id}",
             "ai",
-            "Approve or deny an action",
+            "Approve or deny an action (`edited`: approve an edited command or plan; \
+             `reason`: why it was denied, sent to the model)",
             Ref("Decision"),
             Object,
         ),
         ep(
             Get,
+            "/api/v1/ai/tasks/{id}/runbook",
+            "ai",
+            "Runbook of a task: the commands it ran as a snippet, to review",
+            None,
+            Ref("RunbookView"),
+        ),
+        ep(
+            Post,
+            "/api/v1/ai/tasks/{id}/runbook",
+            "ai",
+            "Save the runbook of a task as a snippet (in a vault you can edit)",
+            Ref("SaveRunbook"),
+            Record("Snippet"),
+        ),
+        ep(
+            Get,
             "/api/v1/ai/approvals",
             "ai",
-            "Pending approvals",
+            "Pending approvals (with their preview)",
             None,
-            Object,
+            List("PendingApproval"),
         ),
         ep(
             Post,
@@ -1466,6 +1493,16 @@ pub fn document() -> OpenApi {
         .schema_from::<TaskMessage>()
         .schema_from::<SetMode>()
         .schema_from::<Decision>()
+        .schema_from::<NewTask>()
+        .schema_from::<TaskViewDoc>()
+        .schema_from::<PendingApproval>()
+        .schema_from::<ApprovalPreview>()
+        .schema_from::<RiskReasonDoc>()
+        .schema_from::<HostRun>()
+        .schema_from::<TaskPlan>()
+        .schema_from::<ExecutedStep>()
+        .schema_from::<RunbookView>()
+        .schema_from::<SaveRunbook>()
         .schema_from::<SuggestReq>()
         .schema_from::<ExplainReq>()
         .schema_from::<SetAiKey>()
@@ -1579,6 +1616,32 @@ mod tests {
         assert!(json["paths"]["/api/v1/vaults/{id}/members/{member_id}"]["patch"].is_object());
         assert!(json["paths"]["/api/v1/hosts/{id}/credentials"]["post"].is_object());
         assert!(schemas["VaultRole"].is_object());
+        // Hosts carry their protocol and logo.
+        let host = &schemas["Host"]["properties"];
+        assert!(host["protocol"].is_object());
+        assert!(host["icon"].is_object());
+        // AI: approvals with a preview, edited / denied with a reason,
+        // multi-host tasks and runbooks.
+        let decision = &schemas["Decision"]["properties"];
+        assert!(decision["edited"].is_object() && decision["reason"].is_object());
+        assert!(schemas["PendingApproval"]["properties"]["preview"].is_object());
+        assert!(schemas["ApprovalPreview"]["properties"]["reasons"].is_object());
+        assert!(schemas["RiskReason"].is_object());
+        let task = &schemas["NewTask"]["properties"];
+        for f in ["group_id", "tag", "fan_out", "plan_first"] {
+            assert!(task[f].is_object(), "NewTask.{f}");
+        }
+        let view = &schemas["TaskView"]["properties"];
+        for f in ["parent_id", "hosts", "plan", "steps", "pending_approvals"] {
+            assert!(view[f].is_object(), "TaskView.{f}");
+        }
+        let runbook = &json["paths"]["/api/v1/ai/tasks/{id}/runbook"];
+        assert!(runbook["get"].is_object() && runbook["post"].is_object());
+        assert_eq!(
+            json["paths"]["/api/v1/ai/approvals"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["items"]["$ref"],
+            "#/components/schemas/PendingApproval"
+        );
         let register = &schemas["RegisterRequest"]["properties"];
         assert!(register["accept_terms"].is_object());
         assert_eq!(register["terms_version"]["maxLength"], 16);

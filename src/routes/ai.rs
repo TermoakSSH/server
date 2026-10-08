@@ -11,14 +11,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use termoak_ai::assist::{AssistContext, CommandSuggestion};
 use termoak_ai::mcp::McpCaller;
-use termoak_ai::{CreateTask, PermissionMode, TaskView};
+use termoak_ai::{ApprovalDecision, CreateTask, PermissionMode, Runbook, TaskView};
 use termoak_core::Id;
+use termoak_core::model::{Record, SecretUpdate, Snippet};
 use utoipa::ToSchema;
 
 use crate::account::micros_to_usd;
 use crate::auth::{AuthUser, bearer_from_headers};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::vaults::AccessCtx;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -29,6 +31,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/ai/tasks/{id}/cancel", post(cancel))
         .route("/api/v1/ai/tasks/{id}/mode", post(set_mode))
         .route("/api/v1/ai/tasks/{id}/events", get(events))
+        .route(
+            "/api/v1/ai/tasks/{id}/runbook",
+            get(runbook).post(save_runbook),
+        )
         .route(
             "/api/v1/ai/tasks/{id}/approvals/{approval_id}",
             post(decide),
@@ -469,13 +475,26 @@ async fn events(
     Ok(Json(json!(rows)))
 }
 
+/// `POST /ai/tasks/{id}/approvals/{approval_id}`. Apps that only send
+/// `{approve, always}` keep working.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct Decision {
     pub approve: bool,
     /// Approve this one and every later one in the task (switches to autonomous mode).
     #[serde(default)]
     pub always: bool,
+    /// With `approve: true`: the command (`run_command`, `send_to_terminal`)
+    /// or plan to use instead of the model's (approvals whose `preview` has
+    /// `editable: true`). It is what runs, and the model is told.
+    #[serde(default)]
+    pub edited: Option<String>,
+    /// Why it was denied (or a note with the approval): sent to the model.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
+
+/// Longest edited command or plan kept in the audit entry (characters).
+const AUDIT_EDITED_CHARS: usize = 4000;
 
 async fn decide(
     State(st): State<AppState>,
@@ -484,9 +503,33 @@ async fn decide(
     Json(req): Json<Decision>,
 ) -> ApiResult<Json<Value>> {
     let by = format!("{} ({})", u.user.name, u.device.name);
+    let decision = ApprovalDecision {
+        approve: req.approve,
+        always: req.always,
+        edited: req.edited,
+        reason: req.reason,
+    };
+    // What the engine uses: the edit only when approving, trimmed; the
+    // reason trimmed and capped.
+    let edited = decision
+        .edited_text()
+        .filter(|_| decision.approve)
+        .map(str::to_string);
+    let reason = decision.reason_text();
     st.ai
-        .decide(u.id(), id, approval_id, req.approve, req.always, &by)
+        .decide_with(u.id(), id, approval_id, decision, &by)
         .await?;
+    let mut detail = json!({"task": id, "always": req.always});
+    if let Some(e) = &edited {
+        let count = e.chars().count();
+        detail["edited"] = json!(e.chars().take(AUDIT_EDITED_CHARS).collect::<String>());
+        if count > AUDIT_EDITED_CHARS {
+            detail["edited_truncated"] = json!(true);
+        }
+    }
+    if let Some(r) = &reason {
+        detail["reason"] = json!(r);
+    }
     st.store
         .audit(
             u.id(),
@@ -497,10 +540,121 @@ async fn decide(
                 "ai.approval.denied"
             },
             Some(approval_id.to_string()),
-            json!({"task": id, "always": req.always}),
+            detail,
         )
         .await?;
     Ok(Json(json!({"ok": true})))
+}
+
+/// `GET /ai/tasks/{id}/runbook`: the commands the task ran, as a snippet to
+/// review before saving it (`steps: 0` when it ran none).
+async fn runbook(
+    State(st): State<AppState>,
+    u: AuthUser,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<RunbookView>> {
+    Ok(Json(st.ai.runbook(u.id(), id).await?.into()))
+}
+
+/// The runbook of a task: a snippet built from the commands (and file
+/// writes) it ran successfully, in order.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RunbookView {
+    /// Suggested snippet name (the task's title).
+    pub name: String,
+    pub description: String,
+    /// The script (`{{host}}` where the host's name or address was).
+    pub script: String,
+    /// `{{variables}}` of the script.
+    pub variables: Vec<String>,
+    /// Commands and file writes in it (0: nothing to save).
+    pub steps: usize,
+}
+
+impl From<Runbook> for RunbookView {
+    fn from(r: Runbook) -> Self {
+        Self {
+            name: r.name,
+            description: r.description,
+            script: r.script,
+            variables: r.variables,
+            steps: r.steps,
+        }
+    }
+}
+
+/// `POST /ai/tasks/{id}/runbook`.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct SaveRunbook {
+    /// Name of the snippet (the task's title otherwise).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Vault to save it in (default: your personal vault). You must be an
+    /// Editor there.
+    #[serde(default)]
+    pub vault_id: Option<uuid::Uuid>,
+}
+
+/// Longest snippet name accepted.
+const MAX_RUNBOOK_NAME: usize = 200;
+
+/// Saves the runbook of a task as a snippet (tags `ai`, `runbook`) in a
+/// vault you can edit. The body is optional.
+async fn save_runbook(
+    State(st): State<AppState>,
+    ctx: AccessCtx,
+    Path(id): Path<Id>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<Record<Snippet>>> {
+    let req: SaveRunbook = if body.iter().all(u8::is_ascii_whitespace) {
+        SaveRunbook::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad_request(format!("invalid body: {e}")))?
+    };
+    let name = req
+        .name
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty());
+    if name
+        .as_ref()
+        .is_some_and(|n| n.chars().count() > MAX_RUNBOOK_NAME)
+    {
+        return Err(ApiError::bad_request(format!(
+            "the name is too long (maximum {MAX_RUNBOOK_NAME} characters)"
+        )));
+    }
+    let vault = req.vault_id.unwrap_or(ctx.personal());
+    // Checked before building it: a vault you cannot edit is refused the
+    // same way whether the task ran commands or not.
+    ctx.access
+        .require(vault, termoak_core::model::VaultRole::Editor)?;
+    let rb = st.ai.runbook(ctx.id(), id).await?;
+    if rb.steps == 0 {
+        return Err(ApiError::bad_request("the task ran no commands").with_code("runbook_empty"));
+    }
+    let snippet = Snippet {
+        id: Id::nil(),
+        name: name.unwrap_or(rb.name),
+        script: rb.script,
+        description: rb.description,
+        tags: vec!["ai".into(), "runbook".into()],
+    };
+    let saved = st
+        .store
+        .save_in(&ctx.access, vault, snippet, SecretUpdate::Keep, None)
+        .await?;
+    st.store
+        .audit_vault(
+            ctx.id(),
+            &ctx.actor(),
+            "ai.task.runbook",
+            Some(id.to_string()),
+            json!({"snippet": saved.data.id, "steps": rb.steps}),
+            vault,
+        )
+        .await?;
+    Ok(Json(saved))
 }
 
 async fn pending(State(st): State<AppState>, u: AuthUser) -> ApiResult<Json<Value>> {
@@ -592,4 +746,188 @@ async fn mcp(
         Some(resp) => Json(resp).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     })
+}
+
+// --- OpenAPI shapes ----------------------------------------------------------
+//
+// The task routes send and receive the engine's own types (`CreateTask`,
+// `TaskView`, the approval rows); these mirror them for the documentation.
+
+/// `POST /ai/tasks`.
+#[allow(dead_code)]
+#[derive(Debug, ToSchema)]
+pub struct NewTask {
+    pub prompt: String,
+    pub title: Option<String>,
+    /// `read_only`, `ask`, `confirm` or `auto` (the server's default otherwise).
+    pub mode: Option<String>,
+    /// `provider` or `provider::model` (the default one otherwise).
+    pub provider: Option<String>,
+    /// Limit the task to these hosts.
+    pub host_ids: Option<Vec<uuid::Uuid>>,
+    /// Terminal it was launched from (context).
+    pub session_id: Option<uuid::Uuid>,
+    pub effort: Option<String>,
+    /// Run it on the hosts of this group (and its subgroups).
+    pub group_id: Option<uuid::Uuid>,
+    /// Run it on the hosts with this tag.
+    pub tag: Option<String>,
+    /// With several hosts: one conversation per host (the same request,
+    /// `[ai] fan_out_concurrency` at a time, at most `max_fan_out_hosts`)
+    /// under this task, which gets the per-host table (`hosts`).
+    pub fan_out: Option<bool>,
+    /// The model first writes a numbered plan (without tools) to approve or
+    /// edit: an approval with `tool: "plan"`.
+    pub plan_first: Option<bool>,
+}
+
+/// What an approval shows.
+#[allow(dead_code)]
+#[derive(Debug, ToSchema)]
+pub struct ApprovalPreview {
+    /// `command` (run_command), `terminal` (send_to_terminal), `file`
+    /// (write_file), `plan` or `other`.
+    pub kind: String,
+    /// Host as the model named it, or the terminal's title.
+    pub host: Option<String>,
+    /// Exact command (or text typed into the terminal).
+    pub command: Option<String>,
+    /// File written.
+    pub path: Option<String>,
+    /// Unified diff of the file (size-capped).
+    pub diff: Option<String>,
+    pub diff_truncated: Option<bool>,
+    pub added: Option<usize>,
+    pub removed: Option<usize>,
+    pub new_file: Option<bool>,
+    /// Why there is no diff.
+    pub diff_error: Option<String>,
+    /// `low`, `medium` or `high`.
+    pub risk: String,
+    /// The classifier's reasons.
+    pub reasons: Option<Vec<RiskReasonDoc>>,
+    /// Why the model wants to do it.
+    pub explanation: Option<String>,
+    /// The plan to approve (`kind: plan`).
+    pub plan: Option<String>,
+    /// It can be edited before approving (`edited` in the decision).
+    pub editable: Option<bool>,
+}
+
+/// Why an action is risky.
+#[allow(dead_code)]
+#[derive(Debug, ToSchema)]
+#[schema(as = RiskReason)]
+pub struct RiskReasonDoc {
+    /// Stable code for translations: `pipe`, `chain`, `redirect`,
+    /// `substitution`, `sudo`, `rm_rf`, `delete`, `disk`, `reboot`,
+    /// `service`, `packages`, `firewall`, `permissions`, `kill`, `users`,
+    /// `remote_script`, `containers`, `cron`, `git_history`, `system_path`,
+    /// `redacted`, `changes`.
+    pub code: String,
+    /// English text.
+    pub text: String,
+}
+
+/// An approval of a task (`pending_approvals`, `GET /ai/approvals`).
+#[allow(dead_code)]
+#[derive(Debug, ToSchema)]
+pub struct PendingApproval {
+    pub id: uuid::Uuid,
+    pub task_id: uuid::Uuid,
+    /// The tool, or `plan`.
+    pub tool: String,
+    #[schema(value_type = Object)]
+    pub input: Value,
+    pub summary: String,
+    /// `pending`, `approved`, `denied` or `expired`.
+    pub status: String,
+    pub decided_by: Option<String>,
+    pub created_at: i64,
+    pub decided_at: Option<i64>,
+    /// Absent on approvals from before server 0.6.
+    pub preview: Option<ApprovalPreview>,
+}
+
+/// One host of a multi-host task.
+#[allow(dead_code)]
+#[derive(Debug, ToSchema)]
+pub struct HostRun {
+    pub host_id: uuid::Uuid,
+    pub label: String,
+    /// The host's own task (its conversation, with `parent_id`).
+    pub task_id: uuid::Uuid,
+    pub status: String,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub cost_micros: i64,
+    pub pending_approvals: usize,
+}
+
+/// The plan of a "plan before acting" task.
+#[allow(dead_code)]
+#[derive(Debug, ToSchema)]
+pub struct TaskPlan {
+    pub text: String,
+    pub approved: bool,
+    pub edited: Option<bool>,
+}
+
+/// A command or file write a task ran.
+#[allow(dead_code)]
+#[derive(Debug, ToSchema)]
+pub struct ExecutedStep {
+    pub call_id: String,
+    /// `run_command`, `send_to_terminal` or `write_file`.
+    pub tool: String,
+    pub host: Option<String>,
+    /// What ran (the user's edit, if they edited it).
+    pub command: Option<String>,
+    pub path: Option<String>,
+    pub content: Option<String>,
+    pub ok: bool,
+    pub edited: Option<bool>,
+    pub explanation: Option<String>,
+    pub at: i64,
+}
+
+/// A task. Fields that are empty or false are left out.
+#[allow(dead_code)]
+#[derive(Debug, ToSchema)]
+#[schema(as = TaskView)]
+pub struct TaskViewDoc {
+    pub id: uuid::Uuid,
+    pub title: String,
+    pub prompt: String,
+    /// `queued`, `running`, `waiting_approval`, `completed`, `failed` or
+    /// `cancelled`.
+    pub status: String,
+    pub mode: String,
+    pub provider: String,
+    pub used_provider: Option<String>,
+    pub host_ids: Option<Vec<uuid::Uuid>>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub finished_at: Option<i64>,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub cost_micros: i64,
+    #[schema(value_type = Object)]
+    pub usage: Value,
+    #[schema(value_type = Option<Vec<Object>>)]
+    pub messages: Option<Vec<Value>>,
+    pub pending_approvals: Vec<PendingApproval>,
+    /// The multi-host task this host's conversation belongs to.
+    pub parent_id: Option<uuid::Uuid>,
+    /// A multi-host task (see `hosts`).
+    pub fan_out: Option<bool>,
+    /// Per-host table of a multi-host task (`GET` of one task).
+    pub hosts: Option<Vec<HostRun>>,
+    pub group_id: Option<uuid::Uuid>,
+    pub tag: Option<String>,
+    pub plan_first: Option<bool>,
+    pub plan: Option<TaskPlan>,
+    /// Commands and file writes it ran, in order.
+    pub steps: Option<Vec<ExecutedStep>>,
 }

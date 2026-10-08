@@ -152,9 +152,13 @@ SSH and SFTP:
 | `host_key_rejected` | 409 | The host key was rejected |
 | `ssh_timeout` | 504 | The SSH connection timed out |
 | `ssh_error` | 502 | Other SSH error |
+| `telnet_not_supported` | 422 | The host is a Telnet host: the server does not open sessions to it (`POST /sessions`) nor test it; the apps connect to Telnet hosts themselves |
+| `protocol_not_supported` | 422 | The host uses a protocol this server does not know (from a later app). Extra field: `protocol` |
+| `not_supported` | 422 | Not available for this host: SFTP or jumps through a Telnet host (`/exec` reports it in that host's `error`) |
 | `invalid_path` | 400 | Invalid path |
 | `invalid_mode` | 400 | Invalid mode (use octal, for example `644`) |
 | `cannot_delete_root` | 400 | The root directory cannot be deleted |
+| `runbook_empty` | 400 | `POST /ai/tasks/{id}/runbook`: the task ran no commands to save |
 
 Sync, AI, push notifications and updates:
 
@@ -557,13 +561,23 @@ All of them follow the same CRUD pattern:
 | DELETE | `/{col}/{id}` | Delete (Editor; leaves a tombstone for sync) |
 | GET | `/{col}/{id}/secret` | Reveals the secret (Editor; Use-only: `secret_hidden`). Audited as `secret.reveal` with the vault |
 
+Hosts have `protocol` (`"ssh"` or `"telnet"`; left out for SSH, so SSH
+hosts look the same to older apps; a value from a later version is kept as
+it is) and `icon` (the logo id the apps show: `ubuntu`, `debian`, `server`,
+`router`...; left out or `null` = automatic). Both are stored and returned
+as sent. Telnet hosts have no keys, jump hosts, SFTP or tunnels and their
+default port is 23 (written out by the apps). The server does not open
+sessions to them (`telnet_not_supported`): the apps connect to them
+themselves, and `/hosts/{id}/credentials` gives them the username and
+password for the automatic login.
+
 Other entity routes:
 
 | Method | Route | Description |
 |---|---|---|
 | POST | `/keys/generate` | `{label, key_type, comment?, passphrase?, store_passphrase?, vault_id?}`. Generates the key on the server |
 | POST | `/keys/import` | `{label, private_key, passphrase?, store_passphrase?, certificate?, sync_mode?, vault_id?}` |
-| POST | `/hosts/{id}/test` | Tests the connection (any role); returns the detected OS (saved by Editors only) and the latency. `?trust=true` accepts a new host key: it is saved in the host's vault if you are Editor there, otherwise in your personal vault |
+| POST | `/hosts/{id}/test` | Tests the connection (any role); returns the detected OS (saved by Editors only) and the latency. `?trust=true` accepts a new host key: it is saved in the host's vault if you are Editor there, otherwise in your personal vault. SSH only: a Telnet host answers `{ok: false, error_code: "telnet_not_supported"}` |
 | GET | `/hosts/{id}/effective` | Effective settings after applying groups and identity (any role) |
 | POST | `/hosts/{id}/credentials` | Just-in-time credentials for a connection from this device (below) |
 | POST | `/exec` | `{host_ids, command \| snippet_id + variables, timeout_secs?}`. Runs in parallel; any role, each host checked on its own |
@@ -573,7 +587,7 @@ Other entity routes:
 
 ### Just-in-time credentials
 
-`POST /hosts/{id}/credentials {purpose: "ssh" | "sftp" | "forward"}` →
+`POST /hosts/{id}/credentials {purpose: "ssh" | "sftp" | "forward" | "telnet"}` →
 `{vault_id, expires_at, hops: [{host_id, address, port, username, password?,
 key?: {private_key, passphrase?, certificate?}, proxy_password?}]}` with the
 jumps first and the host last. Editors always; Use-only members only if the
@@ -582,7 +596,9 @@ no-store`; the app keeps it in memory only until authentication ends and
 never stores or logs it. Limited to 30 per minute per user (`rate_limited`)
 and audited as `secret.use` (device and purpose) in the vault. This is
 interface protection plus auditing, not cryptography: anyone with the token
-can call it, which is what Strict vaults are for.
+can call it, which is what Strict vaults are for. Telnet hosts follow the
+same rules (apps may send `ssh` or `telnet` as the purpose): the hop has the
+username and password, never a key.
 
 ### Sync v2
 
@@ -661,7 +677,7 @@ All routes live under `/hosts/{id}/sftp/`:
 | Method | Route | Description |
 |---|---|---|
 | GET | `/sessions` | `{active, shared, recent}` |
-| POST | `/sessions` | `{host_id, cols, rows, title?, record?}`. Opens a session that lives on the server |
+| POST | `/sessions` | `{host_id, cols, rows, title?, record?}`. Opens a session that lives on the server (SSH hosts only: `422 telnet_not_supported` for a Telnet host) |
 | GET | `/sessions/{id}` | State, size, `participants` and `driver` (see below) |
 | PATCH | `/sessions/{id}` | `{title}` |
 | DELETE | `/sessions/{id}` | Closes the session |
@@ -769,15 +785,17 @@ library writes them straight to disk with progress.
 |---|---|---|
 | GET | `/ai/providers` | Providers, models and whether they are available (`reason_code` and `reason` when not; see below) |
 | GET | `/ai/tasks` | `?limit=` |
-| POST | `/ai/tasks` | `{prompt, title?, mode?, provider?, host_ids?, session_id?, effort?}` |
-| GET | `/ai/tasks/{id}` | The task and its messages |
+| POST | `/ai/tasks` | `{prompt, title?, mode?, provider?, host_ids?, session_id?, effort?, group_id?, tag?, fan_out?, plan_first?}` (see [Multi-host tasks](#multi-host-tasks-plans-and-runbooks)) |
+| GET | `/ai/tasks/{id}` | The task and its messages, `pending_approvals` (each with its `preview`), `steps` and, for a multi-host task, `hosts` |
 | DELETE | `/ai/tasks/{id}` | Deletes the task |
 | POST | `/ai/tasks/{id}/messages` | `{text}`. Continues the conversation |
 | POST | `/ai/tasks/{id}/cancel` | Cancels the task |
 | POST | `/ai/tasks/{id}/mode` | `{mode: read_only\|ask\|confirm\|auto}` (also while the task is stopped: it applies to the next messages) |
 | GET | `/ai/tasks/{id}/events` | `?after=<seq>`. Stored events, to catch up |
-| POST | `/ai/tasks/{id}/approvals/{approval_id}` | `{approve, always?}` |
-| GET | `/ai/approvals` | Pending approvals of all your tasks |
+| POST | `/ai/tasks/{id}/approvals/{approval_id}` | `{approve, always?, edited?, reason?}` (see [Approvals](#approvals)) |
+| GET | `/ai/tasks/{id}/runbook` | `{name, description, script, variables, steps}`: the commands the task ran, as a snippet to review |
+| POST | `/ai/tasks/{id}/runbook` | `{name?, vault_id?}` (optional body) → the saved snippet (as in `/snippets`). Saved in `vault_id` (default: your personal vault; Editor there) with the tags `ai` and `runbook`; `runbook_empty` if the task ran no commands. Audited as `ai.task.runbook` in the vault |
+| GET | `/ai/approvals` | Pending approvals of all your tasks (each with its `preview`) |
 | POST | `/ai/suggest` | `{request, context?, provider?}` → suggested command |
 | POST | `/ai/explain` | `{text, question?, context?, provider?}` → explanation of an output or an error |
 | POST | `/mcp` | MCP server (JSON-RPC 2.0, HTTP transport). See [AI.md](https://github.com/TermoakSSH/core/blob/main/docs/AI.md) |
@@ -786,6 +804,62 @@ library writes them straight to disk with progress.
 | DELETE | `/me/ai/keys/{provider}` | → `{ok: true, deleted}` |
 | POST | `/me/ai/keys/{provider}/test` | `{key?}` (optional body) → `{ok, error, status}`. Checks the key in the body, or the saved one, with a call to the provider that spends nothing. At most 10 per minute (`429`, `too_many_attempts`) |
 | GET | `/me/ai/access` | `{own_keys, server_ai, credit_usd, spent_usd, remaining_usd, providers}`. See below |
+
+### Approvals
+
+Every approval (in `pending_approvals`, `GET /ai/approvals` and the
+`approval_requested` event) has a `preview` with what it is about:
+
+```json
+{"kind": "command", "host": "web-1", "command": "rm -rf /var/cache/app/*",
+ "risk": "high", "reasons": [{"code": "rm_rf", "text": "recursive forced delete"}],
+ "explanation": "Free disk space", "editable": true}
+```
+
+`kind` is `command` (run_command), `terminal` (send_to_terminal), `file`
+(write_file: `path`, a unified `diff` of the current file capped at 64 KB
+with `diff_truncated`, `added`, `removed`, `new_file` or `diff_error`),
+`plan` (`plan`: the numbered plan of a `plan_first` task) or `other`.
+`risk` is `low`, `medium` or `high`; `reasons[].code` are stable for
+translations. Fields that are empty or false are left out; approvals saved
+by servers before 0.6 have no `preview`.
+
+The answer is `{approve, always?, edited?, reason?}`:
+
+- `edited` (with `approve: true`, for previews with `editable: true`): the
+  command or plan to use instead of the model's. It is what runs, and the
+  model is told.
+- `reason`: why it was denied (sent to the model, which does not retry the
+  same action in another form), or a note with an approval.
+
+Both are optional (`{approve}` alone works as before) and are recorded in
+the audit entry (`ai.approval.approved` / `ai.approval.denied`, with
+`edited` capped at 4000 characters and `reason`). The `approval_decided`
+event has them too.
+
+### Multi-host tasks, plans and runbooks
+
+- `host_ids`, `group_id` (the group and its subgroups) or `tag` choose the
+  hosts. With several hosts and `fan_out: true` the task becomes the parent
+  of one conversation per host (the same request, `[ai]
+  fan_out_concurrency` at a time, at most `max_fan_out_hosts` hosts): the
+  parent's `GET` has `hosts` (`[{host_id, label, task_id, status, summary?,
+  error?, duration_ms?, cost_micros, pending_approvals}]`) and each host's
+  task has `parent_id`. A message to the parent goes to every host. Push
+  notifications: approvals come from each host's task; only the parent
+  notifies that it finished.
+- `plan_first: true`: the model first writes a numbered plan without
+  tools, approved (or edited, or denied with a reason so it proposes
+  another) as an approval with `tool: "plan"`; the task's `plan` is
+  `{text, approved, edited?}`.
+- `steps`: the commands and file writes the task ran, in order (`{call_id,
+  tool, host?, command?, path?, ok, edited?, explanation?, at}`).
+- Runbook: `GET /ai/tasks/{id}/runbook` builds a snippet from the
+  successful steps (the host's name becomes `{{host}}` when the task used
+  one host; for a multi-host task, the first host that ran commands) and
+  `POST` saves it.
+- With `[ai] redact_secrets` (default on) passwords, tokens and keys in tool
+  results and terminal context are hidden before they reach the provider.
 
 ### AI with your own keys and AI credit
 

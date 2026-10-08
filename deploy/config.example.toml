@@ -48,6 +48,13 @@ command_timeout_secs = 120
 # monthly_budget_usd = 50.0
 # Tool mode for external agents using MCP with a user token
 mcp_user_mode = "read_only"
+# Multi-host tasks (`fan_out`): hosts that run at the same time, and the most
+# hosts one task may target.
+fan_out_concurrency = 4
+max_fan_out_hosts = 50
+# Hide secrets (passwords, tokens, private keys...) in command output and
+# terminal context before they are sent to the AI provider.
+redact_secrets = true
 
 # The built-in providers (claude, gpt, codex, codex-api, opencode-api,
 # openrouter, opencode, local) are configured with environment variables:

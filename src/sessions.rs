@@ -27,7 +27,9 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use termoak_ai::{SessionAccess, SessionSummary, TerminalOutput};
-use termoak_core::model::{Host, SessionInfo, SessionShare, SessionStatus, SharePermission};
+use termoak_core::model::{
+    Host, HostProtocol, SessionInfo, SessionShare, SessionStatus, SharePermission,
+};
 use termoak_core::time::now_ms;
 use termoak_core::{Id, Store, new_id};
 use termoak_ssh::prompt::{AuthPrompter, Prompt};
@@ -227,6 +229,27 @@ pub struct HeldTerm {
     hub: Arc<OutputHub>,
     size: Mutex<(u16, u16)>,
     holder: Arc<HolderClient>,
+}
+
+/// A server session can only be opened for SSH hosts: `422`
+/// `telnet_not_supported` for Telnet (the apps connect to Telnet hosts
+/// themselves), `protocol_not_supported` for a protocol this server does
+/// not know.
+pub fn check_server_protocol(host: &Host) -> ApiResult<()> {
+    match &host.protocol {
+        HostProtocol::Ssh => Ok(()),
+        HostProtocol::Telnet => Err(ApiError::new(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "telnet_not_supported",
+            "Telnet hosts cannot have server sessions: connect from the app",
+        )),
+        HostProtocol::Other(p) => Err(ApiError::new(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "protocol_not_supported",
+            format!("this server does not support the \"{p}\" protocol"),
+        )
+        .with_detail("protocol", p.clone())),
+    }
 }
 
 fn holder_down() -> ApiError {
@@ -1031,6 +1054,10 @@ impl SessionManager {
         let rec = self.store.get_in::<Host>(&access, host_id).await?;
         let vault = rec.meta.vault_id.unwrap_or(owner);
         let host = rec.data;
+        // Only SSH lives on the server: Telnet sessions are opened by the
+        // apps themselves, and a protocol from a later version is never
+        // tried as SSH.
+        check_server_protocol(&host)?;
         let settings = self
             .store
             .effective_settings_in(&access, vault, &host)

@@ -144,6 +144,11 @@ impl From<SshError> for ApiError {
                 ApiError::new(StatusCode::GATEWAY_TIMEOUT, "ssh_timeout", e.to_string())
             }
             SshError::Key(m) => ApiError::bad_request(m),
+            // SFTP, tunnels or jumps through a Telnet host (or a protocol
+            // this version does not know).
+            SshError::Unsupported(m) => {
+                ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "not_supported", m)
+            }
             other => ApiError::new(StatusCode::BAD_GATEWAY, "ssh_error", other.to_string()),
         }
     }
