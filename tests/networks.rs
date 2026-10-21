@@ -767,3 +767,204 @@ async fn server_sessions_and_the_apps_reach_hosts_through_the_network() {
     };
     assert!(banner.starts_with(b"SSH-2.0-"), "{banner:?}");
 }
+
+/// RFC 7748 §6.1 (Alice): a private key and its public key.
+const RFC_PRIVATE: &str = "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=";
+const RFC_PUBLIC: &str = "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wireguard_keys_and_netd_follow_the_vaults() {
+    assert_eq!(
+        termoak_server::routes::networks::wireguard_public_key(RFC_PRIVATE).as_deref(),
+        Some(RFC_PUBLIC)
+    );
+    assert_eq!(
+        termoak_server::routes::networks::wireguard_public_key("cHJpdmF0ZQ=="),
+        None
+    );
+    let (srv, fake) = with_netd(|_| {}).await;
+    let ana = srv.user("Ana").await;
+    let bob = srv.user("Bob").await;
+
+    // Generate the key on the server: the public key comes back and stays
+    // in the network; the private key only in the secret.
+    let net = srv
+        .ok(
+            "/api/v1/networks",
+            &ana,
+            json!({"name": "office", "kind": "wireguard",
+                   "wireguard": {"addresses": ["10.9.0.2/32"], "peers": [{
+                       "public_key": RFC_PUBLIC, "endpoint": "vpn.example.com:51820",
+                       "allowed_ips": ["10.9.0.0/24"]}]}}),
+        )
+        .await;
+    let id = net["id"].as_str().unwrap().to_string();
+    assert!(net["wireguard"]["public_key"].is_null(), "{net}");
+    let key_path = format!("/api/v1/networks/{id}/wireguard/key");
+    let gen1 = srv.ok(&key_path, &ana, json!({})).await;
+    let public = gen1["public_key"].as_str().unwrap().to_string();
+    assert_eq!(public.len(), 44);
+    assert_eq!(gen1["network"]["wireguard"]["public_key"], public);
+    assert_eq!(gen1["network"]["has_secret"], true);
+    let secret = srv
+        .get(&format!("/api/v1/networks/{id}/secret"), &ana)
+        .await;
+    let private = secret.body["private_key"].as_str().unwrap();
+    assert_eq!(
+        termoak_server::routes::networks::wireguard_public_key(private).as_deref(),
+        Some(public.as_str())
+    );
+    let got = srv.get(&format!("/api/v1/networks/{id}"), &ana).await;
+    assert_eq!(got.body["wireguard"]["public_key"], public);
+    // Again: refused unless replacing.
+    let again = srv.post(&key_path, &ana, json!({})).await;
+    assert_eq!(
+        (again.status, again.body["error"]["code"].as_str()),
+        (409, Some("key_exists"))
+    );
+    let gen2 = srv.ok(&key_path, &ana, json!({"replace": true})).await;
+    assert_ne!(gen2["public_key"], public);
+    // Others' networks: not found; other kinds: not WireGuard.
+    assert_eq!(srv.post(&key_path, &bob, json!({})).await.status, 404);
+    let ts = srv
+        .ok(
+            "/api/v1/networks",
+            &ana,
+            json!({"name": "tailnet", "kind": "tailscale"}),
+        )
+        .await;
+    let r = srv
+        .post(
+            &format!(
+                "/api/v1/networks/{}/wireguard/key",
+                ts["id"].as_str().unwrap()
+            ),
+            &ana,
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.body["error"]["code"].as_str()),
+        (422, Some("not_wireguard"))
+    );
+    // Audited.
+    let audit = srv
+        .get(&format!("/api/v1/vaults/{}/audit", ana.id), &ana)
+        .await;
+    assert!(
+        audit
+            .body
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "network.key_generated"),
+        "{}",
+        audit.body
+    );
+
+    // A pasted private key: its public key is filled in.
+    let pasted = srv
+        .ok(
+            "/api/v1/networks",
+            &ana,
+            json!({"name": "pasted", "kind": "wireguard",
+                   "wireguard": {"addresses": ["10.9.0.3/32"], "public_key": "bogus", "peers": [{
+                       "public_key": RFC_PUBLIC, "allowed_ips": ["10.9.0.0/24"]}]},
+                   "secret": {"private_key": RFC_PRIVATE}}),
+        )
+        .await;
+    assert_eq!(pasted["wireguard"]["public_key"], RFC_PUBLIC);
+    let pasted_id = pasted["id"].as_str().unwrap().to_string();
+
+    // netd follows the vault: renaming keeps the running node; a new
+    // configuration or a deletion takes it down.
+    let up = srv
+        .ok(&format!("/api/v1/networks/{pasted_id}/up"), &ana, json!({}))
+        .await;
+    assert_eq!(up["state"], "up");
+    let rev = fake.running(&pasted_id).unwrap();
+    let mut data = srv
+        .get(&format!("/api/v1/networks/{pasted_id}"), &ana)
+        .await
+        .body;
+    data["name"] = json!("pasted (renamed)");
+    // The public key a client sends back does not change the revision.
+    let r = srv
+        .put(&format!("/api/v1/networks/{pasted_id}"), &ana, data.clone())
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["wireguard"]["public_key"], RFC_PUBLIC);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(fake.downs().is_empty(), "{:?}", fake.downs());
+    assert_eq!(fake.running(&pasted_id), Some(rev.clone()));
+    data["wireguard"]["peers"][0]["endpoint"] = json!("vpn2.example.com:51820");
+    let r = srv
+        .put(&format!("/api/v1/networks/{pasted_id}"), &ana, data)
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    fake.wait_downs(&pasted_id, 1).await;
+    assert_eq!(fake.running(&pasted_id), None);
+    srv.ok(&format!("/api/v1/networks/{pasted_id}/up"), &ana, json!({}))
+        .await;
+    assert_ne!(fake.running(&pasted_id), Some(rev));
+    // The host test says through which network it went.
+    let host = net_host(&srv, &ana, &ana.id, 1, Some(&pasted_id)).await;
+    let test = srv
+        .ok(&format!("/api/v1/hosts/{host}/test"), &ana, json!({}))
+        .await;
+    assert_eq!(test["ok"], false);
+    assert_eq!(test["error_code"], "network_dial_failed");
+    assert_eq!(test["network"]["id"], pasted_id);
+    assert_eq!(test["network"]["kind"], "wireguard");
+    srv.delete(&format!("/api/v1/hosts/{host}"), &ana).await;
+    let r = srv
+        .delete(&format!("/api/v1/networks/{pasted_id}"), &ana)
+        .await;
+    assert_eq!(r.status, 200);
+    fake.wait_downs(&pasted_id, 2).await;
+
+    // Sync v2: a network pushed with only the private key gets its public
+    // key in the same answer; a later change takes the running node down.
+    let kinds = termoak_client::sync::known_kinds();
+    let pushed = termoak_core::new_id().to_string();
+    let record = |endpoint: &str, at: i64| {
+        json!({"id": pushed, "kind": "network", "vault_id": ana.id, "sync_mode": "synced",
+               "updated_at": at, "deleted": false,
+               "data": {"id": pushed, "name": "pushed", "kind": "wireguard",
+                        "wireguard": {"addresses": ["10.9.0.4/32"], "peers": [{
+                            "public_key": RFC_PUBLIC, "endpoint": endpoint,
+                            "allowed_ips": ["10.9.0.0/24"]}]}},
+               "secret": {"private_key": RFC_PRIVATE}})
+    };
+    let now = termoak_core::time::now_ms();
+    let r = srv
+        .ok(
+            "/api/v1/vaults/sync",
+            &ana,
+            json!({"vaults": [], "changes": [record("a.example.com:1", now)], "kinds": kinds}),
+        )
+        .await;
+    let rec = find(&r["changes"], &pushed).expect("pushed network");
+    assert_eq!(rec["data"]["wireguard"]["public_key"], RFC_PUBLIC, "{rec}");
+    srv.ok(&format!("/api/v1/networks/{pushed}/up"), &ana, json!({}))
+        .await;
+    srv.ok(
+        "/api/v1/vaults/sync",
+        &ana,
+        json!({"vaults": r["cursors"], "changes": [record("b.example.com:1", now + 1000)],
+               "kinds": kinds}),
+    )
+    .await;
+    fake.wait_downs(&pushed, 1).await;
+
+    // Deleting a vault takes its networks down.
+    let shared = srv.vault(&ana, "Shared").await;
+    let in_shared = network(&srv, &ana, &shared, "shared net").await;
+    srv.ok(&format!("/api/v1/networks/{in_shared}/up"), &ana, json!({}))
+        .await;
+    let r = srv
+        .delete(&format!("/api/v1/vaults/{shared}?confirm=Shared"), &ana)
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    fake.wait_downs(&in_shared, 1).await;
+}

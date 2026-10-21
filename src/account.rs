@@ -843,7 +843,12 @@ pub async fn delete_account(
     for live in st.sessions.owned_by(u.id()) {
         let _ = st.sessions.close(&live, u.id()).await;
     }
+    let networks = match st.store.vault_access(u.id()).await {
+        Ok(access) => crate::routes::networks::networks_in(&st, &access, &owned).await,
+        Err(_) => Vec::new(),
+    };
     st.store.delete_user(u.id()).await?;
+    crate::routes::networks::down_later(&st, networks);
     st.sockets.sign_out_user_events(u.id());
     for v in &owned {
         st.sessions.close_for_vault(None, *v).await;

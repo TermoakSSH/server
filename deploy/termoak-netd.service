@@ -1,0 +1,45 @@
+[Unit]
+Description=Termoak private networks (termoak-netd)
+Documentation=https://github.com/TermoakSSH/server/blob/main/docs/NETWORKS.md
+After=network-online.target
+Wants=network-online.target
+# Up before the server, so features.networks is on from its first check.
+Before=termoak-server.service termoak-sessions.service
+
+# Joins the users' WireGuard networks in user space (no TUN, no root, no
+# routes) for termoak-server, which talks to it over the socket below
+# ([networks] netd_socket in /etc/termoak/config.toml). Same user as
+# termoak-server: the socket is 0600 and only that user (and root) may use
+# it. Another user: --socket-group <group> (mode 0660) or --allow-uids.
+[Service]
+Type=simple
+User=termoak
+Group=termoak
+ExecStart=/usr/local/bin/termoak-netd --socket /run/termoak-netd/netd.sock
+# Networks without connections for this long are taken down (0 = never).
+Environment=TERMOAK_NETD_IDLE=15m
+# Environment=TERMOAK_NETD_MAX_NETWORKS=64
+# Environment=TERMOAK_NETD_MAX_STREAMS=256
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=termoak-netd
+RuntimeDirectoryMode=0750
+# A node is a few MB; this caps a runaway one.
+MemoryMax=512M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Only the socket and the WireGuard UDP transport (and netlink, which Go's
+# network code may read).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

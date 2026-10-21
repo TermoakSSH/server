@@ -8,12 +8,30 @@ services:
     volumes:
       - termoak-data:/var/lib/termoak
       # - ./config.toml:/etc/termoak/config.toml:ro
+      # Private networks (docker compose --profile networks up):
+      # - termoak-netd-run:/run/termoak-netd
     environment:
       TERMOAK_PUBLIC_URL: "https://termoak.example.com"
+      # Private networks: the socket of the netd service below.
+      # TERMOAK_NETD_SOCKET: /run/termoak-netd/netd.sock
       # ANTHROPIC_API_KEY: "..."
       # OPENAI_API_KEY: "..."
       # OPENCODE_GO_KEY: "..."
       # CODEX_HOME: /var/lib/termoak/codex
 
+  # Private networks (WireGuard), the "with networks" build: started with
+  # `docker compose --profile networks up -d`, with the two commented lines
+  # of the termoak service enabled. Built locally (no published image).
+  netd:
+    image: termoak-netd:local
+    build:
+      context: .
+      dockerfile: Dockerfile.netd
+    profiles: ["networks"]
+    restart: unless-stopped
+    volumes:
+      - termoak-netd-run:/run/termoak-netd
+
 volumes:
   termoak-data:
+  termoak-netd-run:

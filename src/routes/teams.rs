@@ -180,7 +180,12 @@ async fn remove(
         .map(|v| v.id)
         .collect();
     let before = crate::vaults::snapshot(&st, st.store.team_member_ids(id).await?).await;
+    let networks = match st.store.vault_access(u.id()).await {
+        Ok(access) => crate::routes::networks::networks_in(&st, &access, &team_vaults).await,
+        Err(_) => Vec::new(),
+    };
     st.store.delete_team(id).await?;
+    crate::routes::networks::down_later(&st, networks);
     for v in &team_vaults {
         st.sessions.close_for_vault(None, *v).await;
         st.pool.invalidate_vault(*v, None).await;

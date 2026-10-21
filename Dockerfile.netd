@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+# termoak-netd image (the "with networks" build): runs next to the server
+# image, sharing a volume for its socket (docker-compose.yml, profile
+# "networks"). A static Go binary in user space: no root, no TUN device, no
+# extra capabilities. Both images run as the system user `termoak` (same
+# uid), so the socket stays 0600.
+FROM golang:1.27-bookworm AS build
+WORKDIR /src
+COPY netd/go.mod netd/go.sum ./
+RUN go mod download
+COPY netd ./
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath \
+      -ldflags "-s -w -X github.com/TermoakSSH/server/netd/internal/netd.Version=${VERSION}" \
+      -o /out/termoak-netd ./cmd/termoak-netd
+
+FROM debian:bookworm-slim
+RUN useradd --system --home /var/lib/termoak --create-home termoak \
+ && mkdir -p /run/termoak-netd \
+ && chown termoak:termoak /run/termoak-netd \
+ && chmod 0750 /run/termoak-netd
+COPY --from=build /out/termoak-netd /usr/local/bin/
+USER termoak
+VOLUME ["/run/termoak-netd"]
+ENV TERMOAK_NETD_SOCKET=/run/termoak-netd/netd.sock \
+    TERMOAK_NETD_IDLE=15m
+ENTRYPOINT ["/usr/local/bin/termoak-netd"]

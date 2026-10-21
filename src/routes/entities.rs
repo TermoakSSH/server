@@ -149,12 +149,56 @@ async fn create<T: Entity>(
     if T::KIND == EntityKind::Network {
         ctx.access.require(vault, VaultRole::Editor)?;
         crate::routes::networks::check_new_networks(&st, vault, 1).await?;
+        b.data = with_public_key(&st, &ctx, None, b.data, &b.secret).await?;
     }
     let rec = st
         .store
         .save_in(&ctx.access, vault, b.data, b.secret, b.sync_mode)
         .await?;
     Ok(Json(rec))
+}
+
+/// A WireGuard network keeps the public key of its private key in
+/// `wireguard.public_key` (the secret being saved, or the stored one).
+async fn with_public_key<T: Entity>(
+    st: &AppState,
+    ctx: &AccessCtx,
+    existing: Option<Id>,
+    data: T,
+    secret: &SecretUpdate<T::Secret>,
+) -> ApiResult<T> {
+    let bad = |e: serde_json::Error| ApiError::internal(e.to_string());
+    let mut net: Network =
+        serde_json::from_value(serde_json::to_value(&data).map_err(bad)?).map_err(bad)?;
+    let mut stored = None;
+    let secret: Option<NetworkSecret> = match secret {
+        SecretUpdate::Set(s) => {
+            Some(serde_json::from_value(serde_json::to_value(s).map_err(bad)?).map_err(bad)?)
+        }
+        SecretUpdate::Clear => None,
+        SecretUpdate::Keep => match existing {
+            Some(id) => {
+                stored = st
+                    .store
+                    .secret_in::<Network>(&ctx.access, id, SecretUse::Server)
+                    .await
+                    .ok();
+                stored.clone()
+            }
+            None => None,
+        },
+    };
+    let changed = crate::routes::networks::fill_public_key(&mut net, secret.as_ref());
+    if let Some(mut s) = stored {
+        s.zeroize();
+    }
+    if let Some(mut s) = secret {
+        s.zeroize();
+    }
+    if !changed {
+        return Ok(data);
+    }
+    serde_json::from_value(serde_json::to_value(&net).map_err(bad)?).map_err(bad)
 }
 
 /// Updates in place (Editor). Another `vault_id` → 409 `use_transfer`.
@@ -180,11 +224,18 @@ async fn update<T: Entity>(
         .with_code("use_transfer"));
     }
     b.data.set_id(id);
-    Ok(Json(
-        st.store
-            .save_in(&ctx.access, vault, b.data, b.secret, b.sync_mode)
-            .await?,
-    ))
+    if T::KIND == EntityKind::Network {
+        b.data = with_public_key(&st, &ctx, Some(id), b.data, &b.secret).await?;
+    }
+    let rec = st
+        .store
+        .save_in(&ctx.access, vault, b.data, b.secret, b.sync_mode)
+        .await?;
+    if T::KIND == EntityKind::Network {
+        // A new key or configuration: the running node stops.
+        crate::routes::networks::reconcile_later(&st, &ctx.access, vec![id]);
+    }
+    Ok(Json(rec))
 }
 
 async fn remove<T: Entity>(
@@ -193,6 +244,9 @@ async fn remove<T: Entity>(
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Value>> {
     st.store.delete_in::<T>(&ctx.access, id).await?;
+    if T::KIND == EntityKind::Network {
+        crate::routes::networks::down_later(&st, vec![id]);
+    }
     Ok(Json(json!({"ok": true})))
 }
 
@@ -393,6 +447,18 @@ pub struct HostTest {
     pub banner: Option<String>,
     pub error: Option<String>,
     pub error_code: Option<String>,
+    /// The private network the server reached the host through (none:
+    /// directly); `latency_ms` is measured through it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<HostTestNetwork>,
+}
+
+/// The network of a host test.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HostTestNetwork {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: String,
 }
 
 /// Tests the connection (from the server). With `?trust=true` it accepts a
@@ -420,8 +486,14 @@ async fn test_host(
             banner: None,
             error: Some(e.message),
             error_code: Some(e.code.into()),
+            network: None,
         }));
     }
+    let network = resolved.first_hop_network().map(|n| HostTestNetwork {
+        id: n.network.id,
+        name: n.network.name.clone(),
+        kind: n.network.kind.as_str().to_string(),
+    });
     let trust = q.get("trust").is_some_and(|v| v == "true" || v == "1");
     let opts = ConnectOptions::new(Arc::new(StoreVerifier::for_host(
         st.store.clone(),
@@ -466,6 +538,7 @@ async fn test_host(
                 banner: info.banner,
                 error: None,
                 error_code: None,
+                network,
             }))
         }
         Err(e) => {
@@ -497,6 +570,7 @@ async fn test_host(
                 banner: None,
                 error: Some(e.to_string()),
                 error_code: Some(code.into()),
+                network,
             }))
         }
     }

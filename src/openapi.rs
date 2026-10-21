@@ -692,9 +692,22 @@ fn endpoints() -> Vec<Ep> {
             Get,
             "/api/v1/networks/{id}/peers",
             "networks",
-            "Devices of a network, to import them as hosts (Editor)",
+            "Devices of a network, to import them as hosts (Editor). WireGuard: its \
+             configured peers (online when their last handshake is under 3 minutes old)",
             None,
             List("NetworkPeer"),
+        ),
+        ep(
+            Post,
+            "/api/v1/networks/{id}/wireguard/key",
+            "networks",
+            "Generate the server's WireGuard private key for a network (Editor): it is stored \
+             as the network's secret and the public key is returned (also in \
+             `wireguard.public_key`) to add as a peer on the other side. A network that \
+             already has a private key needs `replace: true` (409 `key_exists`); not a \
+             WireGuard network: 422 `not_wireguard`. Audited as `network.key_generated`",
+            Ref("GenerateWireguardKey"),
+            Ref("GeneratedWireguardKey"),
         ),
         ep(
             Post,
@@ -1482,6 +1495,9 @@ pub fn document() -> OpenApi {
         .schema_from::<crate::netd::NetworkStatus>()
         .schema_from::<crate::netd::NetworkNode>()
         .schema_from::<crate::netd::NetworkPeer>()
+        .schema_from::<crate::routes::networks::GenerateWireguardKey>()
+        .schema_from::<crate::routes::networks::GeneratedWireguardKey>()
+        .schema_from::<crate::routes::entities::HostTestNetwork>()
         .schema_from::<HostSettings>()
         .schema_from::<ProxySettings>()
         .schema_from::<ProxyKind>()

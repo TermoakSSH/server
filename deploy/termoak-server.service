@@ -1,7 +1,7 @@
 [Unit]
 Description=Termoak server
 Documentation=https://github.com/TermoakSSH/server/blob/main/docs/DEPLOYMENT.md
-After=network-online.target termoak-sessions.service
+After=network-online.target termoak-sessions.service termoak-netd.service
 Wants=network-online.target termoak-sessions.service
 
 [Service]
@@ -27,6 +27,8 @@ LockPersonality=true
 ReadWritePaths=/var/lib/termoak
 # Session holder socket (if installed).
 ReadWritePaths=-/run/termoak-sessions
+# termoak-netd socket (the "with networks" build, if installed).
+ReadWritePaths=-/run/termoak-netd
 
 [Install]
 WantedBy=multi-user.target

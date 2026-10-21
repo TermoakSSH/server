@@ -712,10 +712,25 @@ answering; otherwise hosts with a network fail with `network_unavailable`
 | Method | Route | Description |
 |---|---|---|
 | GET | `/hosts/{id}/relay` | WebSocket relay to the host's first hop through its network (below) |
-| GET | `/networks/{id}/status` | State in netd: `{state: down \| starting \| needs_auth \| up \| error, message, node: {name, addresses, public_key, node_id, auth_url}, revision, since, last_used_at, rx_bytes, tx_bytes}` (any member) |
+| GET | `/networks/{id}/status` | State in netd: `{state: down \| starting \| needs_auth \| up \| error, message, node: {name, addresses, public_key, node_id, auth_url}, revision, since, last_used_at, rx_bytes, tx_bytes, last_handshake_at, streams, dials, dials_failed}` (any member). `last_handshake_at` (ms, WireGuard) is missing until the peer answered: check its endpoint and that it has the server's public key |
 | POST | `/networks/{id}/up` | Brings it up now and returns its state (Editor; audited `network.up`) |
 | POST | `/networks/{id}/down` | Takes it down (Editor; audited `network.down`) |
-| GET | `/networks/{id}/peers` | Devices of the network `[{name, dns_name, addresses, os, online, last_seen}]` to import as hosts (Editor) |
+| GET | `/networks/{id}/peers` | Devices of the network `[{name, dns_name, addresses, os, online, last_seen, public_key, endpoint}]` to import as hosts (Editor). WireGuard: its configured peers, `online` when their last handshake is under 3 minutes old |
+| POST | `/networks/{id}/wireguard/key` | `{replace?}` → `{public_key, network}`: the server generates the network's WireGuard private key (stored as its secret, never shown unless an Editor reveals the secret) and returns the public key to add as a peer on the other side. A network with a private key already needs `replace: true` (`409 key_exists`); other kinds `422 not_wireguard`. Audited `network.key_generated` (Editor) |
+
+- **WireGuard public key:** `wireguard.public_key` is always the public
+  key of the network's private key: the server fills it in when a network
+  is saved (REST or sync v2 push) with a private key, whatever the client
+  sent, and clears it without one. Show it in the network view ("add this
+  key as a peer").
+- **netd follows the vaults:** when a network is deleted (also with its
+  vault, team or account) or its configuration or secret changes, the
+  server tells netd `down`, so an old key or endpoint stops at once (a
+  rename does not: the revision only covers the kind, the configuration
+  without the public key and the secret). The next use brings it up again.
+- **Host test:** `POST /hosts/{id}/test` of a host with a network dials
+  through it and says so in `network: {id, name, kind}`; `latency_ms` is
+  measured through the network ("via Office · 23 ms").
 
 ### Relay
 

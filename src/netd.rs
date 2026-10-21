@@ -84,10 +84,16 @@ impl NetworkSpec {
         }
         .unwrap_or(Value::Null);
         let secret = serde_json::to_value(&n.secret).unwrap_or(Value::Null);
+        // The WireGuard public key is derived from the private key (in the
+        // secret): it does not change the revision.
+        let mut hashed = config.clone();
+        if let Some(obj) = hashed.as_object_mut() {
+            obj.remove("public_key");
+        }
         let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
         ctx.update(net.kind.as_str().as_bytes());
         ctx.update(b"\0");
-        ctx.update(config.to_string().as_bytes());
+        ctx.update(hashed.to_string().as_bytes());
         ctx.update(b"\0");
         ctx.update(secret.to_string().as_bytes());
         let digest = ctx.finish();
@@ -140,6 +146,13 @@ pub struct NetworkNode {
     pub auth_url: Option<String>,
 }
 
+impl NetworkStatus {
+    /// The network runs in netd (any state but `down`).
+    pub fn is_running(&self) -> bool {
+        !self.state.is_empty() && self.state != "down"
+    }
+}
+
 /// State of a network in netd.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct NetworkStatus {
@@ -161,10 +174,23 @@ pub struct NetworkStatus {
     pub since: Option<i64>,
     #[serde(default)]
     pub last_used_at: Option<i64>,
+    /// Bytes of the tunnel (WireGuard: from / to the peers).
     #[serde(default)]
     pub rx_bytes: u64,
     #[serde(default)]
     pub tx_bytes: u64,
+    /// Latest handshake with a peer (ms; WireGuard). None: never (check
+    /// the peer's endpoint and that it has the server's public key).
+    #[serde(default)]
+    pub last_handshake_at: Option<i64>,
+    /// Connections open through the network now.
+    #[serde(default)]
+    pub streams: u64,
+    /// Connections opened / failed since the network came up.
+    #[serde(default)]
+    pub dials: u64,
+    #[serde(default)]
+    pub dials_failed: u64,
 }
 
 /// A device of the network (to import hosts).
@@ -181,6 +207,11 @@ pub struct NetworkPeer {
     pub online: Option<bool>,
     #[serde(default)]
     pub last_seen: Option<i64>,
+    /// WireGuard: the peer's public key and endpoint.
+    #[serde(default)]
+    pub public_key: Option<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 /// A failed netd request.

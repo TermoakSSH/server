@@ -238,7 +238,9 @@ async fn remove(
         );
     }
     let before = snapshot(&st, vault_users(&st, &[id]).await).await;
+    let networks = crate::routes::networks::networks_in(&st, &ctx.access, &[id]).await;
     st.store.delete_vault(id).await?;
+    crate::routes::networks::down_later(&st, networks);
     st.sessions.close_for_vault(None, id).await;
     st.pool.invalidate_vault(id, None).await;
     apply_revocations(&st, before, &[id]).await;
@@ -568,6 +570,18 @@ async fn sync_v2(
         crate::routes::networks::limit_network_pushes(&st, &access, &mut pushed).await?;
     let mut report = st.store.apply_remote_v2(&access, pushed).await?;
     report.rejected.extend(over_limit);
+    // Pushed networks: their WireGuard public key (before the changes are
+    // read, so the client gets it now), and netd in step.
+    let pushed_networks: Vec<Id> = report
+        .applied
+        .iter()
+        .filter(|a| a.kind == EntityKind::Network)
+        .map(|a| a.id)
+        .collect();
+    if !pushed_networks.is_empty() {
+        crate::routes::networks::fix_pushed_keys(&st, &access, &pushed_networks).await;
+        crate::routes::networks::reconcile_later(&st, &access, pushed_networks);
+    }
     let known: HashMap<Id, VaultCursor> = req.vaults.into_iter().map(|c| (c.vault_id, c)).collect();
 
     let mut resync = Vec::new();

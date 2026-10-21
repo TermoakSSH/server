@@ -67,6 +67,13 @@ cargo clippy --all-targets -- -D warnings
 cargo test        # some end-to-end tests use the system sshd (Linux)
 ```
 
+`netd/` is `termoak-netd` (private networks, Go, its own module): the build
+machine needs no Go, it runs in the official image:
+
+```sh
+docker run --rm -v "$PWD/netd:/src" -w /src golang:1.27-bookworm go test ./...
+```
+
 `tests/ffi_*.rs` run the engine of the mobile apps (`termoak-ffi`, from core)
 against this server. To work on core at the same time, see
 ["Using the libraries"](https://github.com/TermoakSSH/core#using-the-libraries) in the core README.
@@ -97,6 +104,7 @@ Details in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#publishing-releases).
 ## Documentation
 
 - [Deployment](docs/DEPLOYMENT.md)
+- [Private networks](docs/NETWORKS.md) (`termoak-netd`, the "with networks" build)
 - [HTTP API](docs/API.md), with the full contract at `/api/openapi.json`
 - [WebSocket protocol](docs/WEBSOCKET-PROTOCOL.md)
 - [Architecture](https://github.com/TermoakSSH/core/blob/main/docs/ARCHITECTURE.md), [AI engine](https://github.com/TermoakSSH/core/blob/main/docs/AI.md),

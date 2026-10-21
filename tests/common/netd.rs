@@ -29,6 +29,11 @@ pub struct Log {
     /// `op` of every request, in order.
     pub ops: Vec<String>,
     pub up: Vec<String>,
+    /// Networks running now (id → revision), like the real netd: brought
+    /// up by `up`, `peers` and `dial`, taken down by `down`.
+    pub running: std::collections::HashMap<String, String>,
+    /// Ids of every `down`, in order.
+    pub downs: Vec<String>,
 }
 
 pub struct FakeNetd {
@@ -40,6 +45,26 @@ pub struct FakeNetd {
 impl FakeNetd {
     pub fn dials(&self) -> Vec<Dial> {
         self.log.lock().dials.clone()
+    }
+
+    pub fn downs(&self) -> Vec<String> {
+        self.log.lock().downs.clone()
+    }
+
+    /// The revision a network runs with (`None`: down).
+    pub fn running(&self, id: &str) -> Option<String> {
+        self.log.lock().running.get(id).cloned()
+    }
+
+    /// Waits until `id` was taken down `n` times in total.
+    pub async fn wait_downs(&self, id: &str, n: usize) {
+        for _ in 0..100 {
+            if self.downs().iter().filter(|d| *d == id).count() >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        panic!("netd never got down #{n} for {id}: {:?}", self.downs());
     }
 }
 
@@ -105,8 +130,13 @@ async fn serve(conn: UnixStream, log: Arc<Mutex<Log>>) -> std::io::Result<()> {
         )
         .await;
     }
+    if matches!(op.as_str(), "up" | "peers" | "dial") {
+        let rev = net["revision"].as_str().unwrap_or("").to_string();
+        log.lock().running.insert(id.clone(), rev);
+    }
+    let running_rev = log.lock().running.get(&id).cloned();
     let status = |state: &str| {
-        json!({"network_id": id, "state": state, "revision": net["revision"],
+        json!({"network_id": id, "state": state, "revision": running_rev,
                "node": {"name": "termoak-test", "addresses": ["100.64.0.1"],
                         "public_key": "ZmFrZQ=="}})
     };
@@ -123,9 +153,16 @@ async fn serve(conn: UnixStream, log: Arc<Mutex<Log>>) -> std::io::Result<()> {
             log.lock().up.push(id.clone());
             answer(&mut reader, json!({"ok": true, "status": status("up")})).await
         }
-        "down" => answer(&mut reader, json!({"ok": true})).await,
+        "down" => {
+            {
+                let mut l = log.lock();
+                l.running.remove(&id);
+                l.downs.push(id.clone());
+            }
+            answer(&mut reader, json!({"ok": true})).await
+        }
         "status" => {
-            let up = log.lock().up.contains(&id);
+            let up = running_rev.is_some();
             answer(
                 &mut reader,
                 json!({"ok": true, "status": status(if up { "up" } else { "down" })}),

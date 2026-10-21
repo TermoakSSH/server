@@ -18,7 +18,13 @@
 # build compiles it into dist/server/ for Linux x86_64 and aarch64, in Docker
 # (scripts/builder.Dockerfile, Ubuntu 22.04) so it runs on Ubuntu 22.04+ and
 # Debian 12+; with DOCKER=0 it is built on this machine (which needs what that
-# Dockerfile installs).
+# Dockerfile installs). Two builds per architecture:
+#   termoak-server-vX.Y.Z-linux-<arch>.tar.gz           without networks
+#   termoak-server-networks-vX.Y.Z-linux-<arch>.tar.gz  with networks: the same
+#     server plus termoak-netd (netd/, Go, static) and its systemd unit
+# termoak-netd is built (and tested) in the official Go image
+# (GO_IMAGE, default golang:1.27-bookworm); NETWORKS=0 skips it, NETD_TESTS=0
+# skips its tests.
 #
 # publish creates the <component>-vX.Y.Z release with the contents of
 # dist/<component>/, using the GitHub API (curl, no `gh`). It is created as a
@@ -69,7 +75,7 @@ manifest_of() { # component
 title_of() { echo Server; }
 
 # Code the server depends on (for `status`).
-paths_of() { echo "src web locales build.rs Cargo.toml Cargo.lock deploy Dockerfile.release"; }
+paths_of() { echo "src web locales build.rs Cargo.toml Cargo.lock deploy Dockerfile.release netd Dockerfile.netd"; }
 
 version_of() { # component
   local file v
@@ -202,6 +208,54 @@ build_in_docker() { # platforms...
     termoak-builder scripts/release-local.sh build "$component" "$@"
 }
 
+# --- termoak-netd (the "with networks" build) --------------------------------
+
+GO_IMAGE="${GO_IMAGE:-golang:1.27-bookworm}"
+
+# Runs go in the official image, as this machine's user, with the module and
+# build caches in target/go.
+go_in_docker() { # env... -- go arguments...
+  local envs=()
+  while [[ $# -gt 0 && "$1" != -- ]]; do envs+=(-e "$1"); shift; done
+  shift
+  command -v docker >/dev/null || die "Docker is missing (termoak-netd is built in $GO_IMAGE)"
+  mkdir -p "$root/target/go"
+  docker run --rm --user "$(id -u):$(id -g)" -v "$root:/src" -w /src/netd \
+    -e HOME=/tmp -e GOPATH=/src/target/go -e GOCACHE=/src/target/go/cache \
+    -e GOFLAGS=-buildvcs=false ${envs[@]+"${envs[@]}"} "$GO_IMAGE" go "$@"
+}
+
+# termoak-netd for linux/<goarch> into target/netd/<goarch>/.
+build_netd() { # goarch
+  say "termoak-netd $version: linux/$1"
+  go_in_docker CGO_ENABLED=0 GOOS=linux "GOARCH=$1" -- build -trimpath \
+    -ldflags "-s -w -X github.com/TermoakSSH/server/netd/internal/netd.Version=$version" \
+    -o "/src/target/netd/$1/termoak-netd" ./cmd/termoak-netd
+}
+
+# termoak-server-networks-vX.Y.Z-linux-<arch>.tar.gz from the plain bundle
+# and termoak-netd.
+package_networks() {
+  if [[ "${NETD_TESTS:-1}" != 0 ]]; then
+    say "termoak-netd tests"
+    go_in_docker CGO_ENABLED=0 -- test -count=1 ./...
+  fi
+  local pair arch goarch plain d work
+  for pair in x86_64:amd64 aarch64:arm64; do
+    arch="${pair%%:*}" goarch="${pair##*:}"
+    plain="$dist/termoak-$component-v$version-linux-$arch.tar.gz"
+    [[ -f "$plain" ]] || continue
+    build_netd "$goarch"
+    d="termoak-$component-networks-v$version-linux-$arch"
+    work="$(mktemp -d)"
+    mkdir "$work/$d"
+    tar xzf "$plain" -C "$work/$d" --strip-components=1
+    cp "$root/target/netd/$goarch/termoak-netd" deploy/termoak-netd.service docs/NETWORKS.md "$work/$d/"
+    tar czf "$dist/$d.tar.gz" -C "$work" "$d"
+    rm -rf "$work"
+  done
+}
+
 cmd_build() { # server [platforms...]
   select_component "${1:-}" build
   shift
@@ -223,6 +277,9 @@ cmd_build() { # server [platforms...]
   fi
   if [[ ${#in_docker[@]} -gt 0 ]]; then build_in_docker "${in_docker[@]}"; fi
   for p in ${native[@]+"${native[@]}"}; do "build_$p"; done
+
+  # The "with networks" build, outside the Rust builder image.
+  if [[ -z "${TERMOAK_BUILDER:-}" && "${NETWORKS:-1}" != 0 ]]; then package_networks; fi
 
   if [[ -z "${TERMOAK_BUILDER:-}" ]]; then
     say "Done: $tag in dist/$component/"

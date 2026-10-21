@@ -56,21 +56,67 @@ does not mark who typed in recordings: the server logs it when it
 connects; and sessions to hosts in private networks stay in the server
 process until the holder knows networks).
 
-### Private networks (optional)
+### Private networks (optional: the "with networks" build)
 
-To reach hosts inside WireGuard, Tailscale/Headscale or ZeroTier networks,
-run `termoak-netd` (a separate service, see [NETWORKS.md](NETWORKS.md)) and
-point the server (and the holder, which reads the same file) to its socket:
+The server comes in two builds: without networks (`termoak-server` alone)
+and with networks: the same server plus `termoak-netd`, a small static Go
+program that joins the users' WireGuard networks (Tailscale/Headscale and
+ZeroTier later) **fully in user space**: no TUN device, no root, no routes,
+no capabilities, so it also runs in unprivileged containers. Design,
+protocol and security model: [NETWORKS.md](NETWORKS.md).
+
+`scripts/release-local.sh build server` makes both bundles,
+`termoak-server-vX.Y.Z-linux-<arch>.tar.gz` and
+`termoak-server-networks-vX.Y.Z-linux-<arch>.tar.gz` (the second also has
+`termoak-netd`, `termoak-netd.service` and `NETWORKS.md`). To add networks
+to a server:
+
+```sh
+sudo install -m 755 termoak-netd /usr/local/bin/
+sudo install -m 644 termoak-netd.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now termoak-netd
+```
+
+and point the server (and the holder, which reads the same file) to its
+socket, then restart both:
 
 ```toml
 [networks]
 netd_socket = "/run/termoak-netd/netd.sock"
 ```
 
-Without it the feature is off (`/info` → `features.networks: false`) and
-hosts with a network answer `network_unavailable`: the server never
-connects to them directly. Plans limit the networks per user with
-`max_networks` (10 by default).
+(or `TERMOAK_NETD_SOCKET`). `GET /api/v1/info` then shows
+`features.networks: true`. Without it the feature is off and hosts with a
+network answer `network_unavailable`: the server never connects to them
+directly. Plans limit the networks per user with `max_networks` (10 by
+default).
+
+- **Socket permissions.** netd runs as the same user as the server
+  (`termoak` in the units) and creates its socket with mode `0600`: only
+  that user (and root) can connect, and every connection's peer is checked
+  with `SO_PEERCRED`. To run it as another user, give it the server's group
+  (`--socket-group termoak`: mode `0660`, members of that group allowed) or
+  list the server's user (`--allow-uids termoak`). The units have
+  `ReadWritePaths=-/run/termoak-netd` for the socket.
+- **Settings** (flags or environment): `--idle` / `TERMOAK_NETD_IDLE`
+  (networks without connections for this long go down; default `15m`, `0`
+  never), `--max-networks` (64 up at once; when full, the least recently
+  used one without connections makes room, else `limit`), `--max-streams`
+  (256 open connections per network), `--max-dial-timeout` (2 min),
+  `--log-format text|json`, `--log-level`.
+- **Memory:** an idle process is a few MB and each network up adds a few
+  more (its WireGuard device and TCP/IP stack); the unit caps it with
+  `MemoryMax=512M`.
+- **Check it:** `termoak-netd request --socket /run/termoak-netd/netd.sock
+  '{"v":1,"op":"list"}'` prints the networks it runs (state, handshake,
+  bytes, open connections); `journalctl -u termoak-netd` has a line per
+  network up/down and per connection (host, port, bytes, duration), never
+  keys.
+- **Firewall:** netd only needs outgoing UDP to the peers' endpoints (the
+  WireGuard transport); nothing listens on the network.
+- **Docker:** `Dockerfile.netd` builds a netd image; `docker compose
+  --profile networks up -d` runs it next to the server with a shared volume
+  for the socket (see the comments in `docker-compose.yml`).
 
 The first user to sign up becomes an administrator. You can also create it
 from the console:

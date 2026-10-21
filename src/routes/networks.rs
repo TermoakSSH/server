@@ -25,7 +25,9 @@ use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use termoak_core::Id;
-use termoak_core::model::{EntityKind, Host, Network, SyncRecord, VaultRole};
+use termoak_core::model::{
+    EntityKind, Host, Network, NetworkKind, NetworkSecret, SecretUpdate, SyncRecord, VaultRole,
+};
 use termoak_core::resolve::ResolvedNetwork;
 use termoak_core::store::{SecretUse, SyncRejection, VaultAccess};
 use termoak_core::time::now_ms;
@@ -44,6 +46,270 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/networks/{id}/up", post(up))
         .route("/api/v1/networks/{id}/down", post(down))
         .route("/api/v1/networks/{id}/peers", get(peers))
+        .route("/api/v1/networks/{id}/wireguard/key", post(generate_key))
+}
+
+// --- WireGuard keys ------------------------------------------------------------
+
+/// The WireGuard public key of a base64 private key (`None` if it is not
+/// a 32-byte key).
+pub fn wireguard_public_key(private_key: &str) -> Option<String> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let raw = b64.decode(private_key.trim()).ok()?;
+    let bytes: [u8; 32] = raw.as_slice().try_into().ok()?;
+    let public = curve25519_dalek::MontgomeryPoint::mul_base_clamped(bytes);
+    Some(b64.encode(public.to_bytes()))
+}
+
+/// A new WireGuard private key (base64).
+fn new_wireguard_key() -> ApiResult<String> {
+    use base64::Engine as _;
+    use ring::rand::SecureRandom;
+    let mut k = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut k)
+        .map_err(|_| ApiError::internal("no randomness"))?;
+    k[0] &= 248;
+    k[31] = (k[31] & 127) | 64;
+    Ok(base64::engine::general_purpose::STANDARD.encode(k))
+}
+
+/// Keeps `wireguard.public_key` of a WireGuard network equal to the public
+/// key of its private key (what the other side adds as a peer). Without a
+/// private key there is no public key; an unreadable one leaves it as is.
+/// Returns whether it changed.
+pub fn fill_public_key(net: &mut Network, secret: Option<&NetworkSecret>) -> bool {
+    if net.kind != NetworkKind::Wireguard {
+        return false;
+    }
+    let private = secret.and_then(|s| s.private_key.as_deref());
+    let derived = match private {
+        Some(k) => match wireguard_public_key(k) {
+            Some(p) => Some(p),
+            None => return false,
+        },
+        None => None,
+    };
+    let current = net.wireguard.as_ref().and_then(|w| w.public_key.clone());
+    if current == derived {
+        return false;
+    }
+    net.wireguard
+        .get_or_insert_with(Default::default)
+        .public_key = derived;
+    true
+}
+
+/// `POST /networks/{id}/wireguard/key` body.
+#[derive(Debug, Default, serde::Deserialize, utoipa::ToSchema)]
+pub struct GenerateWireguardKey {
+    /// Replace the private key the network already has (the other side
+    /// must then be given the new public key).
+    #[serde(default)]
+    pub replace: bool,
+}
+
+/// Answer of `POST /networks/{id}/wireguard/key`.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct GeneratedWireguardKey {
+    /// Add it as a peer on the other side of the tunnel.
+    pub public_key: String,
+    #[schema(value_type = Object)]
+    pub network: termoak_core::model::Record<Network>,
+}
+
+/// Generates the server's WireGuard private key for a network (Editor):
+/// stored as the network's secret (it never leaves the server), the public
+/// key is returned and kept in `wireguard.public_key`. A network that
+/// already has a private key needs `replace: true` (409 `key_exists`).
+async fn generate_key(
+    State(st): State<AppState>,
+    ctx: AccessCtx,
+    Path(id): Path<Id>,
+    body: Option<Json<GenerateWireguardKey>>,
+) -> ApiResult<Json<GeneratedWireguardKey>> {
+    let replace = body.map(|b| b.0.replace).unwrap_or(false);
+    let rec = st.store.get_in::<Network>(&ctx.access, id).await?;
+    let vault = rec.meta.vault_id.unwrap_or(ctx.personal());
+    ctx.access.require(vault, VaultRole::Editor)?;
+    if rec.data.kind != NetworkKind::Wireguard {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "not_wireguard",
+            "only WireGuard networks have a key pair",
+        ));
+    }
+    let mut secret = st
+        .store
+        .secret_in::<Network>(&ctx.access, id, SecretUse::Server)
+        .await?;
+    if secret
+        .private_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty())
+        && !replace
+    {
+        secret.zeroize();
+        return Err(ApiError::conflict(
+            "the network already has a private key: generate a new one with replace = true",
+        )
+        .with_code("key_exists"));
+    }
+    secret.private_key = Some(new_wireguard_key()?);
+    let mut net = rec.data;
+    fill_public_key(&mut net, Some(&secret));
+    let public_key = net
+        .wireguard
+        .as_ref()
+        .and_then(|w| w.public_key.clone())
+        .ok_or_else(|| ApiError::internal("no public key"))?;
+    let saved = st
+        .store
+        .save_in(&ctx.access, vault, net, SecretUpdate::Set(secret), None)
+        .await?;
+    st.store
+        .audit_vault(
+            ctx.id(),
+            &ctx.actor(),
+            "network.key_generated",
+            Some(format!("network:{id}")),
+            json!({"name": saved.data.name, "public_key": public_key, "replaced": replace}),
+            vault,
+        )
+        .await?;
+    reconcile_later(&st, &ctx.access, vec![id]);
+    Ok(Json(GeneratedWireguardKey {
+        public_key,
+        network: saved,
+    }))
+}
+
+// --- Keeping netd in step with the vaults ------------------------------------
+
+/// After networks changed (saved, pushed, deleted): fixes the WireGuard
+/// public key of pushed ones (apps send the private key only) and tells
+/// netd `down` for the networks that no longer exist or whose revision
+/// differs from the running one (so an old key or config stops at once).
+/// Runs in the background; errors are logged.
+pub fn reconcile_later(st: &AppState, access: &Arc<VaultAccess>, ids: Vec<Id>) {
+    if ids.is_empty() || st.netd.is_none() {
+        return;
+    }
+    let (st, access) = (st.clone(), access.clone());
+    tokio::spawn(async move {
+        reconcile(&st, &access, &ids).await;
+    });
+}
+
+/// See [`reconcile_later`].
+pub async fn reconcile(st: &AppState, access: &VaultAccess, ids: &[Id]) {
+    let Some(netd) = st.netd.clone() else { return };
+    for id in ids {
+        let expected = match st.store.get_in::<Network>(access, *id).await {
+            Ok(rec) => {
+                let vault = rec.meta.vault_id;
+                match st
+                    .store
+                    .secret_in::<Network>(access, *id, SecretUse::Server)
+                    .await
+                {
+                    Ok(secret) => {
+                        let mut net = ResolvedNetwork {
+                            network: rec.data,
+                            secret,
+                        };
+                        let rev = NetworkSpec::new(&net, vault).revision;
+                        net.secret.zeroize();
+                        Some(rev)
+                    }
+                    Err(_) => continue,
+                }
+            }
+            Err(termoak_core::CoreError::NotFound(_)) => None,
+            Err(_) => continue,
+        };
+        let status = match netd.status(*id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(network = %id, error = %e, "netd status failed");
+                continue;
+            }
+        };
+        if !status.is_running() {
+            continue;
+        }
+        if expected.is_some() && status.revision == expected {
+            continue;
+        }
+        let why = if expected.is_none() {
+            "deleted"
+        } else {
+            "changed"
+        };
+        match netd.down(*id).await {
+            Ok(()) => tracing::info!(network = %id, why, "network taken down in termoak-netd"),
+            Err(e) => tracing::warn!(network = %id, error = %e, "could not take a network down"),
+        }
+    }
+}
+
+/// Fixes `wireguard.public_key` of networks pushed by a sync (their
+/// private key may have changed), saving those that differ.
+pub async fn fix_pushed_keys(st: &AppState, access: &VaultAccess, ids: &[Id]) {
+    for id in ids {
+        let Ok(rec) = st.store.get_in::<Network>(access, *id).await else {
+            continue;
+        };
+        let Ok(mut secret) = st
+            .store
+            .secret_in::<Network>(access, *id, SecretUse::Server)
+            .await
+        else {
+            continue;
+        };
+        let vault = rec.meta.vault_id.unwrap_or(access.personal());
+        let mut net = rec.data;
+        if fill_public_key(&mut net, Some(&secret))
+            && let Err(e) = st
+                .store
+                .save_in(access, vault, net, SecretUpdate::Keep, None)
+                .await
+        {
+            tracing::warn!(network = %id, error = %e, "could not save the network's public key");
+        }
+        secret.zeroize();
+    }
+}
+
+/// The networks of some vaults (before deleting them: netd is told `down`
+/// afterwards with [`down_later`]).
+pub async fn networks_in(st: &AppState, access: &VaultAccess, vaults: &[Id]) -> Vec<Id> {
+    if st.netd.is_none() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for v in vaults {
+        if let Ok(list) = st.store.list_in::<Network>(access, Some(*v)).await {
+            out.extend(list.into_iter().map(|r| r.data.id));
+        }
+    }
+    out
+}
+
+/// Tells netd `down` for these networks (in the background).
+pub fn down_later(st: &AppState, ids: Vec<Id>) {
+    let Some(netd) = st.netd.clone() else { return };
+    if ids.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for id in ids {
+            if let Err(e) = netd.down(id).await {
+                tracing::warn!(network = %id, error = %e, "could not take a network down");
+            }
+        }
+    });
 }
 
 // --- Plan limit ----------------------------------------------------------------

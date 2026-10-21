@@ -33,6 +33,17 @@ max_per_user = 50
 # sessions live in the server and are closed when it restarts.
 # holder_socket = "/run/termoak-sessions/sessions.sock"
 
+# Private networks (WireGuard; Tailscale/Headscale and ZeroTier later): the
+# server joins them through termoak-netd, a separate service of the "with
+# networks" build (see docs/NETWORKS.md and docs/DEPLOYMENT.md). Without
+# netd_socket (or TERMOAK_NETD_SOCKET) the feature is off (GET /api/v1/info:
+# features.networks = false).
+[networks]
+# netd_socket = "/run/termoak-netd/netd.sock"
+max_relays_per_user = 16
+relay_idle_minutes = 30
+dial_timeout_secs = 20
+
 [ai]
 # Default provider and fallbacks (provider::model format).
 default = "codex"

@@ -497,6 +497,9 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("TERMOAK_EMAIL_FROM") {
             cfg.email.from = v;
         }
+        if let Ok(v) = std::env::var("TERMOAK_NETD_SOCKET") {
+            cfg.networks.netd_socket = Some(PathBuf::from(v)).filter(|p| !p.as_os_str().is_empty());
+        }
         if let Ok(v) = std::env::var("AI_PROVIDER") {
             cfg.ai.default = v;
         }
@@ -577,9 +580,11 @@ max_per_user = 50
 # sessions live in the server and are closed when it restarts.
 # holder_socket = "/run/termoak-sessions/sessions.sock"
 
-# Private networks (WireGuard, Tailscale/Headscale, ZeroTier): the server joins
-# them through termoak-netd, a separate service (see docs/NETWORKS.md). Without
-# netd_socket the feature is off (GET /api/v1/info: features.networks = false).
+# Private networks (WireGuard; Tailscale/Headscale and ZeroTier later): the
+# server joins them through termoak-netd, a separate service of the "with
+# networks" build (see docs/NETWORKS.md and docs/DEPLOYMENT.md). Without
+# netd_socket (or TERMOAK_NETD_SOCKET) the feature is off (GET /api/v1/info:
+# features.networks = false).
 [networks]
 # netd_socket = "/run/termoak-netd/netd.sock"
 max_relays_per_user = 16

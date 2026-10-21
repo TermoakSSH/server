@@ -1,7 +1,9 @@
 # Private networks (Termoak 0.7)
 
-Status: **phase 0 done** (core + server groundwork, 2026-10-21). Phase 1
-builds `termoak-netd` (Go) and the UI in the apps and the web.
+Status: **phase 0 done** (core + server groundwork, 2026-10-21); **phase 1a
+done** (2026-10-21): `termoak-netd` with WireGuard (`server/netd/`, Go), the
+server's WireGuard keys, netd following the vaults, QA. Next: the UI in the
+apps and the web (phase 1b), then Tailscale/Headscale (phase 2).
 
 This document is the design, the **server ↔ `termoak-netd` protocol**, the
 security model and the compatibility notes. Plan: `PLAN-0.7.md` §1. A copy
@@ -95,7 +97,14 @@ lives in the server repository (`docs/NETWORKS.md`); keep both equal.
   network the proxy is ignored.
 - Transfers: `settings.network_id` is a dependency like the key or the
   startup snippet (moved/copied with the host; `dependencies: none`
-  detaches it).
+  detaches it). This device cannot hold networks (core 0.7.0-next.2): a
+  host or group moved or copied there loses `network_id` (reported in
+  `detached`), the network stays in the account, and moving a network
+  there is refused.
+- **WireGuard public key:** `wireguard.public_key` is derived from the
+  private key (the secret). The server fills it in whenever a network is
+  saved (REST, sync v2 push, `POST /networks/{id}/wireguard/key`), so every
+  client shows the key to add as a peer on the other side.
 
 ## 4. Sync and compatibility
 
@@ -153,7 +162,19 @@ dial_timeout_secs = 20
   `usage.networks`.
 - Routes: CRUD `/networks` (+ `/secret`), `GET /networks/{id}/status`,
   `POST /networks/{id}/up|down`, `GET /networks/{id}/peers`,
-  `GET /hosts/{id}/relay` (OpenAPI tag `networks`; `docs/API.md`).
+  `POST /networks/{id}/wireguard/key` (the server generates the private
+  key, stores it as the secret and returns the public key; `replace: true`
+  if it has one), `GET /hosts/{id}/relay` (OpenAPI tag `networks`;
+  `docs/API.md`). `TERMOAK_NETD_SOCKET` also sets `netd_socket`.
+- **netd follows the vaults:** after a network is updated (REST or sync
+  push) the server compares the revision netd runs (`status`) with the
+  stored one and sends `down` when they differ; deleting a network, its
+  vault, its team or the account sends `down` too. A rename keeps the node
+  (the revision covers the kind, the configuration without `public_key`,
+  and the secret). Whatever is missed goes down when idle.
+- **Host test** (`POST /hosts/{id}/test`) dials through the network and
+  answers `network: {id, name, kind}` with `latency_ms` measured through
+  it (the "via Office · 23 ms" of the apps).
 - Errors: `network_unavailable` 503, `network_not_found` 404,
   `network_dial_failed` 502 (`netd_code`), `not_in_network` 422,
   `relay_limit` 429.
@@ -186,9 +207,12 @@ Simple to implement in Go with `net.Listen("unix", …)`, `bufio.Reader` and
 ### Transport
 
 - Unix stream socket, path from `[networks] netd_socket`. netd creates it
-  with mode `0660` (owner netd, group `termoak`) or `0600` if both run as
-  the same user; it should check the peer uid (`SO_PEERCRED`) like the
-  session holder.
+  with mode `0600` (it runs as the same user as the server, the default) or
+  `0660` with `--socket-group <group>`, and checks every connection's peer
+  with `SO_PEERCRED`: netd's own user, root, the users of `--allow-uids`
+  and, with a socket group, processes in that group (primary or
+  supplementary). Others are closed without an answer. A live socket is
+  never replaced (a second netd refuses to start); a stale one is.
 - **One connection per request.** The server writes **one JSON object on
   one line** (`\n`-terminated, UTF-8), netd answers **one JSON line**.
   Then the connection is closed — except after a successful `dial`, when
@@ -245,7 +269,9 @@ database (it may cache running nodes by id):
 ← {"ok": true, "v": 1, "version": "0.1.0", "kinds": ["wireguard", "tailscale", "zerotier"]}
 ```
 
-`kinds`: what this build can join. Used as the health check (every 30 s).
+`kinds`: what this build can join (`["wireguard"]` since phase 1a;
+Tailscale and ZeroTier answer `unsupported_kind` until their backends are
+built in). Used as the health check (every 30 s).
 
 ### 6.2 `up` / `down` / `status`
 
@@ -270,11 +296,23 @@ Status = {
            "node_id": "…",              // ZeroTier / Tailscale
            "auth_url": "https://…"},    // when needs_auth
   "revision": "…", "since": 1760000000000, "last_used_at": 1760000000000,
-  "rx_bytes": 0, "tx_bytes": 0
+  "rx_bytes": 0, "tx_bytes": 0,         // the tunnel's bytes
+  "last_handshake_at": 1760000000000,   // WireGuard; absent: never
+  "streams": 0,                         // connections open now
+  "dials": 0, "dials_failed": 0         // since it came up
 }
 ```
 
 `up` may answer before the node is fully up (`starting`, `needs_auth`).
+A start that failed (bad key, unresolvable endpoint…) is `error` with the
+reason in `message`; the next `up`/`dial` retries it.
+
+```json
+→ {"v": 1, "op": "list"}
+← {"ok": true, "networks": [Status, …]}   // every network netd runs
+```
+
+`list` is for operators and metrics (`termoak-netd request '{"v":1,"op":"list"}'`).
 
 ### 6.3 `peers`
 
@@ -286,7 +324,9 @@ Status = {
 ```
 
 Brings the network up if needed. WireGuard answers its configured peers
-(no discovery). For "import hosts".
+(no discovery): `name` = endpoint (or the start of the key), `addresses` =
+allowed IPs, `public_key`, `endpoint`, and `online`/`last_seen` from the
+last handshake (online under 3 minutes). For "import hosts".
 
 ### 6.4 `dial`
 
@@ -299,6 +339,8 @@ Brings the network up if needed. WireGuard answers its configured peers
 - netd brings the network up if needed (waiting up to `timeout_ms` for
   `up`), resolves `host` **inside the network** (MagicDNS / the WireGuard
   `dns`), and opens TCP to `host:port` through its user-space stack.
+  `timeout_ms` is capped by `--max-dial-timeout` (default 20 s when
+  missing).
 - After the `ok` line, netd copies bytes both ways until either side
   closes (half-close: shutdown the write side when the other side's read
   ends). Closing the Unix connection closes the TCP connection.
@@ -316,6 +358,67 @@ Brings the network up if needed. WireGuard answers its configured peers
 - No root, no TUN devices, no routes (works in the unprivileged LXC).
 - Idle shutdown (phase 1): stop nodes unused for N minutes; limits on
   networks and streams; per-network metrics and logs (without secrets).
+
+### 6.5 `termoak-netd` (phase 1a)
+
+Go module in the server repository, `server/netd/` (a static binary,
+`CGO_ENABLED=0`; built in the official Go image, so the build machine needs
+no Go):
+
+```
+netd/
+  cmd/termoak-netd/     main: flags/env, socket, signals; `request` (send one line) and `version`
+  cmd/termoak-wgpeer/   test tool, never shipped: a WireGuard peer in user space (QA)
+  internal/proto/       the protocol types and codes (Spec never prints its secret)
+  internal/netd/        Manager (nodes, limits, idle reaper), Server (socket, SO_PEERCRED,
+                        one request per connection, the byte pipe), Backend/Node interfaces
+  internal/wg/          WireGuard: wireguard-go + gVisor netstack, one device and stack per network
+  internal/wgtest/      a WireGuard "site" for tests (echo, forward, DNS in its netstack)
+```
+
+- **WireGuard** (`internal/wg`): `device.NewDevice(netstack.CreateNetTUN(…),
+  conn.NewDefaultBind())`. The node's addresses are `wireguard.addresses`
+  (`10.9.0.2/32` or a bare IP), MTU `mtu` (default 1420), the peers'
+  `public_key`, `endpoint` (a name is resolved with the host's resolver
+  when the network starts: the endpoint is outside the network),
+  `allowed_ips`, `persistent_keepalive`; the secret's `private_key` and
+  `preshared_key` (applied to every peer). The host's kernel only carries
+  the encrypted UDP; dials go through the network's own netstack. Two
+  networks may use the same addresses: they never see each other.
+- **Names.** An IP is used as is. A name is resolved with the network's
+  `dns` servers through the tunnel when it has them (entries of `dns` that
+  are not IPs are search domains, like wg-quick: `nas` → `nas.lan`);
+  otherwise with the system resolver (`/etc/hosts`, the host's DNS), for
+  public names that point to private addresses. Either way only addresses
+  inside some peer's `allowed_ips` are dialed; anything else fails at once
+  with `dial_failed` ("outside the network") instead of waiting for a
+  timeout. A dial with no handshake ends in `timeout` with a hint (check
+  the endpoint and that the peer has the server's public key).
+- **Lifecycle.** A network starts on the first `up`/`peers`/`dial` (`up`
+  waits up to 10 s, then answers `starting`), restarts when its revision
+  changes, and stops on `down`, when idle (`--idle`, default 15 min
+  without open connections; checked every quarter of it, at most 30 s), or
+  when room is needed. `down` and restarts close its open connections.
+- **Limits.** `--max-networks` (64): when full, the least recently used
+  network without connections makes room, otherwise `limit`.
+  `--max-streams` (256 per network) → `limit`. `--max-dial-timeout` (2
+  min). Request line: 1 MiB, 30 s to send it.
+- **Pipe.** After `ok`, bytes are copied both ways with half-close. If the
+  host closes first, the client gets EOF and 30 s to finish sending; an
+  error on either side closes both.
+- **Logs and metrics** (`log/slog`, text or JSON on stderr): network up
+  (addresses, peers, its public key), down (reason: requested, idle,
+  replaced, shutdown; dials), each connection closed (host, port,
+  bytes up/down, duration), dial failures (code); per-network counters in
+  `status`/`list`. Keys and secrets are never logged (`Spec` has a
+  `LogValue` without them; wireguard-go only logs peers' short public keys).
+- **Kinds.** Backends register by kind (`netd.Register`). WireGuard is
+  always built in; Tailscale (`tsnet`, phase 2) and ZeroTier (libzt, phase
+  6) will be files behind build tags (`//go:build tailscale`) that register
+  theirs. Without them those kinds answer `unsupported_kind` (→ the
+  server's `network_unavailable`) and `hello` does not list them.
+- **Shutdown** (SIGTERM/SIGINT): stops accepting, takes every network
+  down, removes the socket.
 
 ## 7. Security model
 
@@ -406,20 +509,53 @@ Nothing is required to compile, except:
   (bytes, audit, authorization: another user, Use-only Strict, no network,
   dial failure, per-user limit), server session, `/test`, `/exec` and an
   app (the FFI engine) over the relay against a real sshd;
+  `wireguard_keys_and_netd_follow_the_vaults` (key generation, public keys
+  of pasted and pushed keys, `down` on change/delete/vault deletion, not on
+  rename, the host test's network);
   `tests/holder.rs::the_holder_dials_network_hosts_through_netd`.
+- netd (Go, `go test ./...`, also with `-race`): two netstack peers talking
+  in process: dial through the tunnel (4 MiB echoed, handshake and
+  counters), outside the allowed IPs, refused port, DNS inside the network
+  with search domains, invalid configurations (never echoing the key),
+  RFC 7748 keys; the manager (revisions, failed starts, limits, LRU
+  eviction, idle reaping) with a fake backend; the protocol over a real
+  socket (every op, malformed requests, `unsupported_kind`, socket mode and
+  peer access); two networks with the same addresses reaching their own
+  site, half-close, `down` closing connections, a silent peer timing out.
+- Core: `transfer::tests::without_networks_keeps_networks_and_detaches_hosts`
+  and the FFI test moving a host to This device.
+- QA (`qa`, `./run.sh networks`): a real netd and `termoak-wgpeer` (a
+  WireGuard peer in user space whose port 22 forwards to the sshd
+  container; no TUN needed): generated key, `up`, host test, a server
+  session, SFTP of 50 MB with OpenSSH over the relay (checksums, audit
+  bytes), never dialing directly, isolation between two users (and two
+  networks with the same addresses), idle shutdown and coming back,
+  netd stopped → `network_unavailable` and `features.networks` false.
 
-## 10. Phase 1 (next)
+## 10. Phase 1
 
-1. `termoak-netd` in Go (wireguard-go + netstack, tsnet, libzt behind a
-   build tag), systemd unit, socket permissions, idle shutdown, limits,
-   metrics; QA with a WireGuard peer and Headscale in Docker.
-2. Server: tell netd `down` when a network is deleted or changes vault;
-   "generate WireGuard key" (server creates the key, shows the public key);
-   network status/latency in host status; import hosts from `peers`;
-   relay/session metrics per network.
-3. Apps and web: Account → Networks (add, test, state, node), the "Network"
-   picker in host and group editors, "via <network> · 23 ms" in the
-   terminal bar, import hosts; hide everything without `features.networks`.
-4. Transfers to This device should detach `network_id` (a network cannot
-   live there); today the planner copies it as a dependency.
-5. Desktop: adopt core 0.7 (see §8).
+Done in phase 1a (2026-10-21):
+
+1. `termoak-netd` in Go with WireGuard (wireguard-go + netstack), the
+   systemd unit (`deploy/termoak-netd.service`), socket permissions, idle
+   shutdown, limits, per-network logs and counters; the "with networks"
+   bundle (`release-local.sh build server`) and `Dockerfile.netd`; QA with
+   a WireGuard peer in user space.
+2. Server: `down` when a network is deleted (also its vault, team or
+   account) or its revision changes; "generate WireGuard key"; the public
+   key in network views; the host test's network and latency.
+3. Core 0.7.0-next.2: transfers to This device detach `network_id`.
+
+Left for phase 1b (UI) and later:
+
+1. Apps and web: Account → Networks (add with a pasted `.conf` or a
+   generated key, the server's public key to copy, test with `up` and the
+   handshake, state), the "Network" picker in host and group editors, "via
+   <network> · 23 ms" in the terminal bar (host test), import hosts from
+   `peers`; hide everything without `features.networks`.
+2. Desktop: adopt core 0.7 (see §8).
+3. Relay/session metrics per network in the server (netd has them per
+   network already).
+4. Phase 2: Tailscale/Headscale (`tsnet` backend behind a build tag,
+   `needs_auth` with the login URL, state directory per network, MagicDNS,
+   `peers` for import), Headscale in Docker for QA.

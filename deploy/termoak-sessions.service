@@ -1,7 +1,7 @@
 [Unit]
 Description=Termoak session holder
 Documentation=https://github.com/TermoakSSH/server/blob/main/docs/DEPLOYMENT.md
-After=network-online.target
+After=network-online.target termoak-netd.service
 Wants=network-online.target
 
 # Keeps the SSH connections of server sessions open: restarting
@@ -30,6 +30,8 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 ReadWritePaths=/var/lib/termoak
+# termoak-netd socket (the "with networks" build, if installed).
+ReadWritePaths=-/run/termoak-netd
 
 [Install]
 WantedBy=multi-user.target
