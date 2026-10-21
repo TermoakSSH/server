@@ -210,3 +210,104 @@ async fn sessions_survive_a_server_restart() {
     stop.cancel();
     holder.await.unwrap().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_holder_dials_network_hosts_through_netd() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let Some(sshd) = start_sshd() else {
+        eprintln!("sshd not available: test skipped");
+        return;
+    };
+    // The holder's netd and the server's (the server only checks it is
+    // there): the session's dial must reach the holder's.
+    let fake = common::netd::start().await;
+    let servers = common::netd::start().await;
+    let data = tempfile::tempdir().unwrap();
+    let socket = data.path().join("holder").join("sessions.sock");
+    let stop = tokio_util::sync::CancellationToken::new();
+    let holder = tokio::spawn({
+        let socket = socket.clone();
+        let stop = stop.clone();
+        let dialer = termoak_server::netd::Netd::new(fake.socket.clone()).dialer();
+        async move { termoak_server::holder::daemon::run_with(&socket, stop, Some(dialer)).await }
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut config = ServerConfig::default();
+    config.server.data_dir = data.path().join("data");
+    config.sessions.host_key_policy = termoak_ssh::HostKeyPolicy::AcceptNew;
+    config.sessions.holder_socket = Some(socket.clone());
+    config.networks.netd_socket = Some(servers.socket.clone());
+    let http = reqwest::Client::new();
+    let (base, _server) = start_server(&config).await;
+    let reg: Value = http
+        .post(format!("{base}/api/v1/auth/register"))
+        .json(&json!({"email": "ana@termoak.test", "name": "Ana", "password": "secure-password", "device_name": "Laptop", "platform": "desktop-linux"}))
+        .send().await.unwrap().json().await.unwrap();
+    let token = reg["tokens"]["access_token"].as_str().unwrap().to_string();
+    let post = |path: &str, body: Value| {
+        call(
+            &http,
+            reqwest::Method::POST,
+            format!("{base}{path}"),
+            &token,
+            Some(body),
+        )
+    };
+    let (_, key) = post(
+        "/api/v1/keys/import",
+        json!({"label": "k", "private_key": sshd.private_key}),
+    )
+    .await;
+    let (_, net) = post(
+        "/api/v1/networks",
+        json!({"name": "office", "kind": "tailscale", "secret": {"auth_key": "tskey-x"}}),
+    )
+    .await;
+    let (_, host) = post(
+        "/api/v1/hosts",
+        json!({"label": "local", "address": "127.0.0.1",
+               "settings": {"port": sshd.port, "username": sshd.user, "key_id": key["id"],
+                            "network_id": net["id"]}}),
+    )
+    .await;
+    // The holder announced it knows networks: the session lives there.
+    for _ in 0..100 {
+        let (s, _) = post("/api/v1/sessions", json!({"host_id": "x"})).await;
+        if s != 503 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (s, session) = post(
+        "/api/v1/sessions",
+        json!({"host_id": host["id"], "cols": 100, "rows": 30}),
+    )
+    .await;
+    assert!(s < 300, "{s} {session}");
+    let sid = session["id"].as_str().unwrap().to_string();
+    let mut ws = ws_connect(&base, &format!("/api/v1/sessions/{sid}/ws"), Some(&token)).await;
+    ws_wait_json(&mut ws, "hello").await;
+    ws.send(WsMsg::Binary(b"echo held-$((4*4))\n".to_vec().into()))
+        .await
+        .unwrap();
+    ws_wait_output(&mut ws, "held-16").await;
+    let dial = fake
+        .dials()
+        .last()
+        .cloned()
+        .expect("the holder dialed through netd");
+    assert_eq!(dial.port, sshd.port);
+    assert_eq!(dial.kind, "tailscale");
+    assert_eq!(dial.secret["auth_key"], "tskey-x");
+    assert!(
+        servers.dials().is_empty(),
+        "the session was not in the holder"
+    );
+    stop.cancel();
+    holder.await.unwrap().unwrap();
+}

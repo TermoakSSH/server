@@ -16,7 +16,8 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{mpsc, oneshot};
 
 use super::proto::{
-    FEATURE_INPUT_AUTHORS, Frame, PROTOCOL, ToHolder, ToServer, read_frame, write_frame,
+    FEATURE_INPUT_AUTHORS, FEATURE_NETWORKS, Frame, PROTOCOL, ToHolder, ToServer, read_frame,
+    write_frame,
 };
 use crate::sessions::SessionManager;
 
@@ -26,6 +27,8 @@ pub struct HolderClient {
     tx: Mutex<Option<mpsc::UnboundedSender<Frame<ToHolder>>>>,
     /// The holder records input authors ([`ToHolder::Author`]).
     authors: AtomicBool,
+    /// The holder knows private networks ([`FEATURE_NETWORKS`]).
+    networks: AtomicBool,
 }
 
 impl HolderClient {
@@ -34,7 +37,13 @@ impl HolderClient {
             path,
             tx: Mutex::new(None),
             authors: AtomicBool::new(false),
+            networks: AtomicBool::new(false),
         }
+    }
+
+    /// The holder dials hosts with a private network through netd.
+    pub fn knows_networks(&self) -> bool {
+        self.networks.load(Ordering::Relaxed)
     }
 
     /// The holder understands [`ToHolder::Author`].
@@ -132,6 +141,10 @@ async fn connection(
             );
             let authors = features.iter().any(|f| f == FEATURE_INPUT_AUTHORS);
             client.authors.store(authors, Ordering::Relaxed);
+            client.networks.store(
+                features.iter().any(|f| f == FEATURE_NETWORKS),
+                Ordering::Relaxed,
+            );
             if !authors {
                 tracing::info!(
                     "the session holder is older than this server: recordings of the sessions it keeps will not say who typed (restart it to get that)"

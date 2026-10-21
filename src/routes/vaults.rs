@@ -410,6 +410,35 @@ async fn transfer(
     }
     let dry_run = req.dry_run;
     let mode = req.mode;
+    // Private networks that land in the target count for its owner's plan
+    // (copies always; moves from vaults billed to someone else).
+    if !dry_run {
+        let plan = st
+            .store
+            .transfer(
+                &ctx.access,
+                target,
+                TransferRequest {
+                    dry_run: true,
+                    ..req.clone()
+                },
+            )
+            .await?;
+        let billed = st.store.vault_billing_user(target).await?;
+        let mut adding = plan
+            .copied
+            .iter()
+            .filter(|c| c.kind == EntityKind::Network)
+            .count() as i64;
+        for m in plan.moved.iter().filter(|m| m.kind == EntityKind::Network) {
+            if let Ok((_, from)) = st.store.locate_in(&ctx.access, m.id).await
+                && st.store.vault_billing_user(from).await? != billed
+            {
+                adding += 1;
+            }
+        }
+        crate::routes::networks::check_new_networks(&st, target, adding).await?;
+    }
     let result = st.store.transfer(&ctx.access, target, req).await?;
     if !dry_run {
         sources.insert(target);
@@ -474,6 +503,11 @@ pub struct SyncV2Request {
     /// Records per response (default 2000, max 5000).
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Entity kinds this client understands (`host`, `network`...). Records
+    /// and departures of other kinds are left out. Without it, only the
+    /// kinds every core knows (cores before 0.7 fail on any other).
+    #[serde(default)]
+    pub kinds: Option<Vec<String>>,
 }
 
 /// An entity left a vault (moved, or the vault lost it).
@@ -524,7 +558,16 @@ async fn sync_v2(
     }
     let limit = req.limit.unwrap_or(2000).clamp(1, 5000) as usize;
     let access = ctx.access.clone();
-    let report = st.store.apply_remote_v2(&access, req.changes).await?;
+    let kinds: Vec<EntityKind> = match &req.kinds {
+        Some(list) => list.iter().filter_map(|k| EntityKind::parse(k)).collect(),
+        None => EntityKind::LEGACY.to_vec(),
+    };
+    let mut pushed = req.changes;
+    // New private networks over the owner's plan (`max_networks`).
+    let over_limit =
+        crate::routes::networks::limit_network_pushes(&st, &access, &mut pushed).await?;
+    let mut report = st.store.apply_remote_v2(&access, pushed).await?;
+    report.rejected.extend(over_limit);
     let known: HashMap<Id, VaultCursor> = req.vaults.into_iter().map(|c| (c.vault_id, c)).collect();
 
     let mut resync = Vec::new();
@@ -590,6 +633,8 @@ async fn sync_v2(
             }
         }
     }
+    changes.retain(|c| kinds.contains(&c.kind));
+    removed.retain(|r| kinds.contains(&r.kind));
     Ok(Json(SyncV2Response {
         vaults: st.store.vaults_for(ctx.id()).await?,
         cursors,

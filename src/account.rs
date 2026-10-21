@@ -244,11 +244,14 @@ async fn my_plan(State(st): State<AppState>, u: AuthUser) -> ApiResult<Json<Valu
         .count();
     let access = server_ai_access(&st.config.plans, st.config.ai.monthly_budget_usd, &u.user);
     let ai_spent = st.ai.server_spend_this_month(u.id()).await?;
+    let networks = st.store.networks_billed_to(u.id()).await?;
     Ok(Json(json!({
         "plan": plan,
         "usage": {
             "teams_owned": teams_owned,
             "server_sessions": sessions,
+            // Private networks billed to you (`limits.max_networks`).
+            "networks": networks,
             "ai_spent_usd": micros_to_usd(ai_spent),
             "ai_credit_usd": access.credit_micros.filter(|_| access.allowed).map(micros_to_usd),
         },
@@ -304,7 +307,7 @@ impl termoak_ai::AccessPolicy for PlanAiPolicy {
 }
 
 /// `limit` is the `PlanLimits` field that was reached (`max_teams`...).
-fn limit_error(limit: &str, what: &str, max: u32) -> ApiError {
+pub(crate) fn limit_error(limit: &str, what: &str, max: u32) -> ApiError {
     ApiError::new(
         StatusCode::FORBIDDEN,
         "plan_limit",
@@ -315,7 +318,7 @@ fn limit_error(limit: &str, what: &str, max: u32) -> ApiError {
 }
 
 /// Plan limits of a user (administrators have none).
-fn limits_for(st: &AppState, user: &User) -> Option<PlanLimits> {
+pub(crate) fn limits_for(st: &AppState, user: &User) -> Option<PlanLimits> {
     (!user.is_admin).then(|| st.config.plans.get(&user.plan).limits)
 }
 

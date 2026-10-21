@@ -643,6 +643,59 @@ fn endpoints() -> Vec<Ep> {
             Ref("CredentialsRequest"),
             Ref("Credentials"),
         ),
+        Ep {
+            query: &["access_token"],
+            ..ep(
+                Get,
+                "/api/v1/hosts/{id}/relay",
+                "networks",
+                "Server relay (WebSocket) to a host reached through a private network: the \
+                 server dials the host's first hop (its first jump host, or the host) through \
+                 the network with termoak-netd and pipes the bytes both ways as binary frames; \
+                 SSH runs inside, end to end. Editors; Use-only members unless the vault is \
+                 Strict. Errors before the upgrade: `network_unavailable` (503, no netd), \
+                 `network_not_found` (404), `network_dial_failed` (502), `not_in_network` \
+                 (422), `relay_limit` (429), `use_only_strict` (403). Closes on idle \
+                 (`[networks] relay_idle_minutes`) and when the device is signed out (4007). \
+                 Audited as `relay.open` / `relay.close` (bytes, duration)",
+                None,
+                None,
+            )
+        },
+        ep(
+            Get,
+            "/api/v1/networks/{id}/status",
+            "networks",
+            "State of a network in termoak-netd (any member of its vault); \
+             `network_unavailable` without netd",
+            None,
+            Ref("NetworkStatus"),
+        ),
+        ep(
+            Post,
+            "/api/v1/networks/{id}/up",
+            "networks",
+            "Bring a network up now (Editor): to test it or see the server's node (public \
+             key, node id, authorization URL). Audited as `network.up`",
+            None,
+            Ref("NetworkStatus"),
+        ),
+        ep(
+            Post,
+            "/api/v1/networks/{id}/down",
+            "networks",
+            "Take a network down (Editor). Audited as `network.down`",
+            None,
+            Object,
+        ),
+        ep(
+            Get,
+            "/api/v1/networks/{id}/peers",
+            "networks",
+            "Devices of a network, to import them as hosts (Editor)",
+            None,
+            List("NetworkPeer"),
+        ),
         ep(
             Post,
             "/api/v1/sync",
@@ -1208,6 +1261,7 @@ fn endpoints() -> Vec<Ep> {
         ("forwards", "PortForward"),
         ("known-hosts", "KnownHost"),
         ("memories", "Memory"),
+        ("networks", "Network"),
     ] {
         let list: &'static str = Box::leak(format!("/api/v1/{name}").into_boxed_str());
         let item: &'static str = Box::leak(format!("/api/v1/{name}/{{id}}").into_boxed_str());
@@ -1261,6 +1315,7 @@ fn name_tag(name: &str) -> &'static str {
         "snippets" => "snippets",
         "forwards" => "tunnels",
         "known-hosts" => "known hosts",
+        "networks" => "networks",
         _ => "memories",
     }
 }
@@ -1418,6 +1473,15 @@ pub fn document() -> OpenApi {
         .schema_from::<PortForward>()
         .schema_from::<KnownHost>()
         .schema_from::<Memory>()
+        .schema_from::<Network>()
+        .schema_from::<NetworkSecret>()
+        .schema_from::<WireguardConfig>()
+        .schema_from::<WireguardPeer>()
+        .schema_from::<TailscaleConfig>()
+        .schema_from::<ZerotierConfig>()
+        .schema_from::<crate::netd::NetworkStatus>()
+        .schema_from::<crate::netd::NetworkNode>()
+        .schema_from::<crate::netd::NetworkPeer>()
         .schema_from::<HostSettings>()
         .schema_from::<ProxySettings>()
         .schema_from::<ProxyKind>()
@@ -1557,6 +1621,11 @@ pub fn document() -> OpenApi {
             "memories",
             "What the AI remembers about your infrastructure",
         ),
+        (
+            "networks",
+            "Private networks (WireGuard, Tailscale/Headscale, ZeroTier) the server joins \
+             through termoak-netd, and the relay the apps reach their hosts with",
+        ),
         ("sync", "Sync between devices"),
         ("sessions", "Persistent and shared terminals"),
         ("sftp", "Files over SFTP through the server"),
@@ -1645,5 +1714,14 @@ mod tests {
         let register = &schemas["RegisterRequest"]["properties"];
         assert!(register["accept_terms"].is_object());
         assert_eq!(register["terms_version"]["maxLength"], 16);
+        // Private networks (0.7).
+        assert!(json["paths"]["/api/v1/networks"]["post"].is_object());
+        assert!(json["paths"]["/api/v1/networks/{id}/secret"]["get"].is_object());
+        assert!(json["paths"]["/api/v1/hosts/{id}/relay"]["get"].is_object());
+        assert!(json["paths"]["/api/v1/networks/{id}/status"]["get"].is_object());
+        assert!(schemas["HostSettings"]["properties"]["network_id"].is_object());
+        assert!(schemas["Network"]["properties"]["wireguard"].is_object());
+        assert!(schemas["PlanLimits"]["properties"]["max_networks"].is_object());
+        assert!(schemas["SyncV2Request"]["properties"]["kinds"].is_object());
     }
 }

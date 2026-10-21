@@ -51,6 +51,16 @@ pub fn protocol_file(socket: &Path) -> PathBuf {
 
 /// Listens on `socket` until `stop` is cancelled.
 pub async fn run(socket: &Path, stop: CancellationToken) -> anyhow::Result<()> {
+    run_with(socket, stop, None).await
+}
+
+/// Like [`run`], with the dialer for hosts with a private network
+/// (`termoak-netd`); without it they fail with `network_unavailable`.
+pub async fn run_with(
+    socket: &Path,
+    stop: CancellationToken,
+    dialer: Option<termoak_ssh::Dialer>,
+) -> anyhow::Result<()> {
     if socket.exists() {
         if UnixStream::connect(socket).await.is_ok() {
             anyhow::bail!("there is already a session holder at {}", socket.display());
@@ -75,7 +85,10 @@ pub async fn run(socket: &Path, stop: CancellationToken) -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
-    let holder = Arc::new(Holder::default());
+    let holder = Arc::new(Holder {
+        dialer,
+        ..Default::default()
+    });
     loop {
         let stream = tokio::select! {
             _ = stop.cancelled() => break,
@@ -109,6 +122,8 @@ struct Holder {
     /// The server being served now.
     link: Mutex<Option<Arc<Link>>>,
     links: AtomicU64,
+    /// Dialer for hosts with a private network.
+    dialer: Option<termoak_ssh::Dialer>,
 }
 
 /// Connection to a server.
@@ -369,7 +384,9 @@ impl Holder {
             holder: Arc::downgrade(self),
             id: held.id,
         });
-        let opts = ConnectOptions::new(asker.clone()).with_prompter(asker);
+        let opts = ConnectOptions::new(asker.clone())
+            .with_prompter(asker)
+            .with_dialer(self.dialer.clone());
         let conn = Connection::connect(&o.host, &opts).await?;
         self.set_status(
             held,

@@ -1,5 +1,5 @@
 //! Entity CRUD (hosts, groups, identities, keys, snippets, tunnels, known
-//! hosts, memories), keychain, sync and audit.
+//! hosts, memories, private networks), keychain, sync and audit.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -38,6 +38,7 @@ pub fn routes() -> Router<AppState> {
     r = crud::<PortForward>(r, "forwards");
     r = crud::<KnownHost>(r, "known-hosts");
     r = crud::<Memory>(r, "memories");
+    r = crud::<Network>(r, "networks");
     r.route("/api/v1/keys/generate", post(generate_key))
         .route("/api/v1/keys/import", post(import_key))
         .route("/api/v1/hosts/{id}/test", post(test_host))
@@ -145,6 +146,10 @@ async fn create<T: Entity>(
     let mut b = split_body::<T>(body)?;
     b.data.set_id(Id::nil());
     let vault = b.vault_id.unwrap_or(ctx.personal());
+    if T::KIND == EntityKind::Network {
+        ctx.access.require(vault, VaultRole::Editor)?;
+        crate::routes::networks::check_new_networks(&st, vault, 1).await?;
+    }
     let rec = st
         .store
         .save_in(&ctx.access, vault, b.data, b.secret, b.sync_mode)
@@ -161,6 +166,12 @@ async fn update<T: Entity>(
 ) -> ApiResult<Json<Record<T>>> {
     let current = st.store.get_in::<T>(&ctx.access, id).await?;
     let vault = current.meta.vault_id.unwrap_or(ctx.personal());
+    // Clients that do not know `settings.network_id` (the web and apps
+    // before 0.7) leave it out: the stored one is kept.
+    let mut body = body;
+    if let Ok(stored) = serde_json::to_value(&current.data) {
+        termoak_core::store::keep_omitted_fields(T::KIND, &mut body, &stored);
+    }
     let mut b = split_body::<T>(body)?;
     if b.vault_id.is_some_and(|v| v != vault) {
         return Err(ApiError::conflict(
@@ -422,7 +433,8 @@ async fn test_host(
             HostKeyPolicy::Strict
         },
         None,
-    )));
+    )))
+    .with_dialer(st.netd.as_ref().map(|n| n.dialer()));
     let started = Instant::now();
     match Connection::connect(&resolved, &opts).await {
         Ok(conn) => {
@@ -472,6 +484,8 @@ async fn test_host(
                 }
                 termoak_ssh::SshError::Auth { .. } => ("auth_failed", None, None),
                 termoak_ssh::SshError::Timeout(_) => ("timeout", None, None),
+                // network_unavailable, network_dial_failed...
+                termoak_ssh::SshError::Network { code, .. } => (*code, None, None),
                 _ => ("connect_failed", None, None),
             };
             Ok(Json(HostTest {
@@ -524,6 +538,9 @@ async fn sync(
         );
     }
     let mut pushed = req.changes;
+    // Apps on this protocol (cores before vaults) only know the legacy
+    // kinds: anything else they push is ignored and never sent to them.
+    pushed.retain(|c| c.kind.is_legacy());
     for c in &mut pushed {
         c.vault_id = None;
         c.has_secret = None;
@@ -614,6 +631,7 @@ async fn sync(
         changes.retain(|c| !gone.contains_key(&c.id));
         changes.extend(gone.into_values());
     }
+    changes.retain(|c| c.kind.is_legacy());
     Ok(Json(SyncResponse {
         rev: page.head.max(req.since),
         accepted: report.accepted,

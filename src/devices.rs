@@ -31,6 +31,8 @@ pub enum SocketKind {
     Events,
     /// A terminal session (own or shared).
     Session,
+    /// A private network relay (`/hosts/{id}/relay`).
+    Relay,
 }
 
 impl Sockets {

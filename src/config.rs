@@ -152,6 +152,10 @@ pub struct PlanLimits {
     pub max_team_members: Option<u32>,
     /// Persistent server sessions open at the same time.
     pub max_server_sessions: Option<u32>,
+    /// Private networks (WireGuard, Tailscale, ZeroTier) billed to the
+    /// user: those of the vaults they own and of the team vaults of the
+    /// teams they own. 10 when not set (the Free plan's).
+    pub max_networks: Option<u32>,
     /// Can use the server's own AI providers (its API keys, the Codex
     /// subscription...). Without it, the AI only runs with the user's own API
     /// keys. `true` when not set.
@@ -168,8 +172,42 @@ impl Default for PlanLimits {
             max_teams: None,
             max_team_members: None,
             max_server_sessions: None,
+            max_networks: Some(DEFAULT_MAX_NETWORKS),
             server_ai: true,
             ai_credit_usd: None,
+        }
+    }
+}
+
+/// Private networks per user when a plan does not say (`max_networks`).
+pub const DEFAULT_MAX_NETWORKS: u32 = 10;
+
+/// Private networks: the server joins WireGuard, Tailscale/Headscale and
+/// ZeroTier networks through `termoak-netd`, a separate service it talks to
+/// over a Unix socket (see `docs/NETWORKS.md`). Without `netd_socket` the
+/// feature is off: hosts with a network cannot be reached from the server
+/// and the relay answers `network_unavailable`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworksSection {
+    /// Socket of `termoak-netd` (e.g. `/run/termoak-netd/netd.sock`).
+    pub netd_socket: Option<PathBuf>,
+    /// Relays (`/hosts/{id}/relay`) open at the same time per user.
+    pub max_relays_per_user: usize,
+    /// A relay with no bytes in either direction for this long is closed.
+    pub relay_idle_minutes: u64,
+    /// Time to open a connection inside a network (netd brings the network
+    /// up on its first use, which may take a few seconds).
+    pub dial_timeout_secs: u64,
+}
+
+impl Default for NetworksSection {
+    fn default() -> Self {
+        Self {
+            netd_socket: None,
+            max_relays_per_user: 16,
+            relay_idle_minutes: 30,
+            dial_timeout_secs: 20,
         }
     }
 }
@@ -429,6 +467,7 @@ pub struct ServerConfig {
     pub email: EmailSection,
     pub web: WebSection,
     pub push: PushSection,
+    pub networks: NetworksSection,
 }
 
 impl ServerConfig {
@@ -537,6 +576,15 @@ max_per_user = 50
 # updating or restarting the server does not cut the sessions. Without it,
 # sessions live in the server and are closed when it restarts.
 # holder_socket = "/run/termoak-sessions/sessions.sock"
+
+# Private networks (WireGuard, Tailscale/Headscale, ZeroTier): the server joins
+# them through termoak-netd, a separate service (see docs/NETWORKS.md). Without
+# netd_socket the feature is off (GET /api/v1/info: features.networks = false).
+[networks]
+# netd_socket = "/run/termoak-netd/netd.sock"
+max_relays_per_user = 16
+relay_idle_minutes = 30
+dial_timeout_secs = 20
 
 [ai]
 # Default provider and fallbacks (provider::model format).
@@ -673,6 +721,7 @@ default = "free"
 # max_teams = 3
 # max_team_members = 10
 # max_server_sessions = 20
+# max_networks = 10        # private networks (default 10)
 # server_ai = false
 #
 # [[plans.catalog]]

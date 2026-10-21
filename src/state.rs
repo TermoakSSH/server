@@ -39,6 +39,10 @@ pub struct Inner {
     pub instance_id: String,
     /// Open WebSockets per device (closed when the device is signed out).
     pub sockets: Arc<crate::devices::Sockets>,
+    /// `termoak-netd` (private networks), when configured.
+    pub netd: Option<Arc<crate::netd::Netd>>,
+    /// Open network relays per user.
+    pub relays: crate::routes::networks::RelayCounter,
 }
 
 #[derive(Clone)]

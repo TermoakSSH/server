@@ -902,6 +902,8 @@ pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<Id, Arc<LiveSession>>>>,
     notices: broadcast::Sender<(Id, SessionNotice)>,
     holder: OnceLock<Arc<HolderClient>>,
+    /// Dialer for hosts with a private network (`termoak-netd`).
+    dialer: OnceLock<termoak_ssh::Dialer>,
 }
 
 impl SessionManager {
@@ -914,6 +916,7 @@ impl SessionManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             notices,
             holder: OnceLock::new(),
+            dialer: OnceLock::new(),
         });
         let weak = Arc::downgrade(&mgr);
         tokio::spawn(async move {
@@ -935,6 +938,11 @@ impl SessionManager {
             }
         });
         mgr
+    }
+
+    /// Uses `dialer` for hosts with a private network.
+    pub fn set_dialer(&self, dialer: termoak_ssh::Dialer) {
+        let _ = self.dialer.set(dialer);
     }
 
     /// Per-user notices.
@@ -1062,6 +1070,21 @@ impl SessionManager {
             .store
             .effective_settings_in(&access, vault, &host)
             .await?;
+        // A host in a private network needs netd; never a direct connection.
+        // (The network of a chain is the first jump's or this host's; a
+        // network missing from the vault fails here with
+        // `network_not_found`.)
+        let network = self
+            .store
+            .resolve_in(&access, host_id, termoak_core::store::SecretUse::Server)
+            .await?
+            .first_hop_network_id()
+            .is_some();
+        if network && self.dialer.get().is_none() {
+            return Err(crate::netd::not_configured());
+        }
+        // An older holder would dial such hosts directly: they live here.
+        let holder = holder.filter(|h| !network || h.knows_networks());
         let record = record
             .or(settings.record_sessions)
             .unwrap_or(self.cfg.record);
@@ -1168,7 +1191,8 @@ impl SessionManager {
             self.cfg.host_key_policy,
             Some(prompter.clone()),
         )))
-        .with_prompter(prompter);
+        .with_prompter(prompter)
+        .with_dialer(self.dialer.get().cloned());
         let conn = Connection::connect(&resolved, &opts).await?;
         live.set_state(SessionState::Connecting {
             message: "Opening terminal…".into(),

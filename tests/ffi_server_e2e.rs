@@ -692,6 +692,10 @@ fn server_end_to_end() {
         host_ids: vec![],
         session_id: None,
         effort: None,
+        plan_first: false,
+        group_id: None,
+        tag: None,
+        fan_out: false,
     }))
     .unwrap();
     let done = wait_task(&core, &task.id, |t| {
@@ -711,6 +715,10 @@ fn server_end_to_end() {
         host_ids: vec![host.id.clone()],
         session_id: None,
         effort: None,
+        plan_first: false,
+        group_id: None,
+        tag: None,
+        fan_out: false,
     }))
     .unwrap();
     assert_eq!(task.mode, AiPermissionMode::Ask);
@@ -754,6 +762,8 @@ fn server_end_to_end() {
         local_listener.clone(),
         None,
         true,
+        false,
+        None,
     ))
     .unwrap();
     let shared = block_on(core.share_terminal(local.clone(), "from the phone".into())).unwrap();
@@ -809,6 +819,7 @@ fn server_end_to_end() {
         remote.clone(),
         Some(progress.clone()),
         None,
+        None,
     ))
     .unwrap();
     assert_eq!(sent, 26);
@@ -822,6 +833,7 @@ fn server_end_to_end() {
         remote.clone(),
         back.to_string_lossy().into_owned(),
         Some(progress.clone()),
+        None,
         None,
     ))
     .unwrap();
@@ -839,6 +851,7 @@ fn server_end_to_end() {
             missing.to_string_lossy().into_owned(),
             None,
             None,
+            None,
         ))
         .is_err()
     );
@@ -848,6 +861,7 @@ fn server_end_to_end() {
         block_on(core.download_recording(
             session.id.clone(),
             files.path().join("s.cast").to_string_lossy().into_owned(),
+            None,
             None,
         )),
         Err(TermoakError::NotFound(_))
@@ -875,6 +889,7 @@ fn server_end_to_end() {
     let bytes = block_on(core.download_recording(
         recorded.id.clone(),
         cast.to_string_lossy().into_owned(),
+        None,
         None,
     ))
     .unwrap();

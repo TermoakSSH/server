@@ -53,7 +53,24 @@ code (`RESTART_SESSIONS=1 scripts/release-local.sh deploy server`).
 A holder older than the server keeps working; additions it does not know
 about are simply not used until it restarts (for example, an older holder
 does not mark who typed in recordings: the server logs it when it
-connects).
+connects; and sessions to hosts in private networks stay in the server
+process until the holder knows networks).
+
+### Private networks (optional)
+
+To reach hosts inside WireGuard, Tailscale/Headscale or ZeroTier networks,
+run `termoak-netd` (a separate service, see [NETWORKS.md](NETWORKS.md)) and
+point the server (and the holder, which reads the same file) to its socket:
+
+```toml
+[networks]
+netd_socket = "/run/termoak-netd/netd.sock"
+```
+
+Without it the feature is off (`/info` → `features.networks: false`) and
+hosts with a network answer `network_unavailable`: the server never
+connects to them directly. Plans limit the networks per user with
+`max_networks` (10 by default).
 
 The first user to sign up becomes an administrator. You can also create it
 from the console:

@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+pub mod netd;
 pub mod srv;
 
 pub struct Sshd {

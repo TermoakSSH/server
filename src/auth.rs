@@ -472,6 +472,11 @@ async fn info(State(st): State<AppState>) -> ApiResult<Json<Value>> {
             "vaults": true,
             "sync_v2": true,
             "credentials": true,
+            // Private networks (0.7): termoak-netd is configured and
+            // answering. Hosts and groups with `settings.network_id`,
+            // `/networks`, sync v2 `kinds: ["network"]` and the relay
+            // (`GET /hosts/{id}/relay`).
+            "networks": st.netd.as_ref().is_some_and(|n| n.is_healthy()),
             "plans": true,
             "web": st.config.web.enabled,
             "email": st.mailer.enabled(),

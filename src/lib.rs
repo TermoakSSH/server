@@ -17,6 +17,7 @@ pub mod error;
 pub mod holder;
 pub mod i18n;
 pub mod limiter;
+pub mod netd;
 pub mod openapi;
 pub mod push;
 pub mod room;
@@ -121,6 +122,16 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
         config.sessions.clone(),
         config.server.data_dir.clone(),
     );
+    // Private networks: everything that connects from the server (sessions,
+    // tests, exec, SFTP, AI) dials hosts with a network through netd.
+    let netd = config.networks.netd_socket.clone().map(|socket| {
+        tracing::info!(socket = %socket.display(), "private networks through termoak-netd");
+        let netd = netd::Netd::new(socket);
+        netd.spawn_health();
+        pool.set_dialer(Some(netd.dialer()));
+        sessions.set_dialer(netd.dialer());
+        netd
+    });
     let ai = AiEngine::new(
         store.clone(),
         pool.clone(),
@@ -178,5 +189,7 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
         ),
         instance_id,
         sockets: devices::Sockets::new(),
+        netd,
+        relays: Default::default(),
     })))
 }

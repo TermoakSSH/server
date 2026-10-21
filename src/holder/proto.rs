@@ -36,8 +36,13 @@ pub const PROTOCOL: u32 = 1;
 /// know them, and an unknown message would drop the connection).
 pub const FEATURE_INPUT_AUTHORS: &str = "input_authors";
 
+/// The holder dials hosts with a private network through `termoak-netd`
+/// (or refuses them): an older holder would connect to them directly, so
+/// the server keeps their sessions in its own process instead.
+pub const FEATURE_NETWORKS: &str = "networks";
+
 /// What this holder understands beyond [`PROTOCOL`].
-pub const FEATURES: &[&str] = &[FEATURE_INPUT_AUTHORS];
+pub const FEATURES: &[&str] = &[FEATURE_INPUT_AUTHORS, FEATURE_NETWORKS];
 
 /// Maximum frame size (a session's scrollback fits comfortably).
 const MAX_FRAME: usize = 64 << 20;

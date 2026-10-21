@@ -165,7 +165,13 @@ async fn main() -> anyhow::Result<()> {
                 let _ = tokio::signal::ctrl_c().await;
                 on_signal.cancel();
             });
-            termoak_server::holder::daemon::run(&socket, stop).await
+            // Hosts with a private network are dialed through netd.
+            let dialer = config
+                .networks
+                .netd_socket
+                .clone()
+                .map(|s| termoak_server::netd::Netd::new(s).dialer());
+            termoak_server::holder::daemon::run_with(&socket, stop, dialer).await
         }
         Command::HolderProtocol => {
             println!("{}", termoak_server::holder::proto::PROTOCOL);

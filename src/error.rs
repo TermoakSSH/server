@@ -111,6 +111,9 @@ impl From<CoreError> for ApiError {
                     | codes::ID_IN_USE => StatusCode::CONFLICT,
                     codes::CROSS_VAULT_REFERENCE => StatusCode::UNPROCESSABLE_ENTITY,
                     codes::INVALID_ROLE => StatusCode::BAD_REQUEST,
+                    codes::NETWORK_NOT_FOUND => StatusCode::NOT_FOUND,
+                    codes::NETWORK_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
+                    codes::NETWORK_DIAL_FAILED => StatusCode::BAD_GATEWAY,
                     _ => StatusCode::FORBIDDEN,
                 };
                 let mut e = ApiError::new(status, code, message);
@@ -148,6 +151,16 @@ impl From<SshError> for ApiError {
             // this version does not know).
             SshError::Unsupported(m) => {
                 ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "not_supported", m)
+            }
+            // Private networks: `network_unavailable` (no netd, or it is
+            // down), `network_not_found`, `network_dial_failed`.
+            SshError::Network { code, message } => {
+                let status = match code {
+                    codes::NETWORK_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
+                    codes::NETWORK_NOT_FOUND => StatusCode::NOT_FOUND,
+                    _ => StatusCode::BAD_GATEWAY,
+                };
+                ApiError::new(status, code, message)
             }
             other => ApiError::new(StatusCode::BAD_GATEWAY, "ssh_error", other.to_string()),
         }

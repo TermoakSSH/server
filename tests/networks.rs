@@ -1,0 +1,769 @@
+//! Private networks (0.7): the entity, its sync with old and new clients,
+//! the compatibility of hosts edited by apps that do not know
+//! `settings.network_id`, the `max_networks` limit, and the relay and
+//! server sessions through a fake `termoak-netd`.
+
+mod common;
+
+use std::time::Duration;
+
+use common::netd::{self, FakeNetd};
+use common::srv::{Srv, User};
+use futures::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use tokio_tungstenite::tungstenite::Message as WsMsg;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+fn find<'a>(changes: &'a Value, id: &str) -> Option<&'a Value> {
+    changes.as_array().unwrap().iter().find(|c| c["id"] == id)
+}
+
+fn wireguard(name: &str, vault: &str) -> Value {
+    json!({
+        "name": name, "kind": "wireguard", "vault_id": vault,
+        "wireguard": {"addresses": ["10.9.0.2/32"], "peers": [{
+            "public_key": "cGVlcg==", "endpoint": "vpn.example.com:51820",
+            "allowed_ips": ["10.9.0.0/24"]}]},
+        "secret": {"private_key": "cHJpdmF0ZQ=="}
+    })
+}
+
+async fn network(srv: &Srv, u: &User, vault: &str, name: &str) -> String {
+    srv.ok("/api/v1/networks", u, wireguard(name, vault)).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// A host of `vault` at 127.0.0.1:`port` through `network`.
+async fn net_host(srv: &Srv, u: &User, vault: &str, port: u16, network: Option<&str>) -> String {
+    srv.ok(
+        "/api/v1/hosts",
+        u,
+        json!({"label": "nas", "address": "127.0.0.1", "vault_id": vault,
+               "settings": {"username": "root", "port": port, "network_id": network}}),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn with_netd(
+    configure: impl FnOnce(&mut termoak_server::config::ServerConfig),
+) -> (Srv, FakeNetd) {
+    let fake = netd::start().await;
+    let socket = fake.socket.clone();
+    let srv = Srv::start_with(move |c| {
+        c.networks.netd_socket = Some(socket);
+        configure(c);
+    })
+    .await;
+    // The first health check runs right away.
+    for _ in 0..50 {
+        let info: Value = reqwest::get(format!("{}/api/v1/info", srv.base))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if info["features"]["networks"] == true {
+            return (srv, fake);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("features.networks never became true");
+}
+
+async fn echo_server() -> u16 {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut c, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = c.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    port
+}
+
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Opens the relay; `Err((status, body))` when refused before the upgrade.
+async fn relay(srv: &Srv, u: &User, host: &str) -> Result<Ws, (u16, Value)> {
+    let url = format!(
+        "{}/api/v1/hosts/{host}/relay",
+        srv.base.replace("http://", "ws://")
+    );
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", u.token).parse().unwrap(),
+    );
+    match tokio_tungstenite::connect_async(req).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            let status = resp.status().as_u16();
+            let body = resp
+                .body()
+                .as_deref()
+                .and_then(|b| serde_json::from_slice(b).ok())
+                .unwrap_or(Value::Null);
+            Err((status, body))
+        }
+        Err(e) => panic!("relay: {e}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn networks_sync_only_to_clients_that_know_them_and_old_apps_keep_them() {
+    let srv = Srv::start().await;
+    let ana = srv.user("Ana").await;
+    let info: Value = reqwest::get(format!("{}/api/v1/info", srv.base))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["features"]["networks"], false, "no netd: off");
+
+    // CRUD with the secret apart.
+    let net = network(&srv, &ana, &ana.id, "office").await;
+    let got = srv.get(&format!("/api/v1/networks/{net}"), &ana).await;
+    assert_eq!(got.body["kind"], "wireguard");
+    assert_eq!(got.body["has_secret"], true);
+    assert!(got.body.get("secret").is_none());
+    let secret = srv
+        .get(&format!("/api/v1/networks/{net}/secret"), &ana)
+        .await;
+    assert_eq!(secret.body["private_key"], "cHJpdmF0ZQ==");
+    let bad = srv
+        .post(
+            "/api/v1/networks",
+            &ana,
+            json!({"name": "zt", "kind": "zerotier", "zerotier": {"network_id": "nope"}}),
+        )
+        .await;
+    assert_eq!(bad.status, 400, "{}", bad.body);
+
+    // A host in the network.
+    let host = net_host(&srv, &ana, &ana.id, 22, Some(&net)).await;
+    let h = srv.get(&format!("/api/v1/hosts/{host}"), &ana).await.body;
+    assert_eq!(h["settings"]["network_id"], net);
+
+    // REST: a client that does not know the field (the web, apps before
+    // 0.7) leaves it out and it is kept; `null` clears it.
+    let mut old = h.clone();
+    old["settings"]
+        .as_object_mut()
+        .unwrap()
+        .remove("network_id");
+    old["label"] = json!("nas (renamed)");
+    let r = srv.put(&format!("/api/v1/hosts/{host}"), &ana, old).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["label"], "nas (renamed)");
+    assert_eq!(r.body["settings"]["network_id"], net);
+    let mut bare = h.clone();
+    bare.as_object_mut().unwrap().remove("settings");
+    let r = srv.put(&format!("/api/v1/hosts/{host}"), &ana, bare).await;
+    assert_eq!(r.body["settings"]["network_id"], net, "{}", r.body);
+
+    // Legacy sync (apps before vaults, cores 0.2/0.3): no networks at all.
+    let legacy = srv
+        .ok("/api/v1/sync", &ana, json!({"since": 0, "changes": []}))
+        .await;
+    assert!(find(&legacy["changes"], &host).is_some());
+    assert!(find(&legacy["changes"], &net).is_none(), "{legacy}");
+    assert!(
+        legacy["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["kind"] != "network")
+    );
+    // The old app edits the host without the field: kept.
+    let mut data = find(&legacy["changes"], &host).unwrap()["data"].clone();
+    data["settings"]
+        .as_object_mut()
+        .unwrap()
+        .remove("network_id");
+    data["label"] = json!("nas (old app)");
+    let now = termoak_core::time::now_ms() + 1000;
+    let rev = legacy["rev"].as_i64().unwrap();
+    let r = srv
+        .ok(
+            "/api/v1/sync",
+            &ana,
+            json!({"since": rev, "changes": [
+                {"id": host, "kind": "host", "data": data, "sync_mode": "synced",
+                 "updated_at": now, "deleted": false},
+                // A network pushed on this protocol is ignored.
+                {"id": termoak_core::new_id(), "kind": "network",
+                 "data": {"name": "x", "kind": "wireguard"}, "sync_mode": "synced",
+                 "updated_at": now, "deleted": false}
+            ]}),
+        )
+        .await;
+    assert_eq!(r["accepted"], json!([host]));
+    assert!(
+        r["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["kind"] != "network")
+    );
+    let h = srv.get(&format!("/api/v1/hosts/{host}"), &ana).await.body;
+    assert_eq!(h["label"], "nas (old app)");
+    assert_eq!(h["settings"]["network_id"], net);
+    assert_eq!(
+        srv.get("/api/v1/networks", &ana)
+            .await
+            .body
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Sync v2 without `kinds` (cores 0.4–0.6): no networks either.
+    let v2 = srv
+        .ok(
+            "/api/v1/vaults/sync",
+            &ana,
+            json!({"vaults": [], "changes": []}),
+        )
+        .await;
+    assert!(find(&v2["changes"], &host).is_some());
+    assert!(find(&v2["changes"], &net).is_none(), "{v2}");
+    // With `kinds` (0.7): the network, with its secret.
+    let kinds = termoak_client::sync::known_kinds();
+    let v2 = srv
+        .ok(
+            "/api/v1/vaults/sync",
+            &ana,
+            json!({"vaults": [], "changes": [], "kinds": kinds}),
+        )
+        .await;
+    let rec = find(&v2["changes"], &net).expect("network for 0.7 clients");
+    assert_eq!(rec["kind"], "network");
+    assert_eq!(rec["secret"]["private_key"], "cHJpdmF0ZQ==");
+    // Its deletion reaches only clients that know it too.
+    let cursor = v2["cursors"].clone();
+    srv.delete(&format!("/api/v1/hosts/{host}"), &ana).await;
+    let r = srv.delete(&format!("/api/v1/networks/{net}"), &ana).await;
+    assert_eq!(r.status, 200);
+    let old = srv
+        .ok(
+            "/api/v1/vaults/sync",
+            &ana,
+            json!({"vaults": cursor, "changes": []}),
+        )
+        .await;
+    assert!(find(&old["changes"], &net).is_none(), "{old}");
+    assert!(find(&old["changes"], &host).is_some());
+    let new = srv
+        .ok(
+            "/api/v1/vaults/sync",
+            &ana,
+            json!({"vaults": cursor, "changes": [], "kinds": kinds}),
+        )
+        .await;
+    assert_eq!(find(&new["changes"], &net).unwrap()["deleted"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_hosts_never_connect_directly_without_netd() {
+    let srv = Srv::start().await;
+    let ana = srv.user("Ana").await;
+    let port = echo_server().await;
+    let net = network(&srv, &ana, &ana.id, "office").await;
+    let host = net_host(&srv, &ana, &ana.id, port, Some(&net)).await;
+
+    // Relay, server session and connection test: network_unavailable.
+    let (status, body) = relay(&srv, &ana, &host).await.err().unwrap();
+    assert_eq!(status, 503);
+    assert_eq!(body["error"]["code"], "network_unavailable");
+    let r = srv
+        .post(
+            "/api/v1/sessions",
+            &ana,
+            json!({"host_id": host, "cols": 80, "rows": 24}),
+        )
+        .await;
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert_eq!(r.code(), "network_unavailable");
+    let t = srv
+        .post(&format!("/api/v1/hosts/{host}/test"), &ana, json!({}))
+        .await;
+    assert_eq!(t.body["ok"], false);
+    assert_eq!(t.body["error_code"], "network_unavailable");
+    let r = srv
+        .get(&format!("/api/v1/networks/{net}/status"), &ana)
+        .await;
+    assert_eq!((r.status, r.code()), (503, "network_unavailable"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_networks_counts_for_the_vault_owner_and_the_team_owner() {
+    let srv = Srv::start_with(|c| {
+        for p in &mut c.plans.catalog {
+            p.limits.max_networks = Some(2);
+        }
+    })
+    .await;
+    let _admin = srv.user("Admin").await; // the first user has no limits
+    let ana = srv.user("Ana").await;
+    let bea = srv.user("Bea").await;
+    // The default plan says 10 when not configured.
+    let plans: Value = reqwest::get(format!("{}/api/v1/plans", srv.base))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(plans["plans"][0]["limits"]["max_networks"], 2);
+    assert_eq!(
+        termoak_server::config::PlanLimits::default().max_networks,
+        Some(10)
+    );
+
+    let ops = srv.vault(&ana, "Ops").await;
+    network(&srv, &ana, &ana.id, "one").await;
+    network(&srv, &ana, &ops, "two").await;
+    let r = srv
+        .post("/api/v1/networks", &ana, wireguard("three", &ana.id))
+        .await;
+    assert_eq!((r.status, r.code()), (403, "plan_limit"), "{}", r.body);
+    assert_eq!(r.body["error"]["limit"], "max_networks");
+    assert_eq!(r.body["error"]["max"], 2);
+    let mine = srv.get("/api/v1/me/plan", &ana).await;
+    assert_eq!(mine.body["usage"]["networks"], 2);
+
+    // Sync v2 pushes over the limit come back rejected.
+    let id = termoak_core::new_id().to_string();
+    let r = srv
+        .ok(
+            "/api/v1/vaults/sync",
+            &ana,
+            json!({"vaults": [], "kinds": ["network"], "changes": [{
+                "id": id, "kind": "network", "vault_id": ana.id,
+                "data": {"name": "pushed", "kind": "tailscale"},
+                "sync_mode": "synced", "updated_at": termoak_core::time::now_ms(),
+                "deleted": false}]}),
+        )
+        .await;
+    assert_eq!(r["rejected"][0]["id"], id);
+    assert_eq!(r["rejected"][0]["code"], "plan_limit");
+    assert!(
+        srv.get(&format!("/api/v1/networks/{id}"), &ana)
+            .await
+            .status
+            == 404
+    );
+
+    // Team vault: billed to the team owner (Bea), not to who creates it.
+    let team = srv
+        .ok("/api/v1/teams", &bea, json!({"name": "Infra"}))
+        .await;
+    let team_id = team["id"].as_str().unwrap();
+    srv.ok(
+        &format!("/api/v1/teams/{team_id}/members"),
+        &bea,
+        json!({"email": ana.email, "role": "admin"}),
+    )
+    .await;
+    let tv = srv
+        .ok(
+            "/api/v1/vaults",
+            &ana,
+            json!({"name": "Team", "team_id": team_id}),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    network(&srv, &ana, &tv, "team-1").await;
+    network(&srv, &ana, &tv, "team-2").await;
+    let r = srv
+        .post("/api/v1/networks", &ana, wireguard("team-3", &tv))
+        .await;
+    assert_eq!(r.code(), "plan_limit");
+    assert_eq!(
+        srv.get("/api/v1/me/plan", &bea).await.body["usage"]["networks"],
+        2
+    );
+    assert_eq!(
+        srv.get("/api/v1/me/plan", &ana).await.body["usage"]["networks"],
+        2
+    );
+
+    // Transfers: a host brings its network along. Into a vault billed to
+    // the same user it is not new; a copy into the team vault (Bea is at
+    // her limit) is.
+    let one = srv.get("/api/v1/networks", &ana).await.body;
+    let one = one
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "one")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let host = net_host(&srv, &ana, &ana.id, 22, Some(&one)).await;
+    let r = srv
+        .post(
+            &format!("/api/v1/vaults/{tv}/transfer"),
+            &ana,
+            json!({"mode": "copy", "items": [{"kind": "host", "id": host}]}),
+        )
+        .await;
+    assert_eq!((r.status, r.code()), (403, "plan_limit"), "{}", r.body);
+    let r = srv
+        .post(
+            &format!("/api/v1/vaults/{ops}/transfer"),
+            &ana,
+            json!({"mode": "move", "items": [{"kind": "host", "id": host}]}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let moved = srv.get(&format!("/api/v1/hosts/{host}"), &ana).await.body;
+    assert_eq!(moved["vault_id"], ops);
+    assert_eq!(moved["settings"]["network_id"], one);
+    let net = srv.get(&format!("/api/v1/networks/{one}"), &ana).await.body;
+    assert_eq!(net["vault_id"], ops, "the network moved with its host");
+    assert_eq!(
+        srv.get("/api/v1/me/plan", &ana).await.body["usage"]["networks"],
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_pipes_bytes_through_netd_and_only_for_who_may_use_the_host() {
+    let (srv, fake) = with_netd(|c| c.networks.max_relays_per_user = 2).await;
+    let ana = srv.user("Ana").await;
+    let bea = srv.user("Bea").await;
+    let port = echo_server().await;
+    let ops = srv.vault(&ana, "Ops").await;
+    let net = network(&srv, &ana, &ops, "office").await;
+    let host = net_host(&srv, &ana, &ops, port, Some(&net)).await;
+
+    let mut ws = relay(&srv, &ana, &host).await.unwrap();
+    let data: Vec<u8> = (0..100_000u32).map(|i| (i % 253) as u8).collect();
+    for chunk in data.chunks(10_000) {
+        ws.send(WsMsg::Binary(chunk.to_vec().into())).await.unwrap();
+    }
+    let mut got = Vec::new();
+    while got.len() < data.len() {
+        match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+            Ok(Some(Ok(WsMsg::Binary(b)))) => got.extend_from_slice(&b),
+            Ok(Some(Ok(_))) => {}
+            other => panic!("relay ended: {other:?}"),
+        }
+    }
+    assert_eq!(got, data);
+    ws.close(None).await.unwrap();
+    // netd dialed the host's address inside the host's network, with the
+    // network's config and secret.
+    let dial = fake.dials().last().cloned().unwrap();
+    assert_eq!(
+        (dial.network_id.as_str(), dial.kind.as_str()),
+        (net.as_str(), "wireguard")
+    );
+    assert_eq!((dial.host.as_str(), dial.port), ("127.0.0.1", port));
+    assert_eq!(dial.secret["private_key"], "cHJpdmF0ZQ==");
+    assert_eq!(dial.revision.len(), 16);
+
+    // Audited with the bytes.
+    let mut closed = Value::Null;
+    for _ in 0..50 {
+        let audit = srv
+            .get(&format!("/api/v1/vaults/{ops}/audit"), &ana)
+            .await
+            .body;
+        if let Some(e) = audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["action"] == "relay.close")
+        {
+            closed = e.clone();
+            assert!(
+                audit
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["action"] == "relay.open")
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(closed["detail"]["bytes_up"], 100_000, "{closed}");
+    assert_eq!(closed["detail"]["bytes_down"], 100_000);
+    assert_eq!(closed["detail"]["network"], "office");
+
+    // Someone without access to the vault: not found (no dial).
+    let dials = fake.dials().len();
+    let (status, _) = relay(&srv, &bea, &host).await.err().unwrap();
+    assert_eq!(status, 404);
+    // Bea cannot point her own host at Ana's network either.
+    let r = srv
+        .post(
+            "/api/v1/hosts",
+            &bea,
+            json!({"label": "steal", "address": "127.0.0.1",
+                   "settings": {"username": "x", "network_id": net}}),
+        )
+        .await;
+    assert_eq!(r.code(), "cross_vault_reference", "{}", r.body);
+    // Use-only in a Strict vault: only through the server.
+    srv.share(&ana, &ops, &bea, "use_only").await;
+    let s = srv
+        .patch(
+            &format!("/api/v1/vaults/{ops}"),
+            &ana,
+            json!({"settings": {"use_only_local": false}}),
+        )
+        .await;
+    assert_eq!(s.status, 200, "{}", s.body);
+    let (status, body) = relay(&srv, &bea, &host).await.err().unwrap();
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (403, Some("use_only_strict"))
+    );
+    // Not Strict: Use-only members may relay.
+    srv.patch(
+        &format!("/api/v1/vaults/{ops}"),
+        &ana,
+        json!({"settings": {"use_only_local": true}}),
+    )
+    .await;
+    let mut ws = relay(&srv, &bea, &host).await.unwrap();
+    ws.send(WsMsg::Binary(b"hi".to_vec().into())).await.unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+            Ok(Some(Ok(WsMsg::Binary(b)))) => {
+                assert_eq!(&b[..], b"hi");
+                break;
+            }
+            Ok(Some(Ok(_))) => {}
+            other => panic!("relay ended: {other:?}"),
+        }
+    }
+    assert_eq!(fake.dials().len(), dials + 1);
+
+    // A host without a network: the relay is not for it.
+    let direct = net_host(&srv, &ana, &ops, port, None).await;
+    let (status, body) = relay(&srv, &ana, &direct).await.err().unwrap();
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (422, Some("not_in_network"))
+    );
+    // A host that cannot be reached: network_dial_failed.
+    let down = net_host(&srv, &ana, &ops, 1, Some(&net)).await;
+    let (status, body) = relay(&srv, &ana, &down).await.err().unwrap();
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (502, Some("network_dial_failed"))
+    );
+    assert_eq!(body["error"]["netd_code"], "dial_failed");
+
+    // At most 2 relays per user.
+    let _a = relay(&srv, &ana, &host).await.unwrap();
+    let _b = relay(&srv, &ana, &host).await.unwrap();
+    let (status, body) = relay(&srv, &ana, &host).await.err().unwrap();
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (429, Some("relay_limit"))
+    );
+
+    // netd state of the network.
+    let up = srv
+        .ok(&format!("/api/v1/networks/{net}/up"), &ana, json!({}))
+        .await;
+    assert_eq!(up["state"], "up");
+    assert_eq!(up["node"]["public_key"], "ZmFrZQ==");
+    let st = srv
+        .get(&format!("/api/v1/networks/{net}/status"), &bea)
+        .await;
+    assert_eq!(st.body["state"], "up", "{}", st.body);
+    let peers = srv
+        .get(&format!("/api/v1/networks/{net}/peers"), &ana)
+        .await;
+    assert_eq!(peers.body[0]["name"], "nas");
+    // Use-only members cannot bring networks up or list their devices.
+    let r = srv
+        .post(&format!("/api/v1/networks/{net}/up"), &bea, json!({}))
+        .await;
+    assert_eq!(r.code(), "vault_read_only");
+    // A kind this netd cannot join.
+    let zt = srv
+        .ok(
+            "/api/v1/networks",
+            &ana,
+            json!({"name": "zt", "kind": "zerotier", "vault_id": ops,
+                   "zerotier": {"network_id": "8056c2e21c000001"}}),
+        )
+        .await;
+    let r = srv
+        .post(
+            &format!("/api/v1/networks/{}/up", zt["id"].as_str().unwrap()),
+            &ana,
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.code()),
+        (503, "network_unavailable"),
+        "{}",
+        r.body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_sessions_and_the_apps_reach_hosts_through_the_network() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let Some(sshd) = common::start_sshd() else {
+        eprintln!("sshd not available: test skipped");
+        return;
+    };
+    let (srv, fake) = with_netd(|_| {}).await;
+    let ana = srv.user("Ana").await;
+    let net = network(&srv, &ana, &ana.id, "office").await;
+    let key = srv
+        .ok(
+            "/api/v1/keys/import",
+            &ana,
+            json!({"label": "k", "private_key": sshd.private_key}),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The network comes from the group.
+    let group = srv
+        .ok(
+            "/api/v1/groups",
+            &ana,
+            json!({"name": "lan", "settings": {"network_id": net}}),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let host = srv
+        .ok(
+            "/api/v1/hosts",
+            &ana,
+            json!({"label": "local", "address": "127.0.0.1", "group_id": group,
+                   "settings": {"username": sshd.user, "port": sshd.port, "key_id": key}}),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Connection test and exec from the server go through netd.
+    let t = srv
+        .post(
+            &format!("/api/v1/hosts/{host}/test?trust=true"),
+            &ana,
+            json!({}),
+        )
+        .await;
+    assert_eq!(t.body["ok"], true, "{}", t.body);
+    assert_eq!(fake.dials().last().unwrap().port, sshd.port);
+    let out = srv
+        .ok(
+            "/api/v1/exec",
+            &ana,
+            json!({"host_ids": [host], "command": "echo via-$((6*7))"}),
+        )
+        .await;
+    assert_eq!(out[0]["stdout"].as_str().unwrap().trim(), "via-42", "{out}");
+
+    // A server session.
+    let dials = fake.dials().len();
+    let s = srv
+        .ok(
+            "/api/v1/sessions",
+            &ana,
+            json!({"host_id": host, "cols": 80, "rows": 24}),
+        )
+        .await;
+    let id = s["id"].as_str().unwrap();
+    let mut ws = common::ws_connect(
+        &srv.base,
+        &format!("/api/v1/sessions/{id}/ws"),
+        Some(&ana.token),
+    )
+    .await;
+    common::ws_wait_json(&mut ws, "hello").await;
+    ws.send(WsMsg::Binary(b"echo net-$((5*5))\n".to_vec().into()))
+        .await
+        .unwrap();
+    common::ws_wait_output(&mut ws, "net-25").await;
+    assert_eq!(fake.dials().len(), dials + 1);
+    assert_eq!(fake.dials().last().unwrap().network_id, net);
+
+    // An app (the mobile engine): its SSH connection goes over the relay,
+    // end to end with the host.
+    let dials = fake.dials().len();
+    let (base, email, h) = (srv.base.clone(), ana.email.clone(), host.clone());
+    let stdout = tokio::task::spawn_blocking(move || {
+        use futures::executor::block_on;
+        struct Trust;
+        impl termoak_ffi::AuthHandler for Trust {
+            fn on_host_key(&self, _: String, _: u32, _: String, _: String) -> bool {
+                true
+            }
+            fn on_prompt(&self, _: termoak_ffi::AuthRequest) -> Option<Vec<String>> {
+                None
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let core = termoak_ffi::TermoakCore::new(
+            dir.path().to_string_lossy().into_owned(),
+            termoak_ffi::generate_vault_key(),
+        )
+        .unwrap();
+        block_on(core.login(base, email, "secure-password".into(), None)).unwrap();
+        block_on(core.sync_now()).unwrap();
+        assert_eq!(core.list_networks(None).unwrap().len(), 1);
+        let session = block_on(core.connect(h, std::sync::Arc::new(Trust), None, None)).unwrap();
+        let out = block_on(session.exec("echo app-$((2*21))".into(), 30)).unwrap();
+        out.stdout
+    })
+    .await
+    .unwrap();
+    assert_eq!(stdout.trim(), "app-42");
+    assert_eq!(
+        fake.dials().len(),
+        dials + 1,
+        "the app went through the relay"
+    );
+    let audit = srv.get("/api/v1/audit", &ana).await.body;
+    assert!(
+        audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "relay.open"),
+        "{audit}"
+    );
+
+    // A raw relay carries SSH too (the SSH banner arrives).
+    let mut ws = relay(&srv, &ana, &host).await.unwrap();
+    let banner = loop {
+        match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+            Ok(Some(Ok(WsMsg::Binary(b)))) => break b,
+            Ok(Some(Ok(_))) => {}
+            other => panic!("relay ended: {other:?}"),
+        }
+    };
+    assert!(banner.starts_with(b"SSH-2.0-"), "{banner:?}");
+}

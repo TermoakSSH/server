@@ -26,7 +26,14 @@ ago must keep working with a new server, so `/api/v1` only grows:
   (`SessionStatus`, `EntityKind`, `TeamRole`, `SharePermission`...): current
   clients don't recognize them and the whole response fails to parse. To
   allow it later, the enum first needs a catch-all variant
-  (`#[serde(other)]`) shipped in every client.
+  (`#[serde(other)]`) shipped in every client. New entity kinds (`network`,
+  0.7) are only sent to clients that ask for them (`kinds` in sync v2);
+  the legacy sync never sends them.
+- A field that older clients do not know and drop when they edit an item
+  must survive their edits: `settings.network_id` of hosts and groups
+  (0.7) is always written by newer cores (`null` when empty), so a PUT or a
+  sync push **without the key** keeps the stored value, and `null` clears
+  it. Clients must send the whole object they read.
 
 An incompatible change goes into a new API (`/api/v2`) that lives alongside
 the old one while clients still use it. One deliberate exception: since
@@ -103,7 +110,7 @@ Accounts and sign-in:
 | `invalid_terms_version` | 400 | `terms_version` is longer than 16 characters or has control characters |
 | `last_admin` | 409 | You are the only administrator: appoint another one first |
 | `last_team_owner` | 409 | A team would be left without an owner. Extra field when deleting the account: `teams` (names of those teams) |
-| `plan_limit` | 403 | Your plan does not allow more. Extra fields: `limit` (`max_teams`, `max_team_members` or `max_server_sessions`) and `max` |
+| `plan_limit` | 403 | Your plan does not allow more. Extra fields: `limit` (`max_teams`, `max_team_members`, `max_server_sessions` or `max_networks`) and `max` |
 
 Administration:
 
@@ -181,6 +188,11 @@ Sync, AI, push notifications and updates:
 | `confirmation_required` | 400 | Deleting a vault needs `?confirm=<its name>` |
 | `shared_vaults` | 409 | Deleting the account would delete your shared vaults with members: confirm with `delete_shared_vaults: true`. Extra field: `vaults` (`[{id, name, member_count}]`) |
 | `rate_limited` | 429 | Too many requests (`/hosts/{id}/credentials`: 30 per minute). Extra field: `retry_ms` |
+| `network_unavailable` | 503 | Private networks are not available: the server has no `termoak-netd` (or it is down), or it cannot join that kind of network |
+| `network_not_found` | 404 | The host (or its group) uses a private network that is not in its vault. Extra field: `network_id` |
+| `network_dial_failed` | 502 | The network could not reach the host. Extra field: `netd_code` (`dial_failed`, `needs_auth`, `timeout`...) |
+| `not_in_network` | 422 | `/hosts/{id}/relay` for a host without a private network: connect to it directly |
+| `relay_limit` | 429 | Too many relays open (`[networks] max_relays_per_user`). Extra field: `max` |
 | `ai_not_configured` | 503 | The AI provider is not configured |
 | `ai_key_required` | 403 | The plan does not include the server's AI and you have no API key of your own that can be used: add one in Settings → AI (`PUT /me/ai/keys/{provider}`) |
 | `ai_budget_exceeded` | 403 | This month's AI credit for the server's providers is spent (your own API keys keep working) |
@@ -194,8 +206,8 @@ Sync, AI, push notifications and updates:
 
 `POST /hosts/{id}/test` does not fail when the connection fails: it answers
 `200` with `ok: false`, the `error` text and an `error_code`
-(`host_key_unknown`, `host_key_changed`, `auth_failed`, `timeout` or
-`connect_failed`).
+(`host_key_unknown`, `host_key_changed`, `auth_failed`, `timeout`,
+`network_unavailable`, `network_dial_failed` or `connect_failed`).
 
 ## Authentication and account
 
@@ -367,8 +379,9 @@ English texts and the raw id. The built-in catalog has **Free** (everything
 included; AI runs with your own API keys) and **Pro** (coming soon: priority
 support and Termoak AI credit).
 
-Plan limits (teams owned, members per team, open server sessions) answer
-`403` with `plan_limit`. Server administrators have no limits.
+Plan limits (teams owned, members per team, open server sessions, private
+networks: `max_networks`, 10 when not set) answer `403` with `plan_limit`.
+Server administrators have no limits.
 
 Plans also decide the AI (see [AI with your own keys and AI credit](#ai-with-your-own-keys-and-ai-credit)):
 `limits.server_ai` (can use the server's AI providers; `true` when not set)
@@ -551,6 +564,7 @@ All of them follow the same CRUD pattern:
 | Port forwards | `/forwards` |
 | Known hosts | `/known-hosts` |
 | AI memories | `/memories` |
+| Private networks (0.7) | `/networks` |
 
 | Method | Route | Description |
 |---|---|---|
@@ -570,6 +584,19 @@ default port is 23 (written out by the apps). The server does not open
 sessions to them (`telnet_not_supported`): the apps connect to them
 themselves, and `/hosts/{id}/credentials` gives them the username and
 password for the automatic login.
+
+Hosts and groups have `settings.network_id` (0.7): the private network
+(of the same vault) their first connection goes through, inherited from the
+groups like `proxy`; `null` is direct. A PUT without the key keeps the
+stored value (see [Compatibility](#compatibility)).
+
+Private networks (`/networks`) are `{name, kind: "wireguard" | "tailscale" |
+"zerotier", description, wireguard?: {addresses, dns, mtu, peers:
+[{public_key, endpoint, allowed_ips, persistent_keepalive}], public_key},
+tailscale?: {control_url, hostname, tags}, zerotier?: {network_id,
+central_url}}` with the secret `{private_key?, preshared_key?, auth_key?,
+api_token?}`. Creating one checks `max_networks` (see
+[Private networks](#private-networks)).
 
 Other entity routes:
 
@@ -607,7 +634,9 @@ username and password, never a key.
 ```json
 {"vaults": [{"vault_id": "…", "cursor": 1234, "role": "editor"}],
  "changes": [SyncRecord],
- "limit": 2000}
+ "limit": 2000,
+ "kinds": ["group", "host", "identity", "key", "snippet", "forward",
+           "known_host", "memory", "network"]}
 ```
 
 →
@@ -642,6 +671,12 @@ username and password, never a key.
   response already start from 0.
 - `more: true`: the limit (default 2000, max 5000) cut the answer; call
   again with the new cursors.
+- `kinds`: the entity kinds the client understands. Records and departures
+  of other kinds are left out of `changes` and `removed`. Without it, only
+  the kinds every core knows (everything but `network`). A client that
+  starts asking for a new kind downloads everything again once (its
+  cursors advanced without it). New networks over the plan come back in
+  `rejected` with `plan_limit`.
 - Sync on the `vault/changed` and `vault/access` events, after local saves,
   periodically and after a `vault_read_only` from REST.
 
@@ -654,7 +689,53 @@ and items that left it (moved to another vault) come as deletions
 (`deleted: true`), so an old app drops them. Pushes land in the personal
 vault; an existing item that is now in another vault where you are Editor
 is changed there (and stays out of the answer). `rev` is the server's
-current revision.
+current revision. Only the kinds every core knows travel here: private
+networks are never sent, and pushed ones are ignored.
+
+## Private networks
+
+Since 0.7 the server can reach hosts in private networks (WireGuard,
+Tailscale/Headscale, ZeroTier) through `termoak-netd`, a separate service
+(`[networks] netd_socket`; design, protocol and security model in
+[NETWORKS.md](NETWORKS.md)). `/info` has `features.networks: true` when it is configured and
+answering; otherwise hosts with a network fail with `network_unavailable`
+(the server never connects to them directly).
+
+- **Server sessions, tests, `/exec`, SFTP and the AI** dial the first hop
+  (the first jump host, or the host) through its network.
+- **Apps** (local terminals, SFTP, tunnels) open the relay below and run
+  SSH inside it, end to end.
+- **Plan:** `limits.max_networks` (10 when not set) counts the networks of
+  the vaults you own and of the team vaults of the teams you own (the
+  team's first owner pays). `GET /me/plan` has `usage.networks`.
+
+| Method | Route | Description |
+|---|---|---|
+| GET | `/hosts/{id}/relay` | WebSocket relay to the host's first hop through its network (below) |
+| GET | `/networks/{id}/status` | State in netd: `{state: down \| starting \| needs_auth \| up \| error, message, node: {name, addresses, public_key, node_id, auth_url}, revision, since, last_used_at, rx_bytes, tx_bytes}` (any member) |
+| POST | `/networks/{id}/up` | Brings it up now and returns its state (Editor; audited `network.up`) |
+| POST | `/networks/{id}/down` | Takes it down (Editor; audited `network.down`) |
+| GET | `/networks/{id}/peers` | Devices of the network `[{name, dns_name, addresses, os, online, last_seen}]` to import as hosts (Editor) |
+
+### Relay
+
+`GET /hosts/{id}/relay` with a WebSocket upgrade (`Authorization` or
+`?access_token=`). It is by host, not by address: the server dials the
+host's first hop as its vault defines it, so nobody reaches other addresses
+of a network, and Use-only members only reach the hosts an Editor added.
+
+- Access: Editors; Use-only members unless the vault is Strict
+  (`use_only_strict`), like `/credentials`.
+- Everything is checked and dialed **before** the upgrade, so failures are
+  normal JSON errors: `network_unavailable`, `network_not_found`,
+  `network_dial_failed`, `not_in_network`, `relay_limit`, `not_found`.
+- Then binary frames carry the bytes both ways (text frames are ignored).
+  The server pings every 30 s; it closes with `1000` when the host closes
+  (`host_closed`) or after `[networks] relay_idle_minutes` without bytes
+  (`idle`), and with `4007` (`signed_out`) when the device is signed out.
+- Audited in the vault as `relay.open` (network, address, port, device) and
+  `relay.close` (also `bytes_up`, `bytes_down`, `duration_ms`, `reason`).
+- At most `[networks] max_relays_per_user` open per user (default 16).
 
 ## SFTP
 

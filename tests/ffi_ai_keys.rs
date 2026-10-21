@@ -76,6 +76,10 @@ fn own_ai_keys() {
         host_ids: Vec::new(),
         session_id: None,
         effort: None,
+        plan_first: false,
+        group_id: None,
+        tag: None,
+        fan_out: false,
     };
     assert!(matches!(
         block_on(core.create_ai_task(task)),

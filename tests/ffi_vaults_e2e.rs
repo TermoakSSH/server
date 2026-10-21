@@ -281,7 +281,7 @@ fn vaults_from_mobile() {
         }
     }
     assert!(matches!(
-        block_on(bea.connect(web.id.clone(), Arc::new(NoAuth), None)),
+        block_on(bea.connect(web.id.clone(), Arc::new(NoAuth), None, None)),
         Err(TermoakError::UseOnlyStrict(_))
     ));
 

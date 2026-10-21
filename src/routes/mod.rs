@@ -3,6 +3,7 @@
 pub mod ai;
 pub mod entities;
 pub mod events;
+pub mod networks;
 pub mod sessions;
 pub mod sftp;
 pub mod teams;
@@ -49,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .merge(events::routes())
         .merge(teams::routes())
         .merge(vaults::routes())
+        .merge(networks::routes())
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .merge(uploads)
         .merge(crate::updates::routes())
