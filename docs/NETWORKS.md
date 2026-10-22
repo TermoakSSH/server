@@ -2,8 +2,9 @@
 
 Status: **phase 0 done** (core + server groundwork, 2026-10-21); **phase 1a
 done** (2026-10-21): `termoak-netd` with WireGuard (`server/netd/`, Go), the
-server's WireGuard keys, netd following the vaults, QA. Next: the UI in the
-apps and the web (phase 1b), then Tailscale/Headscale (phase 2).
+server's WireGuard keys, netd following the vaults, QA; **phase 1b, part 1
+done** (2026-10-22): the UI in the web and the desktop app (§8.1). Next: the
+UI in Android and iOS, then Tailscale/Headscale (phase 2).
 
 This document is the design, the **server ↔ `termoak-netd` protocol**, the
 security model and the compatibility notes. Plan: `PLAN-0.7.md` §1. A copy
@@ -496,6 +497,100 @@ Nothing is required to compile, except:
   (AccountDeletion on Android and iOS) with `apiError`.
 - Show networks only when the account's `features.networks` is true.
 
+### 8.1 The UI in the apps (phase 1b)
+
+Done in the web (`web/site/js/pages/app/networks.js`) and the desktop
+(`src/networks.rs`, `src/views/networks.rs`); Android and iOS follow the
+same rules.
+
+- **Features can be stale:** re-read `/info` when an account starts and
+  when the Networks screen opens (the desktop does both).
+- **Connecting from the device:** `Workspace::connect_item` and
+  `open_telnet_item` already use the relay; any other path that runs the SSH
+  engine itself (the desktop's local AI) needs
+  `Workspace::network_dialer(scope, &resolved)`. Relay failures arrive as
+  `SshError::Network { code }` (FFI: `NetworkUnavailable` + `apiError`):
+  map the code to a text. Local reachability probes skip network hosts.
+- **Proxy:** with a network the proxy is ignored; the editors say so.
+
+- **Where.** Account → Networks, only when the account's server has
+  `features.networks` (never for This device). Host and group editors: a
+  "Network" picker. Where host status or latency is shown and in the
+  terminal bar: "via Office · 23 ms". The vault page of the web also lists
+  groups so their network can be chosen there.
+- **List.** `GET /networks` (every vault you can see; `vault_id`,
+  `has_secret`, `secret_hidden`, `wireguard.public_key`). State from
+  `GET /networks/{id}/status` per network (it never brings it up): `up` with
+  `last_handshake_at` = "Connected"; `up` without a handshake (WireGuard) =
+  "Waiting for the peer" (check the endpoint and that the peer has the
+  server's key); `starting`, `needs_auth`, `error` (+ `message`), `down` =
+  "comes up when a host needs it". A status that fails (netd down) = state
+  unknown, not an error page.
+- **Test** = `POST /networks/{id}/up`, then poll `status` about once a second
+  for a few seconds until `last_handshake_at` appears (wireguard-go only
+  handshakes when there is traffic or a `persistent_keepalive`: the form
+  suggests 25). Editors only; Use-only members see the list and the state.
+- **Add / edit (WireGuard).** Two ways:
+  1. **Paste or open a `.conf`** (wg-quick): `[Interface]` `Address`
+     (repeatable, comma lists), `DNS` (IPs and search domains), `MTU`,
+     `PrivateKey`; each `[Peer]` `PublicKey`, `Endpoint` (`host:port`,
+     `[v6]:port`), `AllowedIPs` (repeatable), `PersistentKeepalive` (`off` =
+     none), `PresharedKey`. `#` starts a comment; keys are case-insensitive;
+     the value is everything after the first `=` (base64 keys end in `=`).
+     Other keys (`ListenPort`, `PostUp`, `Table`...) are ignored and listed.
+     Termoak keeps **one** preshared key for the network (applied to every
+     peer): different ones per peer are an error. The parsed values fill
+     the form; the secret is `{private_key, preshared_key?}`.
+  2. **Generate a key on the server**: create the network without a private
+     key (secret only with a preshared key, if any), then
+     `POST /networks/{id}/wireguard/key` (`{replace: true}` when it has one:
+     otherwise `409 key_exists`). The server keeps the private key (and an
+     existing preshared key) and answers `{public_key, network}`: show it
+     with a copy button and a `[Peer]` block for the other side
+     (`PublicKey = …`, `AllowedIPs = <the network's addresses>`).
+  Validation before saving: addresses required; keys are 32 bytes of base64
+  (`^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$`); each peer needs a public key
+  and allowed IPs; at least one peer needs an endpoint (the server is the
+  side that connects). Editing: "keep the key" (no `secret` in the PUT),
+  "paste a new one" (the `secret` object replaces both keys) or "generate a
+  new one". The private key is **never shown again** (the web never reveals
+  secrets; apps follow their reveal rules for `/networks/{id}/secret`).
+  Send the whole network object as read on PUT. Tailscale and ZeroTier:
+  shown as "coming soon", never created.
+- **Plan.** `GET /me/plan` → `usage.networks` of `plan.limits.max_networks`
+  (it counts the networks billed to you: your vaults and the team vaults
+  of teams you own). Creating over it: `403 plan_limit` with `limit:
+  "max_networks"`, `max`.
+- **Picker.** Options: the inherited value for `null` ("Same as group
+  “Servers” (via Office)", walking `group_id` / `parent_id` for the nearest
+  group with `settings.network_id`; else "Direct"), then the networks **of
+  the same vault**; a `network_id` that is not there = "Missing network"
+  (`network_not_found` when connecting). Show the chosen network's state
+  next to it. Save with the whole host or group (`settings.network_id`,
+  `null` = inherit/direct). Hosts on This device have no picker.
+- **Host test.** `POST /hosts/{id}/test` → `network: {id, name, kind}` and
+  `latency_ms` measured through it: "via Office · 23 ms". Failures are
+  `ok: false` with `error_code` (`host_key_unknown` → offer "trust and test"
+  with `?trust=true`, `host_key_changed`, `auth_failed`, `timeout`,
+  `network_unavailable`, `network_dial_failed`, `network_not_found`,
+  `telnet_not_supported`, `connect_failed`).
+- **Import hosts.** `GET /networks/{id}/peers` (Editor; it brings the
+  network up). WireGuard answers its configured peers: `name` = endpoint,
+  `addresses` = allowed IPs. A single address (`/32`, `/128`) → "Add host
+  10.9.0.1"; a subnet → "Add a host in 10.9.0.0/24" with the address typed.
+  `POST /hosts {label, address, settings: {port, username, network_id},
+  vault_id: <the network's vault>}`.
+- **Errors** (structured, `apiError` in the FFI, `ApiError.data.error` in
+  the web): `network_unavailable` (netd missing; `netd_code:
+  unsupported_kind` = this server cannot join that kind),
+  `network_not_found`, `network_dial_failed` with `netd_code`
+  (`dial_failed`, `timeout`, `needs_auth`, `network_error`, `limit`,
+  `invalid`), `plan_limit` (`max_networks`), `key_exists`, `not_wireguard`,
+  `relay_limit` (`max`), `cross_vault_reference`.
+- **Audit** (vault activity): `network.up`, `network.down`,
+  `network.key_generated` (`replaced`), `relay.open` / `relay.close`
+  (target `host:<id>`, `network`, bytes).
+
 ## 9. Tests
 
 - Core: `store::vault_tests::{networks_*, old_cores_editing_a_host_keep_its_network,
@@ -532,7 +627,10 @@ Nothing is required to compile, except:
   session, SFTP of 50 MB with OpenSSH over the relay (checksums, audit
   bytes), never dialing directly, isolation between two users (and two
   networks with the same addresses), idle shutdown and coming back,
-  netd stopped → `network_unavailable` and `features.networks` false.
+  netd stopped → `network_unavailable` and `features.networks` false;
+  the web (phase 1b): Account → Networks with a `.conf` and a generated
+  key (handshake through Test), peers → a host, the vault page's picker
+  and host test, deleting, and the tab hidden without netd.
 
 ## 10. Phase 1
 
@@ -548,16 +646,13 @@ Done in phase 1a (2026-10-21):
    key in network views; the host test's network and latency.
 3. Core 0.7.0-next.2: transfers to This device detach `network_id`.
 
-Left for phase 1b (UI) and later:
+Done in phase 1b, part 1 (2026-10-22): the web and the desktop (§8.1).
 
-1. Apps and web: Account → Networks (add with a pasted `.conf` or a
-   generated key, the server's public key to copy, test with `up` and the
-   handshake, state), the "Network" picker in host and group editors, "via
-   <network> · 23 ms" in the terminal bar (host test), import hosts from
-   `peers`; hide everything without `features.networks`.
-2. Desktop: adopt core 0.7 (see §8).
-3. Relay/session metrics per network in the server (netd has them per
+Left for phase 1b, part 2, and later:
+
+1. Android and iOS: the same UI (§8.1) on core v0.7.0-next.2.
+2. Relay/session metrics per network in the server (netd has them per
    network already).
-4. Phase 2: Tailscale/Headscale (`tsnet` backend behind a build tag,
+3. Phase 2: Tailscale/Headscale (`tsnet` backend behind a build tag,
    `needs_auth` with the login URL, state directory per network, MagicDNS,
    `peers` for import), Headscale in Docker for QA.
