@@ -6,8 +6,10 @@ server's WireGuard keys, netd following the vaults, QA; **phase 1b, part 1
 done** (2026-10-22): the UI in the web and the desktop app (§8.1); **phase
 1b, part 2 done** (2026-10-22): the UI in Android and iOS; **phase 2a
 done** (2026-10-22): Tailscale/Headscale in `termoak-netd` (tsnet, §6.6),
-the server and QA (Headscale in Docker). Next: phase 2b, the Tailscale UI
-in the apps (§8.1, "Tailscale/Headscale").
+the server and QA (Headscale in Docker); **phase 2b, part 1 done**
+(2026-10-22): the Tailscale UI in the web and the desktop app. Next: phase
+2b, part 2, the Tailscale UI in Android and iOS (§8.1,
+"Tailscale/Headscale").
 
 This document is the design, the **server ↔ `termoak-netd` protocol**, the
 security model and the compatibility notes. Plan: `PLAN-0.7.md` §1. A copy
@@ -763,10 +765,17 @@ iOS `fileImporter`) and read the errors' details with `apiError`
   `network.key_generated` (`replaced`), `relay.open` / `relay.close`
   (target `host:<id>`, `network`, bytes).
 
-#### Tailscale/Headscale (phase 2b: to do in the web, desktop, Android and iOS)
+#### Tailscale/Headscale (phase 2b: done in the web and the desktop; Android and iOS to do)
 
-The server side is done (phase 2a, §6.6); the apps still show Tailscale as
-"coming soon". What each app needs:
+The server side is done (phase 2a, §6.6). Done in the web
+(`web/site/js/pages/app/networks.js`: `networkKinds`, `tailscaleFields`,
+`tailscaleProblems`, the rows' `tailnetState` and login polling, the
+devices dialog) and the desktop (`src/networks.rs`: `kinds`,
+`tailscale_problem`, `tailnet_summary`, `NetPeer::imported_in`,
+`tailscale_error_text`, `api::SecretChange`; `src/views/networks.rs`: the
+form's Tailscale part, `watch_login`, the devices card;
+`tailnet_address_hint` in the host editor). Android and iOS still show
+Tailscale as "coming soon". What each app needs:
 
 - **When.** Offer Tailscale only when `/info` → `features.network_kinds`
   contains `"tailscale"` (re-read `/info` as for `features.networks`). A
@@ -792,7 +801,8 @@ The server side is done (phase 2a, §6.6); the apps still show Tailscale as
     create --user <id> --reusable --ephemeral --tags tag:termoak`. Without a
     key you log the server in from a link." Never shown again after saving;
     editing: "keep the key" (no `secret` in the PUT), "new key"
-    (`secret: {auth_key}`), "remove the key" (`secret: {}`).
+    (`secret: {auth_key}`), "remove the key" (`secret: null`; `{}` would
+    store an empty secret and `has_secret` would stay true).
   - Advanced: Hostname (placeholder "automatic: termoak-xxxxxxxx", the last
     8 hex digits of the id once it exists); Tags (list, empty by default;
     hint: "Empty = the key's tags. Headscale only accepts the key's tags.");
@@ -816,7 +826,9 @@ The server side is done (phase 2a, §6.6); the apps still show Tailscale as
     page" / "Abrir la página de inicio de sesión" ("Sign in to the tailnet
     there; with Headscale an admin approves it with `headscale auth
     register`."), then poll `status` every 2 s until `up` (stop after a few
-    minutes or when the screen closes). Use-only members (no `auth_url`):
+    minutes or when the screen closes; if the network goes idle meanwhile,
+    `down`, stop too: Test brings it up already logged in, a persistent
+    node keeps its state). Use-only members (no `auth_url`):
     "Waiting for an Editor to log the server in" / "Esperando a que un
     editor inicie la sesión del servidor".
   - `needs_auth` + `auth: "approval"`: "Waiting for approval: approve
@@ -918,6 +930,13 @@ The server side is done (phase 2a, §6.6); the apps still show Tailscale as
   key; bad settings → 400; idle, `down`, a netd restart and deleting never
   leave nodes in Headscale.
 
+- Apps (phase 2b, Tailscale): the desktop's `networks::tests`
+  (`tailscale_*`, `tailnet_devices_become_hosts`,
+  `removing_the_auth_key_sends_null`); QA `./run.sh tailscale` has a web
+  test (Account → Networks with Headscale: the form's checks, a key →
+  connected, devices → a host by its MagicDNS name marked as added, the
+  host test through the tailnet, a login from the link polled until up, a
+  Use-only member waiting for an Editor).
 - Apps (phase 1b): the desktop's `networks::tests` (+ the opt-in
   `live_relay_through_a_wireguard_network`); Android's `NetworksTest`
   (`.conf`, states, peers, inheritance and picker, error texts, REST calls),
@@ -951,9 +970,12 @@ v0.7.0-next.3 (`ephemeral`, validation), server 0.7.0-next.3
 (`network_kinds`, the Tailscale status and peers, `forget`), QA with
 Headscale; deployed on next.termoak.com.
 
+Done in phase 2b, part 1 (2026-10-22): the Tailscale/Headscale UI in the
+web and the desktop (§8.1), the desktop on core v0.7.0-next.3.
+
 Left for later:
 
-1. Phase 2b: the Tailscale UI in the web, desktop, Android and iOS (§8.1,
+1. Phase 2b, part 2: the Tailscale UI in Android and iOS (§8.1,
    "Tailscale/Headscale").
 2. Relay/session metrics per network in the server (netd has them per
    network already).
