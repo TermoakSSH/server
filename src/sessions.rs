@@ -1241,6 +1241,10 @@ impl SessionManager {
             .set_session_status(live.id, SessionStatus::Running, None)
             .await?;
 
+        // Ends the SSH connection with the shell (the closed session stays
+        // listed for a while; its TCP connection, maybe through a private
+        // network that should go idle, must not).
+        let ended = conn.clone();
         // Detect the host's OS if unknown (saved only by Editors: it is
         // just metadata).
         let store = self.store.clone();
@@ -1285,6 +1289,7 @@ impl SessionManager {
                         let s = status.borrow().clone();
                         if let TermStatus::Closed { exit_code, reason } = s {
                             mgr.finish(&session, SessionStatus::Closed, exit_code, reason).await;
+                            ended.disconnect().await;
                             break;
                         }
                     }

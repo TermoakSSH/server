@@ -436,6 +436,8 @@ impl Holder {
             }
         });
 
+        // The SSH connection ends with the shell.
+        let ended = conn.clone();
         if o.detect_os {
             let holder = self.clone();
             let id = held.id;
@@ -459,6 +461,7 @@ impl Holder {
             if let TermStatus::Closed { exit_code, reason } = now {
                 // Grace period so the last output arrives before the close.
                 tokio::time::sleep(Duration::from_millis(300)).await;
+                ended.disconnect().await;
                 self.sessions.lock().remove(&held.id);
                 let closed = HeldStatus::Closed {
                     exit_code,
