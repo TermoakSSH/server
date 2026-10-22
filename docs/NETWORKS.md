@@ -765,7 +765,7 @@ iOS `fileImporter`) and read the errors' details with `apiError`
   `network.key_generated` (`replaced`), `relay.open` / `relay.close`
   (target `host:<id>`, `network`, bytes).
 
-#### Tailscale/Headscale (phase 2b: done in the web and the desktop; Android and iOS to do)
+#### Tailscale/Headscale (phase 2b: done in the web, the desktop, Android and iOS)
 
 The server side is done (phase 2a, §6.6). Done in the web
 (`web/site/js/pages/app/networks.js`: `networkKinds`, `tailscaleFields`,
@@ -774,8 +774,13 @@ devices dialog) and the desktop (`src/networks.rs`: `kinds`,
 `tailscale_problem`, `tailnet_summary`, `NetPeer::imported_in`,
 `tailscale_error_text`, `api::SecretChange`; `src/views/networks.rs`: the
 form's Tailscale part, `watch_login`, the devices card;
-`tailnet_address_hint` in the host editor). Android and iOS still show
-Tailscale as "coming soon". What each app needs:
+`tailnet_address_hint` in the host editor), Android (`data/Networks.kt`:
+`kinds`, `tailscaleProblem`, `tailscaleBody` with `SecretChange`,
+`importedHost`, `tailscaleErrorText`, `tailscaleMessageText`;
+`NetworksApi.watchLogin`; `ui/NetworksScreen.kt`: the form's Tailscale
+part, `TailnetState`, `TailnetDevices`) and iOS (`Model/Networks.swift`:
+the same names and `TailnetMessage`; `NetworksAPI.watchLogin`;
+`Views/NetworksView.swift`). What each app needs:
 
 - **When.** Offer Tailscale only when `/info` → `features.network_kinds`
   contains `"tailscale"` (re-read `/info` as for `features.networks`). A
@@ -860,6 +865,15 @@ Tailscale as "coming soon". What each app needs:
   route can be reached; "there is no device named …": the ACLs may hide
   it); `timeout` → "still connecting to the tailnet, try again";
   `limit` → "the server runs too many Tailscale networks right now".
+  Host tests (`error_code: network_dial_failed`, `network.kind`) and
+  connections through the relay (the engine keeps the server's message,
+  status 0, no details) only carry netd's English message: map it by its
+  words ("waits for authorization", "is still starting", "could not start",
+  "outside the tailnet" / "no device named") and strip `the network "X"
+  could not start: `. The approval message also says "logged in" ("the node
+  is logged in but must be approved"): look for "approv" to tell it from a
+  login. "is still starting" is any kind's: say "the tailnet" only when the
+  network is known to be one.
   `network_unavailable` with `netd_code: unsupported_kind` → "this server
   cannot join Tailscale networks". Saving: `400` with the reason.
 - **Delete.** As WireGuard; the server makes netd log the node out (a
