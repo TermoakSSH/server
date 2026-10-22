@@ -4,8 +4,10 @@ Status: **phase 0 done** (core + server groundwork, 2026-10-21); **phase 1a
 done** (2026-10-21): `termoak-netd` with WireGuard (`server/netd/`, Go), the
 server's WireGuard keys, netd following the vaults, QA; **phase 1b, part 1
 done** (2026-10-22): the UI in the web and the desktop app (§8.1); **phase
-1b, part 2 done** (2026-10-22): the UI in Android and iOS. Next:
-Tailscale/Headscale (phase 2).
+1b, part 2 done** (2026-10-22): the UI in Android and iOS; **phase 2a
+done** (2026-10-22): Tailscale/Headscale in `termoak-netd` (tsnet, §6.6),
+the server and QA (Headscale in Docker). Next: phase 2b, the Tailscale UI
+in the apps (§8.1, "Tailscale/Headscale").
 
 This document is the design, the **server ↔ `termoak-netd` protocol**, the
 security model and the compatibility notes. Plan: `PLAN-0.7.md` §1. A copy
@@ -66,7 +68,7 @@ lives in the server repository (`docs/NETWORKS.md`); keep both equal.
                "allowed_ips": ["10.9.0.0/24"], "persistent_keepalive": 25}],
     "public_key": "…"
   },
-  "tailscale": {"control_url": null, "hostname": null, "tags": ["tag:termoak"]},
+  "tailscale": {"control_url": null, "hostname": null, "tags": [], "ephemeral": null},
   "zerotier": {"network_id": "8056c2e21c000001", "central_url": null}
 }
 ```
@@ -83,7 +85,14 @@ lives in the server repository (`docs/NETWORKS.md`); keep both equal.
 - Networks live in **account vaults** only (never on "This device":
   `save_network` refuses). Team vault networks are shared by the team.
 - Validation: name required (≤ 100 chars), WireGuard peers need a public
-  key, Tailscale `control_url` must be http(s), ZeroTier id is 16 hex.
+  key, ZeroTier id is 16 hex. Tailscale (core 0.7.0-next.3): `control_url`
+  http(s) with a host and no user, query or fragment (`null`: Tailscale's);
+  `hostname` a DNS label (letters, digits, `-`, ≤ 63; default
+  `termoak-<last 8 hex digits of the id>`); `tags` `tag:name` (≤ 20;
+  empty = the auth key's tags); `ephemeral` `null` = yes with an auth key,
+  no without one; the secret's `auth_key` printable ASCII without spaces
+  (≤ 1024), never echoed in errors (`Entity::validate_secret`, on saves and
+  pushed sync records: REST `400`, sync rejected `invalid`).
 
 ### `HostSettings.network_id: Option<Uuid>`
 
@@ -133,7 +142,9 @@ clients must not lose what they do not know.
    `null` clears it. Tested in core (`old_cores_editing_a_host_keep_its_network`)
    and the server (`networks_sync_only_to_clients_that_know_them_and_old_apps_keep_them`).
    `protocol`/`icon` cannot be protected this way (they are omitted when
-   default), `network_id` is never omitted.
+   default), `network_id` is never omitted. The same holds for
+   `tailscale.ephemeral` of networks (cores before 0.7.0-next.3 drop it;
+   0.7.0-next.3 always writes it, `null` when unset).
 3. Old apps connecting **from the device** to a host with a network do not
    know it and connect directly (as before; usually unreachable). Their
    server sessions go through the network (the server decides).
@@ -155,7 +166,10 @@ dial_timeout_secs = 20
 ```
 
 - `GET /info` → `features.networks`: configured **and** netd answered the
-  last `hello` (checked at start and every 30 s, and by every request).
+  last `hello` (checked at start and every 30 s, and by every request);
+  `features.network_kinds`: the kinds of that `hello` (`["wireguard"]`, or
+  `["wireguard", "tailscale"]` with the Tailscale build; `[]` without
+  netd). Apps offer a kind only when it is listed.
 - `limits.max_networks` per plan (default 10; admins unlimited). Billing
   user of a vault: its owner; for a team vault, the team's first owner (by
   date). Checked on `POST /networks`, on sync v2 pushes of new networks
@@ -173,13 +187,19 @@ dial_timeout_secs = 20
   stored one and sends `down` when they differ; deleting a network, its
   vault, its team or the account sends `down` too. A rename keeps the node
   (the revision covers the kind, the configuration without `public_key`,
-  and the secret). Whatever is missed goes down when idle.
+  and the secret). Whatever is missed goes down when idle. A deleted
+  network gets `down` with `forget` whether it runs or not (netd removes
+  what it keeps of it: a persistent Tailscale node logs out and its state
+  is deleted).
+- **Status for members:** `GET /networks/{id}/status` is for any member,
+  but `node.auth_url` (a Tailscale login URL: whoever opens it decides which
+  tailnet the server's node joins) only for Editors.
 - **Host test** (`POST /hosts/{id}/test`) dials through the network and
   answers `network: {id, name, kind}` with `latency_ms` measured through
   it (the "via Office · 23 ms" of the apps).
 - Errors: `network_unavailable` 503, `network_not_found` 404,
-  `network_dial_failed` 502 (`netd_code`), `not_in_network` 422,
-  `relay_limit` 429.
+  `network_dial_failed` 502 (`netd_code`; with `needs_auth` also `auth`:
+  `login` or `approval`), `not_in_network` 422, `relay_limit` 429.
 
 ### Relay (`GET /api/v1/hosts/{id}/relay`, WebSocket)
 
@@ -232,7 +252,7 @@ Simple to implement in Go with `net.Listen("unix", …)`, `bufio.Reader` and
 |---|---|---|
 | `invalid` | malformed request | 502 `network_dial_failed` |
 | `unsupported_kind` | this build cannot join the kind (e.g. no ZeroTier) | 503 `network_unavailable` |
-| `needs_auth` | the node waits for authorization (Tailscale login URL, ZeroTier member not authorized) | 502 `network_dial_failed` |
+| `needs_auth` | the node waits for authorization (Tailscale login URL, ZeroTier member not authorized); the line has `auth`: `login` or `approval` | 502 `network_dial_failed` (+ `auth`) |
 | `network_error` | the network could not start (bad key, control server down…) | 502 `network_dial_failed` |
 | `dial_failed` | connection refused / unreachable inside the network | 502 `network_dial_failed` |
 | `timeout` | `timeout_ms` passed | 502 `network_dial_failed` |
@@ -260,8 +280,11 @@ database (it may cache running nodes by id):
 
 - If a node for `id` runs with another `revision`, netd restarts it with
   the new spec.
-- Tailscale defaults: hostname `termoak-<first 8 of id>`, tags
-  `["tag:termoak"]`, ephemeral node; state directory per network id.
+- Tailscale defaults: hostname `termoak-<last 8 hex digits of the id>`
+  (UUIDv7 ids start with a timestamp: networks created together share
+  their first digits), no advertised tags (the auth key's apply;
+  `tag:termoak` with an OAuth client secret), ephemeral with an auth key
+  and persistent without one (§6.6).
 - `secret` must never be logged.
 
 ### 6.1 `hello`
@@ -271,9 +294,11 @@ database (it may cache running nodes by id):
 ← {"ok": true, "v": 1, "version": "0.1.0", "kinds": ["wireguard", "tailscale", "zerotier"]}
 ```
 
-`kinds`: what this build can join (`["wireguard"]` since phase 1a;
-Tailscale and ZeroTier answer `unsupported_kind` until their backends are
-built in). Used as the health check (every 30 s).
+`kinds`: what this build can join (`["wireguard"]` without the
+`tailscale` build tag, `["tailscale", "wireguard"]` with it; ZeroTier
+answers `unsupported_kind` until its backend is built in). Used as the
+health check (every 30 s); the server passes it on as
+`features.network_kinds`.
 
 ### 6.2 `up` / `down` / `status`
 
@@ -281,7 +306,7 @@ built in). Used as the health check (every 30 s).
 → {"v": 1, "op": "up", "network": NetworkSpec}
 ← {"ok": true, "status": Status}
 
-→ {"v": 1, "op": "down", "network_id": "…"}
+→ {"v": 1, "op": "down", "network_id": "…", "forget": false}
 ← {"ok": true}                      // also when it was not up
 
 → {"v": 1, "op": "status", "network_id": "…"}
@@ -301,9 +326,26 @@ Status = {
   "rx_bytes": 0, "tx_bytes": 0,         // the tunnel's bytes
   "last_handshake_at": 1760000000000,   // WireGuard; absent: never
   "streams": 0,                         // connections open now
-  "dials": 0, "dials_failed": 0         // since it came up
+  "dials": 0, "dials_failed": 0,        // since it came up
+  // Tailscale only (absent for WireGuard):
+  "auth": "login" | "approval",         // with needs_auth: open node.auth_url / approve the device
+  "control_url": "https://controlplane.tailscale.com",
+  "tailnet": "example.com", "magic_dns_suffix": "tail1234.ts.net",
+  "peer_count": 3,                      // when up
+  "ephemeral": true,
+  "last_error": "…"                     // the latest error (refused key…), also while retrying
 }
 ```
+
+`node` of a Tailscale network: `name` (its hostname), `addresses` (100.x
+and fd7a:…), `node_id` (stable id), `dns_name` (MagicDNS name) and
+`auth_url` while it waits for a login. `rx_bytes`/`tx_bytes` and
+`last_handshake_at` sum its peers.
+
+`down` with `"forget": true` (the server sends it when the network was
+deleted): besides stopping the node, netd removes what it keeps of the
+network, also when it is not running (a persistent Tailscale node logs out
+and its state directory is deleted). Older netd builds ignore the field.
 
 `up` may answer before the node is fully up (`starting`, `needs_auth`).
 A start that failed (bad key, unresolvable endpoint…) is `error` with the
@@ -328,7 +370,11 @@ reason in `message`; the next `up`/`dial` retries it.
 Brings the network up if needed. WireGuard answers its configured peers
 (no discovery): `name` = endpoint (or the start of the key), `addresses` =
 allowed IPs, `public_key`, `endpoint`, and `online`/`last_seen` from the
-last handshake (online under 3 minutes). For "import hosts".
+last handshake (online under 3 minutes). Tailscale answers the devices the
+node sees (the tailnet's ACLs decide): `name` (hostname), `dns_name`
+(MagicDNS, without the final dot), `addresses` (100.x, fd7a:…), `os`,
+`online`, `last_seen`, `tags`, `routes` (subnets it routes; exit routes
+left out) and `id` (stable id). For "import hosts".
 
 ### 6.4 `dial`
 
@@ -339,8 +385,9 @@ last handshake (online under 3 minutes). For "import hosts".
 ```
 
 - netd brings the network up if needed (waiting up to `timeout_ms` for
-  `up`), resolves `host` **inside the network** (MagicDNS / the WireGuard
-  `dns`), and opens TCP to `host:port` through its user-space stack.
+  `up`; a Tailscale node that needs a login answers `needs_auth` at once),
+  resolves `host` **inside the network** (MagicDNS / the WireGuard `dns`),
+  and opens TCP to `host:port` through its user-space stack.
   `timeout_ms` is capped by `--max-dial-timeout` (default 20 s when
   missing).
 - After the `ok` line, netd copies bytes both ways until either side
@@ -370,12 +417,17 @@ no Go):
 ```
 netd/
   cmd/termoak-netd/     main: flags/env, socket, signals; `request` (send one line) and `version`
+  cmd/termoak-netd/tailscale.go   (build tag `tailscale`) registers the Tailscale backend
   cmd/termoak-wgpeer/   test tool, never shipped: a WireGuard peer in user space (QA)
+  cmd/termoak-tsnode/   test tool, never shipped (tag `tailscale`): a tsnet node forwarding ports (QA)
   internal/proto/       the protocol types and codes (Spec never prints its secret)
   internal/netd/        Manager (nodes, limits, idle reaper), Server (socket, SO_PEERCRED,
                         one request per connection, the byte pipe), Backend/Node interfaces
   internal/wg/          WireGuard: wireguard-go + gVisor netstack, one device and stack per network
   internal/wgtest/      a WireGuard "site" for tests (echo, forward, DNS in its netstack)
+  internal/ts/          Tailscale/Headscale: config.go, resolve.go, state.go (no tag: configuration,
+                        state mapping, MagicDNS resolution, state directory), node.go (tag
+                        `tailscale`: tsnet nodes)
 ```
 
 - **WireGuard** (`internal/wg`): `device.NewDevice(netstack.CreateNetTUN(…),
@@ -417,12 +469,122 @@ netd/
   `status`/`list`. Keys and secrets are never logged (`Spec` has a
   `LogValue` without them; wireguard-go only logs peers' short public keys).
 - **Kinds.** Backends register by kind (`netd.Register`). WireGuard is
-  always built in; Tailscale (`tsnet`, phase 2) and ZeroTier (libzt, phase
-  6) will be files behind build tags (`//go:build tailscale`) that register
-  theirs. Without them those kinds answer `unsupported_kind` (→ the
-  server's `network_unavailable`) and `hello` does not list them.
+  always built in; Tailscale (`tsnet`, phase 2a, §6.6) is behind the
+  `tailscale` build tag and ZeroTier (libzt, phase 6) will be too. Without
+  them those kinds answer `unsupported_kind` (→ the server's
+  `network_unavailable`) and `hello` does not list them.
 - **Shutdown** (SIGTERM/SIGINT): stops accepting, takes every network
   down, removes the socket.
+
+
+### 6.6 Tailscale / Headscale (phase 2a)
+
+`internal/ts`, compiled in with `go build -tags tailscale` (the "with
+networks" bundle, `Dockerfile.netd` and QA build it; `NETD_TAGS=""
+scripts/release-local.sh build server` or `--build-arg TAGS=` leave it
+out). It uses `tailscale.com/tsnet` (v1.104.2, BSD-3), Tailscale's own
+library: each network is a `tsnet.Server` with its own state, magicsock,
+WireGuard engine and gVisor netstack (`Tun` unset: user space, no TUN, no
+root). Binary: about 23 MB with Tailscale, 7 MB without.
+
+**Configuration** (`Network.tailscale` + secret):
+
+| field | default | notes |
+|---|---|---|
+| `control_url` | Tailscale's (`https://controlplane.tailscale.com`) | a Headscale URL (http or https) |
+| `hostname` | `termoak-<last 8 hex of the id>` | the node's name and MagicDNS label (the control server may add `-1` if taken) |
+| `tags` | none: the auth key's tags | Headscale (0.28+) **refuses advertised tags** when a node logs in with a pre-auth key (`requested tags [...] are invalid or not permitted`): the key's tags apply. On Tailscale, advertise tags only with an untagged key whose owner may assign them. A Tailscale OAuth client secret (`tskey-client-…`, which needs tags) gets `tag:termoak` |
+| `ephemeral` | yes with an auth key, no without one | see "State" |
+| secret `auth_key` | none: interactive login | a reusable pre-auth key, ideally ephemeral and tagged (Tailscale `tskey-auth-…`, Headscale `hskey-auth-…` from `headscale preauthkeys create --reusable --ephemeral --tags tag:termoak`), or a Tailscale OAuth client secret (`tskey-client-…[?ephemeral=…&preauthorized=…]`: tsnet creates a one-off key with it) |
+
+**State** (netd keeps no database; `--state-dir`, default systemd's
+`StateDirectory=termoak-netd`, else a directory in `$TMPDIR`):
+
+- **Ephemeral nodes** (the default with a key): the node's state lives in
+  memory (`mem.Store`); only tsnet's scratch files go to
+  `<state-dir>/tailscale/eph-<id>-<random>/`, removed when the node stops
+  (and leftovers of a crash when netd starts). Every stop (`down`, idle,
+  revision change, eviction, SIGTERM) **logs the node out first**, so
+  Tailscale and Headscale delete it at once (Headscale: "Deleting ephemeral
+  node during logout"); only a crash or SIGKILL leaves it until the control
+  server's inactivity timeout (Headscale `node.ephemeral.inactivity_timeout`,
+  30 min by default). Each start registers a new node with the auth key: a
+  new 100.x address for the server (the hosts it dials do not change), so
+  the key must be **reusable**. No key ever touches the disk.
+- **Persistent nodes** (`ephemeral: false`, the default without a key: a
+  login done by hand must survive restarts): tsnet's state (node and
+  machine keys, 0600) in `<state-dir>/tailscale/<id>/` with `termoak.json`
+  (its control URL). Stops do not log out: the node stays in the tailnet
+  (offline) and keeps its name and address. A changed control URL, or a
+  network turned ephemeral, logs the old node out and starts afresh. `down`
+  with `forget` (the network was deleted) logs it out and removes the
+  directory, running or not (Headscale then shows it expired). Trade-off:
+  keys on disk and a node listed while netd is down, against no re-login.
+- netd never runs two nodes of the same network at once (a restart waits
+  for the old one to close).
+
+**Auth flow** (never blocks a request): `Start` only creates the node; a
+watcher follows tailscaled's IPN bus. netd's states:
+
+| tailscaled | netd `state` | `auth` | notes |
+|---|---|---|---|
+| NoState, Starting, NeedsLogin while the key is used | `starting` | | `up` waits up to 10 s (start timeout) for it to settle; dials wait up to their timeout |
+| Running | `up` | | |
+| NeedsLogin with a login URL | `needs_auth` | `login` | `node.auth_url` (Tailscale login, Headscale `/register/<id>`); no key, or the key was not enough |
+| NeedsMachineAuth | `needs_auth` | `approval` | approve the device in the admin console |
+| an error while not running | `error` | | `message`: "the control server refused the auth key: …" for key errors, a hint for refused tags; `last_error` keeps the raw one; tsnet retries with a backoff (it can still come up) until the network goes idle |
+
+A dial or `peers` on a `needs_auth` node fails at once with `needs_auth`
+(+ `auth`), on an `error` node with `network_error`, on a node still
+starting with `timeout`. Status reads come from the node's local API
+(in memory). tsnet's log uploads to log.tailscale.com are **disabled**
+(`logtail.Disable`, `TS_NO_LOGS_NO_SUPPORT`); its own logs only at debug
+level with `TERMOAK_NETD_TAILSCALE_VERBOSE=1`. The auth key is never
+logged.
+
+**Dials** stay in the tailnet: `tsnet.Server.Dial` would use the **host's
+network** for an address outside the tailnet, so netd never calls it.
+Instead it resolves `host` itself and dials through the node's own netstack
+(`netstack.Impl.DialContextTCPWithBind` from the node's 100.x address):
+
+- an IP is used as is; a name is looked up as a MagicDNS name in the
+  node's network map (`nas`, `nas.tail1234.ts.net`, a unique short name of
+  a shared device) and the tailnet's extra DNS records; any other name with
+  the system resolver;
+- only addresses of the peers (their Tailscale IPs) or inside the subnets
+  they route (subnet routers) are dialed; `/0` routes (exit nodes) never
+  count, so the internet, 127.0.0.1 or the server's LAN fail at once with
+  `dial_failed` ("outside the tailnet"); netd never selects an exit node;
+- what a node may reach is decided by the tailnet's ACLs (a device the
+  ACLs hide is not a peer: "there is no device named …").
+
+**Limits and memory.** `--max-tailscale` (`TERMOAK_NETD_MAX_TAILSCALE`,
+default 16) Tailscale nodes up at once, on top of `--max-networks`: when
+full, the least recently used Tailscale network without connections makes
+room, else `limit`. Measured (Headscale on the same host, 1–2 devices per
+tailnet): netd with Tailscale idles at ~18 MiB RSS (7 MiB without); each
+tsnet node adds **2–3 MiB** (5 nodes: 31 MiB; 12 nodes: ~38 MiB), and 12
+nodes each moving 16 MiB at once peaked at ~60 MiB. Big tailnets cost more
+(the network map grows with the devices). The unit keeps `MemoryMax=512M`
+and adds `GOMEMLIMIT=384MiB` so the Go GC works harder before the cap.
+Joining takes 3–5 s (registration and the first network map).
+
+**Network access.** HTTPS (or HTTP for a Headscale behind plain HTTP) to
+the control server and DERP relays, UDP for STUN (3478) and peer-to-peer
+WireGuard; nothing listens. In the systemd unit: `AF_INET`, `AF_INET6`,
+`AF_NETLINK` (tsnet watches the interfaces), `AF_UNIX`.
+
+**Tests.** `go test -tags tailscale ./internal/ts/` runs the nodes against
+Tailscale's in-process test control server (`tstest/integration/testcontrol`
+with its own DERP and STUN on 127.0.0.1): up with MagicDNS, peers, dials by
+short name, FQDN and IP (256 KiB echoed), nothing outside the tailnet
+(127.0.0.1, 8.8.8.8, `localhost`, unknown names), the manager (up settles,
+status fields, `--max-tailscale` eviction and `limit`), needs a login (the
+URL, `needs_auth`/`login` on dial, then up after the login), needs approval,
+a refused key (never echoed), persistent nodes (same node after a restart,
+`Forget`, `CloseAndForget`). Without the tag: configuration, state mapping,
+MagicDNS resolution and the state directory. QA (`./run.sh tailscale`):
+Headscale in Docker (§9).
 
 ## 7. Security model
 
@@ -453,7 +615,8 @@ netd/
   probes skip those hosts (`Skip::Network`).
 - Sync v2 sends `kinds`; one full re-download after upgrading.
 - FFI: `PrivateNetwork` (+ `WireguardSettings`, `WireguardPeer`,
-  `TailscaleSettings`, `ZerotierSettings`, `NetworkSecrets`),
+  `TailscaleSettings` (`ephemeral` since 0.7.0-next.3), `ZerotierSettings`,
+  `NetworkSecrets`),
   `list_networks`, `get_network`, `save_network(network, secrets?)`,
   `network_secrets`, `delete_network`; `HostSettings.network_id`;
   `TermoakError.NetworkUnavailable`; `ProbeSkip.Network`.
@@ -600,6 +763,98 @@ iOS `fileImporter`) and read the errors' details with `apiError`
   `network.key_generated` (`replaced`), `relay.open` / `relay.close`
   (target `host:<id>`, `network`, bytes).
 
+#### Tailscale/Headscale (phase 2b: to do in the web, desktop, Android and iOS)
+
+The server side is done (phase 2a, §6.6); the apps still show Tailscale as
+"coming soon". What each app needs:
+
+- **When.** Offer Tailscale only when `/info` → `features.network_kinds`
+  contains `"tailscale"` (re-read `/info` as for `features.networks`). A
+  server without the field (0.7.0-next.2) means `["wireguard"]`. Without
+  it, keep "coming soon" (a Tailscale network synced from elsewhere is
+  listed with "this server cannot join Tailscale networks").
+- **Core.** Bump to core v0.7.0-next.3: `TailscaleSettings {control_url,
+  hostname, tags, ephemeral}` and `NetworkSecrets.auth_key`;
+  `save_network` validates (control URL, hostname, tags, key shape:
+  `TermoakError.Invalid`). The web mirrors the rules (§3): control URL
+  `^https?://` with a host and no `user@`, `?` or `#`; hostname
+  `^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`; tags
+  `^tag:[A-Za-z0-9][A-Za-z0-9_-]{0,62}$`, at most 20; key printable ASCII
+  without spaces. The server answers `400` with the reason otherwise.
+- **Add / edit form** (kind Tailscale):
+  - Name.
+  - Control server: **Tailscale** (default, `control_url: null`) or
+    **Headscale** (URL field, `control_url`).
+  - Auth key (password field, secret `auth_key`, optional). Hint: "A
+    reusable, ephemeral key, tagged (e.g. tag:termoak). Tailscale: Admin
+    console → Settings → Keys (Reusable, Ephemeral, Tags); an OAuth client
+    secret (tskey-client-…) works too. Headscale: `headscale preauthkeys
+    create --user <id> --reusable --ephemeral --tags tag:termoak`. Without a
+    key you log the server in from a link." Never shown again after saving;
+    editing: "keep the key" (no `secret` in the PUT), "new key"
+    (`secret: {auth_key}`), "remove the key" (`secret: {}`).
+  - Advanced: Hostname (placeholder "automatic: termoak-xxxxxxxx", the last
+    8 hex digits of the id once it exists); Tags (list, empty by default;
+    hint: "Empty = the key's tags. Headscale only accepts the key's tags.");
+    "Remove the server's node from the tailnet when it stops (ephemeral)":
+    send `ephemeral: null` unless the user changes it (default on with a
+    key, off without one: say so next to the switch). Send the whole
+    network object as read on PUT (`ephemeral` included).
+- **List and detail.** `GET /networks/{id}/status` as for WireGuard, but a
+  Tailscale network has no public key or handshake: `up` is "Connected"
+  whatever `last_handshake_at`. Strings (en / es):
+  - `down`: "Comes up when a host needs it" / "Se levanta cuando un host la
+    necesita".
+  - `starting`: "Connecting to the tailnet…" / "Conectando a la tailnet…".
+  - `up`: "Connected · <node.addresses[0]> · <peer_count> devices" /
+    "Conectada · … · N dispositivos"; detail: control server (`control_url`,
+    "Tailscale" for the default), tailnet (`tailnet`), MagicDNS
+    (`magic_dns_suffix`), the server's node (`node.name`, `node.dns_name`,
+    `node.addresses`, `node.node_id`), "ephemeral" (`ephemeral`).
+  - `needs_auth` + `auth: "login"`: "Log the server in" / "Inicia sesión
+    del servidor"; Editors get `node.auth_url` as a button "Open the login
+    page" / "Abrir la página de inicio de sesión" ("Sign in to the tailnet
+    there; with Headscale an admin approves it with `headscale auth
+    register`."), then poll `status` every 2 s until `up` (stop after a few
+    minutes or when the screen closes). Use-only members (no `auth_url`):
+    "Waiting for an Editor to log the server in" / "Esperando a que un
+    editor inicie la sesión del servidor".
+  - `needs_auth` + `auth: "approval"`: "Waiting for approval: approve
+    <node.name> in the tailnet's admin console (Machines)" / "Esperando
+    aprobación: aprueba <node.name> en la consola de la tailnet (Machines)".
+  - `error`: `message` (e.g. "the control server refused the auth key:
+    …") with "Use another key"; `last_error` in a details line.
+- **Test** = `POST /networks/{id}/up` (it already waits up to 10 s for the
+  node to settle), then poll `status` about once a second while
+  `starting`, up to ~30 s. Editors only.
+- **Import hosts.** `GET /networks/{id}/peers` (Editor; it needs the node
+  up: a `502 network_dial_failed` with `netd_code: needs_auth` means "log
+  the server in first"). Each device: `name`, `dns_name`, `addresses`,
+  `os`, `online` (dot) and `last_seen`, `tags` (chips), `routes`. Actions:
+  "Add host" → `POST /hosts {label: name, address: dns_name (the MagicDNS
+  name; or addresses[0]), settings: {port: 22, network_id}, vault_id: <the
+  network's vault>}`; each of `routes` → "Add a host in 192.168.10.0/24"
+  with the address typed (as WireGuard subnets). Mark devices already
+  imported (a host of that network with that name or address). Only the
+  devices the tailnet's ACLs let the server's node see are listed.
+- **Host editor.** Same picker; for a Tailscale network the address hint
+  says "a MagicDNS name (nas or nas.tail1234.ts.net) or a 100.x address".
+- **Errors** (structured): `network_dial_failed` with `netd_code`:
+  `needs_auth` + `auth: login` → "The server must be logged in to
+  <network> (see Networks)"; `needs_auth` + `auth: approval` → "The
+  server's node in <network> waits for approval"; `network_error` → "<network>
+  could not join the tailnet: <message>"; `dial_failed` → the message (e.g.
+  "outside the tailnet": only devices of the tailnet and the subnets they
+  route can be reached; "there is no device named …": the ACLs may hide
+  it); `timeout` → "still connecting to the tailnet, try again";
+  `limit` → "the server runs too many Tailscale networks right now".
+  `network_unavailable` with `netd_code: unsupported_kind` → "this server
+  cannot join Tailscale networks". Saving: `400` with the reason.
+- **Delete.** As WireGuard; the server makes netd log the node out (a
+  persistent one too).
+- **Audit:** the same entries (`network.up`, `network.down`,
+  `relay.open`/`relay.close` with `kind: "tailscale"`).
+
 ## 9. Tests
 
 - Core: `store::vault_tests::{networks_*, old_cores_editing_a_host_keep_its_network,
@@ -619,7 +874,8 @@ iOS `fileImporter`) and read the errors' details with `apiError`
   of pasted and pushed keys, `down` on change/delete/vault deletion, not on
   rename, the host test's network);
   `tests/holder.rs::the_holder_dials_network_hosts_through_netd`.
-- netd (Go, `go test ./...`, also with `-race`): two netstack peers talking
+- netd (Go, `go test -tags tailscale ./...`, also with `-race`: 31 tests,
+  16 of them since phase 2a): two netstack peers talking
   in process: dial through the tunnel (4 MiB echoed, handshake and
   counters), outside the allowed IPs, refused port, DNS inside the network
   with search domains, invalid configurations (never echoing the key),
@@ -627,7 +883,17 @@ iOS `fileImporter`) and read the errors' details with `apiError`
   eviction, idle reaping) with a fake backend; the protocol over a real
   socket (every op, malformed requests, `unsupported_kind`, socket mode and
   peer access); two networks with the same addresses reaching their own
-  site, half-close, `down` closing connections, a silent peer timing out.
+  site, half-close, `down` closing connections, a silent peer timing out;
+  nodes that settle in the background (up and dial wait, `needs_auth` with
+  its reason on the protocol line), the per-kind limit and `down` with
+  `forget`; Tailscale against an in-process control server (§6.6).
+- Server (phase 2a): `tests/networks.rs::tailscale_networks_are_validated_and_report_logins_and_tailnets`
+  (`network_kinds`, REST and sync validation without echoing the key,
+  status and peers fields, `auth_url` only for Editors, `needs_auth` with
+  `auth` on the relay and the host test, `forget` on delete); core
+  `store::vault_tests::{tailscale_settings_are_validated,
+  tailscale_networks_are_checked_on_save_and_push_and_old_cores_keep_ephemeral}`
+  and the FFI round trip.
 - Core: `transfer::tests::without_networks_keeps_networks_and_detaches_hosts`
   and the FFI test moving a host to This device.
 - QA (`qa`, `./run.sh networks`): a real netd and `termoak-wgpeer` (a
@@ -640,6 +906,17 @@ iOS `fileImporter`) and read the errors' details with `apiError`
   the web (phase 1b): Account → Networks with a `.conf` and a generated
   key (handshake through Test), peers → a host, the vault page's picker
   and host test, deleting, and the tab hidden without netd.
+- QA (`./run.sh tailscale`, phase 2a): Headscale 0.29.5 in Docker with its
+  embedded DERP and STUN on 127.0.0.1 (`TS_DEBUG_USE_DERP_HTTP=1` for netd
+  and the test nodes: no internet), sites made with `termoak-tsnode`
+  (`ssh-site` forwarding port 22 to the sshd container, `other-site` an
+  echo in another ACL slice): a tagged ephemeral pre-auth key → `up`,
+  peers, host test by MagicDNS name and 100.x address, a server session,
+  SFTP of 32 MB over the relay with checksums, nothing outside the tailnet;
+  isolation between users and between ACL slices; no key → the login URL,
+  registered → up, deleted → logged out and its state removed; a refused
+  key; bad settings → 400; idle, `down`, a netd restart and deleting never
+  leave nodes in Headscale.
 
 - Apps (phase 1b): the desktop's `networks::tests` (+ the opt-in
   `live_relay_through_a_wireguard_network`); Android's `NetworksTest`
@@ -650,7 +927,7 @@ iOS `fileImporter`) and read the errors' details with `apiError`
   sync, SSH through the relay, the server's host test, peers); iOS's
   `NetworksTests` (XCTest, run on the Mac).
 
-## 10. Phase 1
+## 10. Phases
 
 Done in phase 1a (2026-10-21):
 
@@ -669,10 +946,18 @@ Done in phase 1b, part 2 (2026-10-22): Android and iOS (§8.1) on core
 v0.7.0-next.2 (Android checked against a real server and WireGuard site
 through the engine: `LiveNetworksTest`, opt-in; iOS not compiled yet).
 
+Done in phase 2a (2026-10-22): Tailscale/Headscale in netd (§6.6), core
+v0.7.0-next.3 (`ephemeral`, validation), server 0.7.0-next.3
+(`network_kinds`, the Tailscale status and peers, `forget`), QA with
+Headscale; deployed on next.termoak.com.
+
 Left for later:
 
-1. Relay/session metrics per network in the server (netd has them per
+1. Phase 2b: the Tailscale UI in the web, desktop, Android and iOS (§8.1,
+   "Tailscale/Headscale").
+2. Relay/session metrics per network in the server (netd has them per
    network already).
-2. Phase 2: Tailscale/Headscale (`tsnet` backend behind a build tag,
-   `needs_auth` with the login URL, state directory per network, MagicDNS,
-   `peers` for import), Headscale in Docker for QA.
+3. Optional: give up on a key the control server refuses (now the node
+   retries with tsnet's backoff until the network goes idle); Tailscale
+   device approval checked against a real tailnet (only the test control
+   server covers `needs_auth`/`approval`).
