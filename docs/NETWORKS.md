@@ -3,8 +3,9 @@
 Status: **phase 0 done** (core + server groundwork, 2026-10-21); **phase 1a
 done** (2026-10-21): `termoak-netd` with WireGuard (`server/netd/`, Go), the
 server's WireGuard keys, netd following the vaults, QA; **phase 1b, part 1
-done** (2026-10-22): the UI in the web and the desktop app (§8.1). Next: the
-UI in Android and iOS, then Tailscale/Headscale (phase 2).
+done** (2026-10-22): the UI in the web and the desktop app (§8.1); **phase
+1b, part 2 done** (2026-10-22): the UI in Android and iOS. Next:
+Tailscale/Headscale (phase 2).
 
 This document is the design, the **server ↔ `termoak-netd` protocol**, the
 security model and the compatibility notes. Plan: `PLAN-0.7.md` §1. A copy
@@ -499,9 +500,17 @@ Nothing is required to compile, except:
 
 ### 8.1 The UI in the apps (phase 1b)
 
-Done in the web (`web/site/js/pages/app/networks.js`) and the desktop
-(`src/networks.rs`, `src/views/networks.rs`); Android and iOS follow the
-same rules.
+Done in the web (`web/site/js/pages/app/networks.js`), the desktop
+(`src/networks.rs`, `src/views/networks.rs`), Android
+(`data/Networks.kt`, `NetworksApi.kt`, `NetworkBook.kt`,
+`ui/NetworksScreen.kt`, `ui/NetworkUi.kt`) and iOS (`Model/Networks.swift`,
+`Model/NetworkBook.swift`, `Views/NetworksView.swift`,
+`Views/NetworkViews.swift`), with the same rules. The mobile apps edit a
+WireGuard network as `.conf` text like the desktop (the configuration
+without keys, "keep the key" unless a `PrivateKey` line is added or a new
+key generated), open `.conf` files with the system's picker (Android SAF,
+iOS `fileImporter`) and read the errors' details with `apiError`
+(`ApiErrors` on Android, `networkErrorText` on iOS) in every error text.
 
 - **Features can be stale:** re-read `/info` when an account starts and
   when the Networks screen opens (the desktop does both).
@@ -632,6 +641,15 @@ same rules.
   key (handshake through Test), peers → a host, the vault page's picker
   and host test, deleting, and the tab hidden without netd.
 
+- Apps (phase 1b): the desktop's `networks::tests` (+ the opt-in
+  `live_relay_through_a_wireguard_network`); Android's `NetworksTest`
+  (`.conf`, states, peers, inheritance and picker, error texts, REST calls),
+  `NetworksScreenshotTest` (Robolectric) and the opt-in `LiveNetworksTest`
+  (the engine built for the computer, through JNA, against a real server
+  and WireGuard site: key generation and `key_exists`, Test with handshake,
+  sync, SSH through the relay, the server's host test, peers); iOS's
+  `NetworksTests` (XCTest, run on the Mac).
+
 ## 10. Phase 1
 
 Done in phase 1a (2026-10-21):
@@ -647,12 +665,14 @@ Done in phase 1a (2026-10-21):
 3. Core 0.7.0-next.2: transfers to This device detach `network_id`.
 
 Done in phase 1b, part 1 (2026-10-22): the web and the desktop (§8.1).
+Done in phase 1b, part 2 (2026-10-22): Android and iOS (§8.1) on core
+v0.7.0-next.2 (Android checked against a real server and WireGuard site
+through the engine: `LiveNetworksTest`, opt-in; iOS not compiled yet).
 
-Left for phase 1b, part 2, and later:
+Left for later:
 
-1. Android and iOS: the same UI (§8.1) on core v0.7.0-next.2.
-2. Relay/session metrics per network in the server (netd has them per
+1. Relay/session metrics per network in the server (netd has them per
    network already).
-3. Phase 2: Tailscale/Headscale (`tsnet` backend behind a build tag,
+2. Phase 2: Tailscale/Headscale (`tsnet` backend behind a build tag,
    `needs_auth` with the login URL, state directory per network, MagicDNS,
    `peers` for import), Headscale in Docker for QA.
