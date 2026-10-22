@@ -403,9 +403,11 @@ netd/
   network without connections makes room, otherwise `limit`.
   `--max-streams` (256 per network) → `limit`. `--max-dial-timeout` (2
   min). Request line: 1 MiB, 30 s to send it.
-- **Pipe.** After `ok`, bytes are copied both ways with half-close. If the
-  host closes first, the client gets EOF and 30 s to finish sending; an
-  error on either side closes both.
+- **Pipe.** After `ok`, bytes are copied both ways with half-close. Once
+  either side has ended, the other is closed after 30 s without bytes (a
+  peer that vanished never sends FIN through the tunnel, and its
+  connection must not keep the network busy); an error on either side
+  closes both.
 - **Logs and metrics** (`log/slog`, text or JSON on stderr): network up
   (addresses, peers, its public key), down (reason: requested, idle,
   replaced, shutdown; dials), each connection closed (host, port,

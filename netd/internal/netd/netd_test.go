@@ -58,9 +58,21 @@ func (n *fakeNode) Dial(_ context.Context, host string, port int) (net.Conn, err
 	}
 	a, b := net.Pipe()
 	n.conns = append(n.conns, b)
-	go func() { _, _ = io.Copy(b, b) }()
+	if host == "blackhole" {
+		// A peer that vanished: reads everything, never answers or closes,
+		// and our FIN goes nowhere.
+		go func() { _, _ = io.Copy(io.Discard, b) }()
+		return lostFIN{a}, nil
+	} else {
+		go func() { _, _ = io.Copy(b, b) }()
+	}
 	return a, nil
 }
+
+// lostFIN half-closes into the void.
+type lostFIN struct{ net.Conn }
+
+func (lostFIN) CloseWrite() error { return nil }
 
 func (n *fakeNode) Info() netd.NodeInfo { return netd.NodeInfo{State: proto.StateUp} }
 func (n *fakeNode) Peers(context.Context) ([]proto.Peer, error) {
@@ -267,7 +279,7 @@ func serve(t *testing.T, l netd.Limits) *harness {
 		t.Fatal(err)
 	}
 	m := manager(l)
-	srv := &netd.Server{M: m, Log: testLog(), Access: netd.Access{GID: -1}}
+	srv := &netd.Server{M: m, Log: testLog(), Access: netd.Access{GID: -1}, Linger: 300 * time.Millisecond}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { ln.Close(); m.DownAll("test") })
 	return &harness{sock: sock, m: m}
@@ -520,5 +532,32 @@ func TestDialTimeout(t *testing.T) {
 	v, _, _ = h.call(t, dialReq(&bad, "10.9.0.1", 22))
 	if code(v) != "network_error" || strings.Contains(v["message"].(string), "short") {
 		t.Fatalf("%v", v)
+	}
+}
+
+// A client that goes away from a connection whose peer vanished (no FIN
+// ever comes back) does not leave it open: the network can go idle.
+func TestVanishedPeerDoesNotKeepTheConnection(t *testing.T) {
+	h := serve(t, netd.Limits{})
+	v, c, _ := h.call(t, dialReq(fake("gone", "r"), "blackhole", 22))
+	if v["ok"] != true {
+		t.Fatal(v)
+	}
+	if st := h.m.Status("gone"); st.Streams != 1 {
+		t.Fatalf("%+v", st)
+	}
+	c.Close()
+	// Not at once (the peer may still answer after a half-close), but after
+	// the linger time without bytes.
+	time.Sleep(100 * time.Millisecond)
+	if st := h.m.Status("gone"); st.Streams != 1 {
+		t.Fatalf("closed before the linger time: %+v", st)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for h.m.Status("gone").Streams != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("still open: %+v", h.m.Status("gone"))
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

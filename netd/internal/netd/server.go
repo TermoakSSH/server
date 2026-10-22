@@ -74,6 +74,8 @@ type Server struct {
 	M      *Manager
 	Log    *slog.Logger
 	Access Access
+	// Linger after one side of a connection ended (default 30 s).
+	Linger time.Duration
 
 	conns sync.WaitGroup
 	// Totals for the logs.
@@ -260,7 +262,7 @@ func (s *Server) dial(ctx context.Context, req *proto.Request, c net.Conn, r *bu
 		return nil
 	}
 	started := time.Now()
-	up, down := pipe(c, r, stream.Conn)
+	up, down := pipe(c, r, stream.Conn, s.Linger)
 	stream.Log().Info("connection closed", "host", req.Host, "port", req.Port,
 		"bytes_up", up, "bytes_down", down, "duration_ms", time.Since(started).Milliseconds())
 	return nil
@@ -268,9 +270,10 @@ func (s *Server) dial(ctx context.Context, req *proto.Request, c net.Conn, r *bu
 
 type closeWriter interface{ CloseWrite() error }
 
-// linger is how long the client may keep sending after the remote end
-// closed its side (then the connection is closed).
-const linger = 30 * time.Second
+// defaultLinger: after one side of a connection ends, how long the other
+// may stay silent before the connection is closed (a peer that vanished
+// never sends FIN through the tunnel).
+const defaultLinger = 30 * time.Second
 
 func closeWrite(c net.Conn) {
 	if cw, ok := c.(closeWriter); ok {
@@ -282,9 +285,14 @@ func closeWrite(c net.Conn) {
 
 // pipe copies bytes both ways (client → remote from r, which may hold
 // buffered bytes) with half-close, until both directions end. An error on
-// either side (the network went down...) closes both.
-func pipe(client net.Conn, r *bufio.Reader, remote net.Conn) (up, down int64) {
+// either side (the network went down...) closes both. Once one side has
+// ended, the other is closed after `linger` without bytes.
+func pipe(client net.Conn, r *bufio.Reader, remote net.Conn, linger time.Duration) (up, down int64) {
+	if linger <= 0 {
+		linger = defaultLinger
+	}
 	var wg sync.WaitGroup
+	var upDone atomic.Bool
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
@@ -294,12 +302,34 @@ func pipe(client net.Conn, r *bufio.Reader, remote net.Conn) (up, down int64) {
 		if err != nil {
 			_ = remote.Close()
 			_ = client.Close()
+			return
 		}
+		upDone.Store(true)
+		_ = remote.SetReadDeadline(time.Now().Add(linger))
 	}()
 	go func() {
 		defer wg.Done()
+		buf := make([]byte, 32*1024)
 		var err error
-		down, err = io.Copy(client, remote)
+		for {
+			n, rerr := remote.Read(buf)
+			if n > 0 {
+				if upDone.Load() {
+					_ = remote.SetReadDeadline(time.Now().Add(linger))
+				}
+				if _, werr := client.Write(buf[:n]); werr != nil {
+					err = werr
+					break
+				}
+				down += int64(n)
+			}
+			if rerr != nil {
+				if !errors.Is(rerr, io.EOF) {
+					err = rerr
+				}
+				break
+			}
+		}
 		closeWrite(client)
 		if err != nil {
 			_ = remote.Close()
