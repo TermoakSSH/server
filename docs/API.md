@@ -190,7 +190,7 @@ Sync, AI, push notifications and updates:
 | `rate_limited` | 429 | Too many requests (`/hosts/{id}/credentials`: 30 per minute). Extra field: `retry_ms` |
 | `network_unavailable` | 503 | Private networks are not available: the server has no `termoak-netd` (or it is down), or it cannot join that kind of network |
 | `network_not_found` | 404 | The host (or its group) uses a private network that is not in its vault. Extra field: `network_id` |
-| `network_dial_failed` | 502 | The network could not reach the host. Extra field: `netd_code` (`dial_failed`, `needs_auth`, `timeout`...) |
+| `network_dial_failed` | 502 | The network could not reach the host. Extra fields: `netd_code` (`dial_failed`, `needs_auth`, `timeout`, `network_error`, `limit`...) and, with `needs_auth` (a Tailscale node), `auth`: `login` (log the node in: the network's status has the URL) or `approval` (approve the device in the tailnet's admin console) |
 | `not_in_network` | 422 | `/hosts/{id}/relay` for a host without a private network: connect to it directly |
 | `relay_limit` | 429 | Too many relays open (`[networks] max_relays_per_user`). Extra field: `max` |
 | `ai_not_configured` | 503 | The AI provider is not configured |
@@ -593,10 +593,16 @@ stored value (see [Compatibility](#compatibility)).
 Private networks (`/networks`) are `{name, kind: "wireguard" | "tailscale" |
 "zerotier", description, wireguard?: {addresses, dns, mtu, peers:
 [{public_key, endpoint, allowed_ips, persistent_keepalive}], public_key},
-tailscale?: {control_url, hostname, tags}, zerotier?: {network_id,
+tailscale?: {control_url, hostname, tags, ephemeral}, zerotier?: {network_id,
 central_url}}` with the secret `{private_key?, preshared_key?, auth_key?,
 api_token?}`. Creating one checks `max_networks` (see
-[Private networks](#private-networks)).
+[Private networks](#private-networks)). Tailscale/Headscale (since
+0.7.0-next.3): `control_url` http(s) without user, query or fragment
+(`null`: Tailscale), `hostname` a DNS label (default
+`termoak-<last 8 hex digits of the id>`), `tags` `tag:name` (at most 20;
+empty: the auth key's tags), `ephemeral` (`null`: yes with an auth key, no
+without one), `auth_key` printable ASCII without spaces; anything else is
+`400` (REST) or rejected `invalid` (sync), never echoing the key.
 
 Other entity routes:
 
@@ -699,7 +705,11 @@ Tailscale/Headscale, ZeroTier) through `termoak-netd`, a separate service
 (`[networks] netd_socket`; design, protocol and security model in
 [NETWORKS.md](NETWORKS.md)). `/info` has `features.networks: true` when it is configured and
 answering; otherwise hosts with a network fail with `network_unavailable`
-(the server never connects to them directly).
+(the server never connects to them directly). `features.network_kinds`
+lists the kinds netd can join (`["wireguard"]`, `["wireguard",
+"tailscale"]` with the Tailscale build; empty without netd): apps offer a
+kind only when it is listed (another kind answers `network_unavailable`
+with `netd_code: unsupported_kind`).
 
 - **Server sessions, tests, `/exec`, SFTP and the AI** dial the first hop
   (the first jump host, or the host) through its network.
@@ -712,10 +722,10 @@ answering; otherwise hosts with a network fail with `network_unavailable`
 | Method | Route | Description |
 |---|---|---|
 | GET | `/hosts/{id}/relay` | WebSocket relay to the host's first hop through its network (below) |
-| GET | `/networks/{id}/status` | State in netd: `{state: down \| starting \| needs_auth \| up \| error, message, node: {name, addresses, public_key, node_id, auth_url}, revision, since, last_used_at, rx_bytes, tx_bytes, last_handshake_at, streams, dials, dials_failed}` (any member). `last_handshake_at` (ms, WireGuard) is missing until the peer answered: check its endpoint and that it has the server's public key |
+| GET | `/networks/{id}/status` | State in netd: `{state: down \| starting \| needs_auth \| up \| error, message, node: {name, addresses, public_key, node_id, auth_url, dns_name}, revision, since, last_used_at, rx_bytes, tx_bytes, last_handshake_at, streams, dials, dials_failed}` (any member). `last_handshake_at` (ms, WireGuard) is missing until the peer answered: check its endpoint and that it has the server's public key. Tailscale adds `auth` (`login` \| `approval` with `needs_auth`), `control_url`, `tailnet`, `magic_dns_suffix`, `peer_count`, `ephemeral` and `last_error`; `node.auth_url` (the login URL) only for Editors |
 | POST | `/networks/{id}/up` | Brings it up now and returns its state (Editor; audited `network.up`) |
 | POST | `/networks/{id}/down` | Takes it down (Editor; audited `network.down`) |
-| GET | `/networks/{id}/peers` | Devices of the network `[{name, dns_name, addresses, os, online, last_seen, public_key, endpoint}]` to import as hosts (Editor). WireGuard: its configured peers, `online` when their last handshake is under 3 minutes old |
+| GET | `/networks/{id}/peers` | Devices of the network `[{name, dns_name, addresses, os, online, last_seen, public_key, endpoint, tags, routes, id}]` to import as hosts (Editor). WireGuard: its configured peers, `online` when their last handshake is under 3 minutes old. Tailscale: the devices the server's node sees (the ACLs decide), with their MagicDNS name, 100.x addresses, OS, tags and the subnets they route; it needs the node up (`needs_auth` → `502 network_dial_failed`) |
 | POST | `/networks/{id}/wireguard/key` | `{replace?}` → `{public_key, network}`: the server generates the network's WireGuard private key (stored as its secret, never shown unless an Editor reveals the secret) and returns the public key to add as a peer on the other side. A network with a private key already needs `replace: true` (`409 key_exists`); other kinds `422 not_wireguard`. Audited `network.key_generated` (Editor) |
 
 - **WireGuard public key:** `wireguard.public_key` is always the public
@@ -728,6 +738,8 @@ answering; otherwise hosts with a network fail with `network_unavailable`
   server tells netd `down`, so an old key or endpoint stops at once (a
   rename does not: the revision only covers the kind, the configuration
   without the public key and the secret). The next use brings it up again.
+  A deleted network's `down` also has `forget`: netd logs a persistent
+  Tailscale node out and removes its state.
 - **Host test:** `POST /hosts/{id}/test` of a host with a network dials
   through it and says so in `network: {id, name, kind}`; `latency_ms` is
   measured through the network ("via Office · 23 ms").

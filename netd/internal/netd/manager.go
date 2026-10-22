@@ -19,6 +19,10 @@ type Limits struct {
 	// network without open connections is taken down for a new one;
 	// otherwise `limit`.
 	MaxNetworks int
+	// KindMax caps the networks of one kind up at the same time (same
+	// rule), e.g. Tailscale nodes, which take far more memory than
+	// WireGuard ones. 0 or missing: only MaxNetworks.
+	KindMax map[string]int
 	// MaxStreams open at the same time per network.
 	MaxStreams int
 	// Idle: a network without connections for this long is taken down
@@ -32,10 +36,17 @@ type Limits struct {
 	StartTimeout time.Duration
 }
 
+// DefaultMaxTailscale: Tailscale nodes up at the same time by default. A
+// tsnet node takes 2–3 MiB in a small tailnet and more with many peers
+// (docs/NETWORKS.md §6.6): 16 of them stay well inside the 512 MiB of the
+// systemd unit, with room for the WireGuard networks and the connections.
+const DefaultMaxTailscale = 16
+
 // DefaultLimits are the defaults of the command line.
 func DefaultLimits() Limits {
 	return Limits{
 		MaxNetworks:        64,
+		KindMax:            map[string]int{"tailscale": DefaultMaxTailscale},
 		MaxStreams:         256,
 		Idle:               15 * time.Minute,
 		MaxDialTimeout:     2 * time.Minute,
@@ -63,6 +74,7 @@ type entry struct {
 	// Set before ready is closed.
 	node     Node
 	startErr error
+	forget   atomic.Bool // closeEntry removes what the backend keeps
 
 	created  time.Time
 	since    time.Time    // set before ready is closed
@@ -91,8 +103,16 @@ func (m *Manager) Up(ctx context.Context, spec *proto.Spec) (proto.Status, error
 	defer cancel()
 	select {
 	case <-e.ready:
+		// A node that joins in the background (Tailscale) answers once it
+		// is up, waits for authorization or failed (or `starting`).
+		if s, ok := e.node.(Settler); ok && e.startErr == nil {
+			s.Settled(wait)
+		}
 	case <-wait.Done():
 	}
+	// An `up` is a use: the idle time counts from its answer (a node that
+	// took a while to join is not taken down right away).
+	e.lastUsed.Store(ms(m.now()))
 	return m.status(e), nil
 }
 
@@ -131,8 +151,19 @@ func (m *Manager) ensure(spec *proto.Spec) (*entry, error) {
 		}
 		e.log.Info("restarting network", "reason", reason, "new_revision", spec.Revision)
 	}
+	if max := m.limits.KindMax[spec.Kind]; max > 0 && m.countKind(spec.Kind) >= max {
+		victim := m.lruIdle(spec.Kind)
+		if victim == nil {
+			m.mu.Unlock()
+			m.closeAll(old, "replaced")
+			return nil, proto.Errorf(proto.CodeLimit, "termoak-netd already runs %d %s networks with open connections (its limit for that kind)", max, kindName(spec.Kind))
+		}
+		delete(m.nodes, victim.id)
+		old = append(old, victim)
+		victim.log.Info("taking network down to make room", "kind_max", max)
+	}
 	if m.limits.MaxNetworks > 0 && len(m.nodes) >= m.limits.MaxNetworks {
-		victim := m.lruIdle()
+		victim := m.lruIdle("")
 		if victim == nil {
 			m.mu.Unlock()
 			m.closeAll(old, "replaced")
@@ -181,11 +212,36 @@ func (m *Manager) ensure(spec *proto.Spec) (*entry, error) {
 	return e, nil
 }
 
-// lruIdle is the least recently used network without connections (mu held).
-func (m *Manager) lruIdle() *entry {
+// kindName is how errors name a kind.
+func kindName(kind string) string {
+	switch kind {
+	case "wireguard":
+		return "WireGuard"
+	case "tailscale":
+		return "Tailscale"
+	case "zerotier":
+		return "ZeroTier"
+	}
+	return kind
+}
+
+// countKind is how many networks of a kind run (mu held).
+func (m *Manager) countKind(kind string) int {
+	n := 0
+	for _, e := range m.nodes {
+		if e.kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// lruIdle is the least recently used network without connections, of kind
+// (any kind when empty) (mu held).
+func (m *Manager) lruIdle(kind string) *entry {
 	var best *entry
 	for _, e := range m.nodes {
-		if e.streams.Load() > 0 {
+		if e.streams.Load() > 0 || (kind != "" && e.kind != kind) {
 			continue
 		}
 		if best == nil || e.lastUsed.Load() < best.lastUsed.Load() {
@@ -208,21 +264,61 @@ func (m *Manager) closeEntry(e *entry, reason string) {
 	}
 	go func() {
 		<-e.ready
-		if e.node != nil {
-			_ = e.node.Close()
-		}
+		closeNode(e)
 		e.log.Info("network down", "reason", reason, "dials", e.dials.Load(), "dials_failed", e.failed.Load())
 	}()
 }
 
+// closeNode closes a started node (forgetting it when asked).
+func closeNode(e *entry) {
+	if e.node == nil {
+		return
+	}
+	if fc, ok := e.node.(ForgetCloser); ok && e.forget.Load() {
+		if err := fc.CloseAndForget(); err != nil {
+			e.log.Warn("could not forget the network's node", "error", err)
+		}
+		return
+	}
+	_ = e.node.Close()
+}
+
 // Down takes a network down (nothing happens if it was not up).
 func (m *Manager) Down(id string, reason string) bool {
+	return m.down(id, reason, false)
+}
+
+// Forget takes a network down and removes what the backends keep of it
+// (the network was deleted): a running node is closed that way, and every
+// backend that keeps state between runs forgets the id (in the
+// background).
+func (m *Manager) Forget(id string) bool {
+	was := m.down(id, "deleted", true)
+	if !was {
+		for _, f := range forgetters() {
+			go func(f Forgetter) {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				defer cancel()
+				log := m.log.With("network", id)
+				if err := f.Forget(ctx, id, log); err != nil {
+					log.Warn("could not forget the network", "error", err)
+				}
+			}(f)
+		}
+	}
+	return was
+}
+
+func (m *Manager) down(id, reason string, forget bool) bool {
 	m.mu.Lock()
 	e := m.nodes[id]
 	delete(m.nodes, id)
 	m.mu.Unlock()
 	if e == nil {
 		return false
+	}
+	if forget {
+		e.forget.Store(true)
 	}
 	m.closeEntry(e, reason)
 	return true
@@ -237,20 +333,25 @@ func (m *Manager) DownAll(reason string) {
 		delete(m.nodes, id)
 	}
 	m.mu.Unlock()
+	// In parallel: a Tailscale node logs out of its control server.
+	var wg sync.WaitGroup
 	for _, e := range list {
 		if e.closed.Swap(true) {
 			continue
 		}
-		select {
-		case <-e.ready:
-		case <-time.After(5 * time.Second):
-			continue
-		}
-		if e.node != nil {
-			_ = e.node.Close()
-		}
-		e.log.Info("network down", "reason", reason)
+		wg.Add(1)
+		go func(e *entry) {
+			defer wg.Done()
+			select {
+			case <-e.ready:
+			case <-time.After(5 * time.Second):
+				return
+			}
+			closeNode(e)
+			e.log.Info("network down", "reason", reason)
+		}(e)
 	}
+	wg.Wait()
 }
 
 // Status of a network, without bringing it up.
@@ -311,6 +412,9 @@ func (m *Manager) status(e *entry) proto.Status {
 	st.Node = info.Node
 	st.RxBytes, st.TxBytes = info.RxBytes, info.TxBytes
 	st.LastHandshakeAt = info.LastHandshakeAt
+	st.Auth, st.ControlURL, st.LastError = info.Auth, info.ControlURL, info.LastError
+	st.Tailnet, st.MagicDNSSuffix = info.Tailnet, info.MagicDNSSuffix
+	st.PeerCount, st.Ephemeral = info.PeerCount, info.Ephemeral
 	return st
 }
 
@@ -346,9 +450,19 @@ func (m *Manager) waitNode(ctx context.Context, e *entry) (Node, error) {
 		}
 		return nil, proto.Errorf(proto.CodeNetworkError, "the network %q could not start: %s", e.name, e.startErr)
 	}
+	if s, ok := e.node.(Settler); ok {
+		s.Settled(ctx)
+	}
 	info := e.node.Info()
-	if info.State == proto.StateNeedsAuth {
-		return nil, proto.Errorf(proto.CodeNeedsAuth, "the network %q waits for authorization: %s", e.name, info.Message)
+	switch info.State {
+	case proto.StateNeedsAuth:
+		pe := proto.Errorf(proto.CodeNeedsAuth, "the network %q waits for authorization: %s", e.name, info.Message)
+		pe.Auth = info.Auth
+		return nil, pe
+	case proto.StateError:
+		return nil, proto.Errorf(proto.CodeNetworkError, "the network %q could not start: %s", e.name, info.Message)
+	case proto.StateStarting:
+		return nil, proto.Errorf(proto.CodeTimeout, "the network %q is still starting: %s", e.name, info.Message)
 	}
 	return e.node, nil
 }

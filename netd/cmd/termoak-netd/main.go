@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,9 +30,30 @@ import (
 )
 
 func init() {
-	// WireGuard is always built in (Tailscale and ZeroTier: see
-	// netd.Backend).
+	// WireGuard is always built in (Tailscale: tailscale.go, behind the
+	// `tailscale` build tag; ZeroTier: see netd.Backend).
 	netd.Register("wireguard", &wg.Backend{})
+}
+
+// backendOptions are the command line options the backends need.
+type backendOptions struct {
+	// StateDir: where backends keep state (persistent Tailscale nodes).
+	StateDir string
+}
+
+// backendSetup configures the backends after the flags are parsed (files
+// behind build tags add theirs).
+var backendSetup []func(backendOptions, *slog.Logger)
+
+// defaultStateDir: systemd's StateDirectory= when set, else a directory
+// in the temporary directory (lost on reboot).
+func defaultStateDir() string {
+	if d := os.Getenv("STATE_DIRECTORY"); d != "" {
+		// systemd may list several, separated by ':'.
+		d, _, _ = strings.Cut(d, ":")
+		return d
+	}
+	return filepath.Join(os.TempDir(), fmt.Sprintf("termoak-netd-%d", os.Getuid()))
 }
 
 func env(name, def string) string {
@@ -84,6 +106,8 @@ func serve(args []string) int {
 	fs.DurationVar(&limits.Idle, "idle", envDuration("TERMOAK_NETD_IDLE", limits.Idle), "take a network down after this long without connections; 0 = never (TERMOAK_NETD_IDLE)")
 	fs.IntVar(&limits.MaxNetworks, "max-networks", envInt("TERMOAK_NETD_MAX_NETWORKS", limits.MaxNetworks), "networks up at the same time (TERMOAK_NETD_MAX_NETWORKS)")
 	fs.IntVar(&limits.MaxStreams, "max-streams", envInt("TERMOAK_NETD_MAX_STREAMS", limits.MaxStreams), "open connections per network (TERMOAK_NETD_MAX_STREAMS)")
+	maxTailscale := fs.Int("max-tailscale", envInt("TERMOAK_NETD_MAX_TAILSCALE", limits.KindMax["tailscale"]), "Tailscale/Headscale nodes up at the same time (each takes 10-20 MiB) (TERMOAK_NETD_MAX_TAILSCALE)")
+	stateDir := fs.String("state-dir", env("TERMOAK_NETD_STATE_DIR", defaultStateDir()), "state directory: persistent Tailscale nodes and the scratch files of ephemeral ones (TERMOAK_NETD_STATE_DIR; default systemd's STATE_DIRECTORY)")
 	fs.DurationVar(&limits.MaxDialTimeout, "max-dial-timeout", envDuration("TERMOAK_NETD_MAX_DIAL_TIMEOUT", limits.MaxDialTimeout), "cap on a dial's timeout_ms (TERMOAK_NETD_MAX_DIAL_TIMEOUT)")
 	logFormat := fs.String("log-format", env("TERMOAK_NETD_LOG_FORMAT", "text"), "text or json (TERMOAK_NETD_LOG_FORMAT)")
 	logLevel := fs.String("log-level", env("TERMOAK_NETD_LOG_LEVEL", "info"), "debug, info, warn or error (TERMOAK_NETD_LOG_LEVEL)")
@@ -135,6 +159,11 @@ func serve(args []string) int {
 		perm = os.FileMode(m)
 	}
 
+	limits.KindMax = map[string]int{"tailscale": *maxTailscale}
+	for _, setup := range backendSetup {
+		setup(backendOptions{StateDir: *stateDir}, log)
+	}
+
 	ln, err := netd.Listen(*socket, perm, gid)
 	if err != nil {
 		log.Error("could not listen", "socket", *socket, "error", err)
@@ -154,7 +183,8 @@ func serve(args []string) int {
 	go m.RunReaper(ctx, tick)
 	log.Info("termoak-netd listening", "version", netd.Version, "socket", *socket,
 		"mode", fmt.Sprintf("%04o", perm), "kinds", netd.Kinds(), "idle", limits.Idle.String(),
-		"max_networks", limits.MaxNetworks, "max_streams", limits.MaxStreams)
+		"max_networks", limits.MaxNetworks, "max_streams", limits.MaxStreams, "max_tailscale", *maxTailscale,
+		"state_dir", *stateDir)
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ln) }()
 	select {

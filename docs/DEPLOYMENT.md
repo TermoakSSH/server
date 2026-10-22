@@ -60,10 +60,17 @@ process until the holder knows networks).
 
 The server comes in two builds: without networks (`termoak-server` alone)
 and with networks: the same server plus `termoak-netd`, a small static Go
-program that joins the users' WireGuard networks (Tailscale/Headscale and
-ZeroTier later) **fully in user space**: no TUN device, no root, no routes,
-no capabilities, so it also runs in unprivileged containers. Design,
-protocol and security model: [NETWORKS.md](NETWORKS.md).
+program that joins the users' WireGuard networks and Tailscale/Headscale
+tailnets (ZeroTier later) **fully in user space**: no TUN device, no root,
+no routes, no capabilities, so it also runs in unprivileged containers.
+Design, protocol and security model: [NETWORKS.md](NETWORKS.md).
+
+termoak-netd has two builds too: with Tailscale (`go build -tags
+tailscale`, what the bundle and `Dockerfile.netd` ship; about 23 MB) and
+without it (no tag: WireGuard only, about 7 MB; `NETD_TAGS=""
+scripts/release-local.sh build server`, or `--build-arg TAGS=` for the
+image). `termoak-netd version` and `/info` → `features.network_kinds` say
+which kinds a running netd joins.
 
 `scripts/release-local.sh build server` makes both bundles,
 `termoak-server-vX.Y.Z-linux-<arch>.tar.gz` and
@@ -102,21 +109,42 @@ default).
   (networks without connections for this long go down; default `15m`, `0`
   never), `--max-networks` (64 up at once; when full, the least recently
   used one without connections makes room, else `limit`), `--max-streams`
-  (256 open connections per network), `--max-dial-timeout` (2 min),
-  `--log-format text|json`, `--log-level`.
-- **Memory:** an idle process is a few MB and each network up adds a few
-  more (its WireGuard device and TCP/IP stack); the unit caps it with
-  `MemoryMax=512M`.
+  (256 open connections per network), `--max-tailscale` /
+  `TERMOAK_NETD_MAX_TAILSCALE` (16 Tailscale nodes up at once, same rule),
+  `--state-dir` / `TERMOAK_NETD_STATE_DIR` (default the unit's
+  `StateDirectory=termoak-netd`, `/var/lib/termoak-netd`),
+  `--max-dial-timeout` (2 min), `--log-format text|json`, `--log-level`;
+  `TERMOAK_NETD_TAILSCALE_VERBOSE=1` adds tsnet's own logs at debug level.
+- **Tailscale state:** ephemeral nodes (the default with an auth key) keep
+  their state in memory and log out when they stop, so the control server
+  deletes them at once; only scratch files live in the state directory and
+  are removed. Persistent nodes (`ephemeral: false`, the default without a
+  key) keep their keys in `<state-dir>/tailscale/<network id>/` (mode
+  0700/0600); back it up with the server if you want them to survive a
+  reinstall. Deleting a network logs its node out and removes it. tsnet
+  never uploads logs (log uploads to Tailscale are disabled).
+- **Memory:** an idle process is a few MB (about 18 MB with Tailscale) and
+  each WireGuard network up adds 1–2 MB; a Tailscale node adds 2–3 MB in a
+  small tailnet (more with hundreds of devices). The unit caps it with
+  `MemoryMax=512M` and sets `GOMEMLIMIT=384MiB` so Go collects garbage
+  before the cap.
 - **Check it:** `termoak-netd request --socket /run/termoak-netd/netd.sock
   '{"v":1,"op":"list"}'` prints the networks it runs (state, handshake,
   bytes, open connections); `journalctl -u termoak-netd` has a line per
   network up/down and per connection (host, port, bytes, duration), never
   keys.
 - **Firewall:** netd only needs outgoing UDP to the peers' endpoints (the
-  WireGuard transport); nothing listens on the network.
-- **Docker:** `Dockerfile.netd` builds a netd image; `docker compose
-  --profile networks up -d` runs it next to the server with a shared volume
-  for the socket (see the comments in `docker-compose.yml`).
+  WireGuard transport) and, for Tailscale, outgoing HTTPS to the control
+  server (Tailscale's or your Headscale) and the DERP relays plus UDP
+  (STUN 3478 and peer-to-peer); nothing listens on the network.
+- **Docker:** `Dockerfile.netd` builds a netd image (with Tailscale; it
+  has CA certificates for the control server); `docker compose --profile
+  networks up -d` runs it next to the server with a shared volume for the
+  socket and one for the state (see the comments in `docker-compose.yml`).
+- **Licenses:** termoak-netd links wireguard-go (MIT), gVisor (Apache
+  2.0), golang.org/x (BSD-3) and, in the Tailscale build, tailscale.com
+  (tsnet, BSD-3); `go version -m termoak-netd` lists every module. The
+  server itself stays AGPL and links none of them.
 
 The first user to sign up becomes an administrator. You can also create it
 from the console:

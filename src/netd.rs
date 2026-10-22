@@ -121,7 +121,9 @@ pub struct NetdHello {
     pub v: u32,
     #[serde(default)]
     pub version: String,
-    /// Network kinds this netd build can join (ZeroTier may be left out).
+    /// Network kinds this netd build can join (`wireguard`, and
+    /// `tailscale` when built with the `tailscale` tag; ZeroTier may be
+    /// left out).
     #[serde(default)]
     pub kinds: Vec<String>,
 }
@@ -141,9 +143,14 @@ pub struct NetworkNode {
     /// ZeroTier node id / Tailscale node id.
     #[serde(default)]
     pub node_id: Option<String>,
-    /// Where to authorize the node (Tailscale login URL), if waiting.
-    #[serde(default)]
+    /// Where to log the node in (Tailscale login URL, Headscale
+    /// registration) while `state` is `needs_auth` with `auth: login`.
+    /// Only Editors of the network's vault see it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_url: Option<String>,
+    /// The node's MagicDNS name (Tailscale).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_name: Option<String>,
 }
 
 impl NetworkStatus {
@@ -158,8 +165,8 @@ impl NetworkStatus {
 pub struct NetworkStatus {
     #[serde(default)]
     pub network_id: Option<uuid::Uuid>,
-    /// `down`, `starting`, `needs_auth` (authorize the node), `up` or
-    /// `error`.
+    /// `down`, `starting`, `needs_auth` (authorize the node: see `auth`),
+    /// `up` or `error` (`message`).
     #[serde(default)]
     pub state: String,
     #[serde(default)]
@@ -191,6 +198,30 @@ pub struct NetworkStatus {
     pub dials: u64,
     #[serde(default)]
     pub dials_failed: u64,
+    /// Tailscale: why a `needs_auth` node waits: `login` (open
+    /// `node.auth_url`: no auth key, or the key was not enough) or
+    /// `approval` (approve the device in the admin console).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    /// Tailscale: the control server (Tailscale's when the network has
+    /// none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_url: Option<String>,
+    /// Tailscale: the tailnet's name and MagicDNS suffix, once logged in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magic_dns_suffix: Option<String>,
+    /// Tailscale: devices the server's node sees (when `up`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_count: Option<u64>,
+    /// Tailscale: the node leaves the tailnet when it stops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral: Option<bool>,
+    /// Tailscale: the latest error of the node (the control server refused
+    /// the auth key...), also while it retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// A device of the network (to import hosts).
@@ -212,6 +243,16 @@ pub struct NetworkPeer {
     pub public_key: Option<String>,
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// Tailscale: the device's ACL tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Tailscale: subnets the device routes for the tailnet (subnet
+    /// router; exit routes left out).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<String>,
+    /// Tailscale: the device's stable id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// A failed netd request.
@@ -220,8 +261,13 @@ pub enum NetdError {
     /// netd is not running (or not answering).
     Unreachable(String),
     /// netd refused: `code` (`needs_auth`, `unsupported_kind`,
-    /// `dial_failed`, `timeout`, `network_error`, `invalid`...).
-    Refused { code: String, message: String },
+    /// `dial_failed`, `timeout`, `network_error`, `invalid`...); `auth`
+    /// with `needs_auth` (`login` or `approval`).
+    Refused {
+        code: String,
+        message: String,
+        auth: Option<String>,
+    },
 }
 
 impl std::fmt::Display for NetdError {
@@ -251,13 +297,16 @@ impl From<NetdError> for SshError {
 
 impl From<NetdError> for ApiError {
     fn from(e: NetdError) -> Self {
-        let netd_code = match &e {
-            NetdError::Refused { code, .. } => Some(code.clone()),
-            NetdError::Unreachable(_) => None,
+        let (netd_code, auth) = match &e {
+            NetdError::Refused { code, auth, .. } => (Some(code.clone()), auth.clone()),
+            NetdError::Unreachable(_) => (None, None),
         };
         let mut err: ApiError = SshError::from(e).into();
         if let Some(c) = netd_code {
             err = err.with_detail("netd_code", c);
+        }
+        if let Some(a) = auth {
+            err = err.with_detail("auth", a);
         }
         err
     }
@@ -296,6 +345,18 @@ impl Netd {
     /// The last `hello` answer.
     pub fn info(&self) -> Option<NetdHello> {
         self.hello.read().clone()
+    }
+
+    /// The network kinds netd can join (`hello`), while it is healthy.
+    pub fn kinds(&self) -> Vec<String> {
+        if !self.is_healthy() {
+            return Vec::new();
+        }
+        self.hello
+            .read()
+            .as_ref()
+            .map(|h| h.kinds.clone())
+            .unwrap_or_default()
     }
 
     /// Checks netd now and then every 30 s (for `features.networks`).
@@ -362,6 +423,7 @@ impl Netd {
                     .as_str()
                     .unwrap_or("termoak-netd refused the request")
                     .to_string(),
+                auth: v["auth"].as_str().map(str::to_string),
             })
         }
     }
@@ -390,6 +452,15 @@ impl Netd {
     /// not up).
     pub async fn down(&self, network_id: Id) -> Result<(), NetdError> {
         self.call(json!({"v": PROTOCOL, "op": "down", "network_id": network_id}))
+            .await?;
+        Ok(())
+    }
+
+    /// The network was deleted: takes it down and netd removes what it
+    /// keeps of it (a persistent Tailscale node is logged out and its state
+    /// deleted). An older netd ignores `forget` and only takes it down.
+    pub async fn forget(&self, network_id: Id) -> Result<(), NetdError> {
+        self.call(json!({"v": PROTOCOL, "op": "down", "network_id": network_id, "forget": true}))
             .await?;
         Ok(())
     }

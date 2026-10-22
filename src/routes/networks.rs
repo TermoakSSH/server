@@ -229,6 +229,19 @@ pub async fn reconcile(st: &AppState, access: &VaultAccess, ids: &[Id]) {
             Err(termoak_core::CoreError::NotFound(_)) => None,
             Err(_) => continue,
         };
+        // Deleted: netd forgets it, running or not (a persistent Tailscale
+        // node keeps state while it is down).
+        if expected.is_none() {
+            match netd.forget(*id).await {
+                Ok(()) => {
+                    tracing::info!(network = %id, "deleted network forgotten in termoak-netd")
+                }
+                Err(e) => {
+                    tracing::warn!(network = %id, error = %e, "could not take a network down")
+                }
+            }
+            continue;
+        }
         let status = match netd.status(*id).await {
             Ok(s) => s,
             Err(e) => {
@@ -236,17 +249,10 @@ pub async fn reconcile(st: &AppState, access: &VaultAccess, ids: &[Id]) {
                 continue;
             }
         };
-        if !status.is_running() {
+        if !status.is_running() || status.revision == expected {
             continue;
         }
-        if expected.is_some() && status.revision == expected {
-            continue;
-        }
-        let why = if expected.is_none() {
-            "deleted"
-        } else {
-            "changed"
-        };
+        let why = "changed";
         match netd.down(*id).await {
             Ok(()) => tracing::info!(network = %id, why, "network taken down in termoak-netd"),
             Err(e) => tracing::warn!(network = %id, error = %e, "could not take a network down"),
@@ -297,7 +303,9 @@ pub async fn networks_in(st: &AppState, access: &VaultAccess, vaults: &[Id]) -> 
     out
 }
 
-/// Tells netd `down` for these networks (in the background).
+/// Tells netd that these networks were deleted (in the background):
+/// `down` with `forget`, so it also removes what it keeps of them (a
+/// persistent Tailscale node logs out), whether they run or not.
 pub fn down_later(st: &AppState, ids: Vec<Id>) {
     let Some(netd) = st.netd.clone() else { return };
     if ids.is_empty() {
@@ -305,7 +313,7 @@ pub fn down_later(st: &AppState, ids: Vec<Id>) {
     }
     tokio::spawn(async move {
         for id in ids {
-            if let Err(e) = netd.down(id).await {
+            if let Err(e) = netd.forget(id).await {
                 tracing::warn!(network = %id, error = %e, "could not take a network down");
             }
         }
@@ -420,19 +428,29 @@ async fn network_for(
     ))
 }
 
-/// State of a network in netd (any member of its vault).
+/// State of a network in netd (any member of its vault). The login URL of
+/// a Tailscale node (`node.auth_url`) is for Editors only: whoever opens it
+/// decides which tailnet the server's node joins.
 async fn status(
     State(st): State<AppState>,
     ctx: AccessCtx,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<NetworkStatus>> {
     let netd = netd(&st)?;
-    st.store.get_in::<Network>(&ctx.access, id).await?;
-    Ok(Json(netd.status(id).await?))
+    let rec = st.store.get_in::<Network>(&ctx.access, id).await?;
+    let vault = rec.meta.vault_id.unwrap_or(ctx.personal());
+    let mut status = netd.status(id).await?;
+    if ctx.access.require(vault, VaultRole::Editor).is_err()
+        && let Some(node) = status.node.as_mut()
+    {
+        node.auth_url = None;
+    }
+    Ok(Json(status))
 }
 
 /// Brings a network up now (Editor): to test it, or to see the server's
-/// node (public key, node id, authorization URL).
+/// node (public key, node id, MagicDNS name, the login URL of a Tailscale
+/// node that waits for one).
 async fn up(
     State(st): State<AppState>,
     ctx: AccessCtx,

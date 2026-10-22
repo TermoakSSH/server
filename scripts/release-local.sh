@@ -21,10 +21,11 @@
 # Dockerfile installs). Two builds per architecture:
 #   termoak-server-vX.Y.Z-linux-<arch>.tar.gz           without networks
 #   termoak-server-networks-vX.Y.Z-linux-<arch>.tar.gz  with networks: the same
-#     server plus termoak-netd (netd/, Go, static) and its systemd unit
+#     server plus termoak-netd (netd/, Go, static; WireGuard and, with the
+#     `tailscale` build tag, Tailscale/Headscale) and its systemd unit
 # termoak-netd is built (and tested) in the official Go image
 # (GO_IMAGE, default golang:1.27-bookworm); NETWORKS=0 skips it, NETD_TESTS=0
-# skips its tests.
+# skips its tests, NETD_TAGS="" builds it without Tailscale.
 #
 # publish creates the <component>-vX.Y.Z release with the contents of
 # dist/<component>/, using the GitHub API (curl, no `gh`). It is created as a
@@ -225,10 +226,15 @@ go_in_docker() { # env... -- go arguments...
     -e GOFLAGS=-buildvcs=false ${envs[@]+"${envs[@]}"} "$GO_IMAGE" go "$@"
 }
 
+# Build tags of the bundled termoak-netd: `tailscale` builds in the
+# Tailscale/Headscale backend (tsnet). NETD_TAGS="" builds it with
+# WireGuard only.
+NETD_TAGS="${NETD_TAGS-tailscale}"
+
 # termoak-netd for linux/<goarch> into target/netd/<goarch>/.
 build_netd() { # goarch
-  say "termoak-netd $version: linux/$1"
-  go_in_docker CGO_ENABLED=0 GOOS=linux "GOARCH=$1" -- build -trimpath \
+  say "termoak-netd $version: linux/$1 (tags: ${NETD_TAGS:-none})"
+  go_in_docker CGO_ENABLED=0 GOOS=linux "GOARCH=$1" -- build -trimpath -tags "$NETD_TAGS" \
     -ldflags "-s -w -X github.com/TermoakSSH/server/netd/internal/netd.Version=$version" \
     -o "/src/target/netd/$1/termoak-netd" ./cmd/termoak-netd
 }
@@ -238,7 +244,7 @@ build_netd() { # goarch
 package_networks() {
   if [[ "${NETD_TESTS:-1}" != 0 ]]; then
     say "termoak-netd tests"
-    go_in_docker CGO_ENABLED=0 -- test -count=1 ./...
+    go_in_docker CGO_ENABLED=0 -- test -count=1 -tags "$NETD_TAGS" ./...
   fi
   local pair arch goarch plain d work
   for pair in x86_64:amd64 aarch64:arm64; do

@@ -968,3 +968,167 @@ async fn wireguard_keys_and_netd_follow_the_vaults() {
     assert_eq!(r.status, 200, "{}", r.body);
     fake.wait_downs(&in_shared, 1).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tailscale_networks_are_validated_and_report_logins_and_tailnets() {
+    let (srv, fake) = with_netd(|_| {}).await;
+    let ana = srv.user("Ana").await;
+    let bea = srv.user("Bea").await;
+    let ops = srv.vault(&ana, "Ops").await;
+    srv.share(&ana, &ops, &bea, "use_only").await;
+
+    // The kinds netd can join.
+    let info: Value = reqwest::get(format!("{}/api/v1/info", srv.base))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        info["features"]["network_kinds"],
+        json!(["wireguard", "tailscale"])
+    );
+
+    // Validation (REST): control URL, hostname, tags, the key's shape (never echoed).
+    let tail = |cfg: Value, secret: Value| {
+        json!({"name": "tailnet", "kind": "tailscale", "vault_id": ops,
+               "tailscale": cfg, "secret": secret})
+    };
+    for (cfg, secret) in [
+        (json!({"control_url": "ftp://hs.example.com"}), json!({})),
+        (
+            json!({"control_url": "https://user:pw@hs.example.com"}),
+            json!({}),
+        ),
+        (json!({"hostname": "my server"}), json!({})),
+        (json!({"tags": ["termoak"]}), json!({})),
+        (json!({}), json!({"auth_key": "hskey-auth SECRET"})),
+    ] {
+        let r = srv
+            .post("/api/v1/networks", &ana, tail(cfg.clone(), secret))
+            .await;
+        assert_eq!(r.status, 400, "{cfg}: {}", r.body);
+        assert!(!r.body.to_string().contains("SECRET"), "{}", r.body);
+    }
+    // With a pre-auth key: up in the tailnet; `ephemeral` is kept as null.
+    let keyed = srv
+        .ok(
+            "/api/v1/networks",
+            &ana,
+            tail(
+                json!({"control_url": "https://hs.example.com", "tags": []}),
+                json!({"auth_key": "hskey-auth-ok"}),
+            ),
+        )
+        .await;
+    let keyed = keyed["id"].as_str().unwrap().to_string();
+    let got = srv
+        .get(&format!("/api/v1/networks/{keyed}"), &ana)
+        .await
+        .body;
+    assert!(
+        got["tailscale"]
+            .as_object()
+            .unwrap()
+            .contains_key("ephemeral"),
+        "{got}"
+    );
+    let st = srv
+        .ok(&format!("/api/v1/networks/{keyed}/up"), &ana, json!({}))
+        .await;
+    assert_eq!(st["state"], "up", "{st}");
+    assert_eq!(st["control_url"], "https://hs.example.com");
+    assert_eq!(st["peer_count"], 2);
+    assert_eq!(st["tailnet"], "qa");
+    assert_eq!(st["node"]["dns_name"], "termoak-test.ts.qa.test");
+    let peers = srv
+        .get(&format!("/api/v1/networks/{keyed}/peers"), &ana)
+        .await
+        .body;
+    assert_eq!(peers[0]["tags"], json!(["tag:server"]), "{peers}");
+    assert_eq!(peers[0]["routes"], json!(["192.168.10.0/24"]));
+    assert_eq!(peers[0]["dns_name"], "nas.tail.ts.net");
+
+    // Without a key: needs a login. Editors see the login URL, Use-only
+    // members only the state.
+    let login = srv
+        .ok("/api/v1/networks", &ana, tail(json!({}), json!({})))
+        .await;
+    let login = login["id"].as_str().unwrap().to_string();
+    let st = srv
+        .ok(&format!("/api/v1/networks/{login}/up"), &ana, json!({}))
+        .await;
+    assert_eq!(
+        (st["state"].as_str(), st["auth"].as_str()),
+        (Some("needs_auth"), Some("login"))
+    );
+    assert_eq!(
+        st["node"]["auth_url"],
+        "https://hs.example.com/register/abc"
+    );
+    let st = srv
+        .get(&format!("/api/v1/networks/{login}/status"), &ana)
+        .await
+        .body;
+    assert_eq!(
+        st["node"]["auth_url"], "https://hs.example.com/register/abc",
+        "{st}"
+    );
+    let st = srv
+        .get(&format!("/api/v1/networks/{login}/status"), &bea)
+        .await
+        .body;
+    assert_eq!(st["auth"], "login", "{st}");
+    assert!(st["node"].get("auth_url").is_none(), "{st}");
+    // Up is for Editors.
+    assert_eq!(
+        srv.post(&format!("/api/v1/networks/{login}/up"), &bea, json!({}))
+            .await
+            .status,
+        403
+    );
+    // Connecting through it: network_dial_failed with netd_code needs_auth
+    // and why.
+    let host = net_host(&srv, &ana, &ops, 22, Some(&login)).await;
+    let (status, body) = relay(&srv, &ana, &host).await.err().unwrap();
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(body["error"]["code"], "network_dial_failed");
+    assert_eq!(body["error"]["netd_code"], "needs_auth");
+    assert_eq!(body["error"]["auth"], "login");
+    let test = srv
+        .ok(&format!("/api/v1/hosts/{host}/test"), &ana, json!({}))
+        .await;
+    assert_eq!(test["ok"], false, "{test}");
+    assert_eq!(test["error_code"], "network_dial_failed");
+
+    // Sync v2 pushes are validated the same way.
+    let now = termoak_core::time::now_ms();
+    let bad_push = json!({
+        "id": uuid::Uuid::now_v7(), "kind": "network", "sync_mode": "synced",
+        "updated_at": now, "deleted": false, "rev": 0, "vault_id": ops,
+        "data": {"name": "pushed", "kind": "tailscale", "tailscale": {"tags": ["bad"]}},
+    });
+    let r = srv
+        .ok(
+            "/api/v1/vaults/sync",
+            &ana,
+            json!({"vaults": [], "changes": [bad_push], "kinds": ["network"]}),
+        )
+        .await;
+    assert_eq!(r["rejected"][0]["code"], "invalid", "{r}");
+
+    // Deleting a network makes netd forget it (a persistent node logs out),
+    // even when it is not running.
+    srv.ok(&format!("/api/v1/networks/{login}/down"), &ana, json!({}))
+        .await;
+    assert!(fake.forgets().is_empty());
+    let r = srv.delete(&format!("/api/v1/networks/{login}"), &ana).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    for _ in 0..100 {
+        if fake.forgets().contains(&login) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(fake.forgets().contains(&login), "{:?}", fake.forgets());
+}

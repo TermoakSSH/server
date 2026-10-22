@@ -34,6 +34,10 @@ pub struct Log {
     pub running: std::collections::HashMap<String, String>,
     /// Ids of every `down`, in order.
     pub downs: Vec<String>,
+    /// Ids of the `down`s with `forget` (the network was deleted).
+    pub forgets: Vec<String>,
+    /// The status of Tailscale networks brought up (status only has the id).
+    pub statuses: std::collections::HashMap<String, Value>,
 }
 
 pub struct FakeNetd {
@@ -49,6 +53,10 @@ impl FakeNetd {
 
     pub fn downs(&self) -> Vec<String> {
         self.log.lock().downs.clone()
+    }
+
+    pub fn forgets(&self) -> Vec<String> {
+        self.log.lock().forgets.clone()
     }
 
     /// The revision a network runs with (`None`: down).
@@ -70,7 +78,9 @@ impl FakeNetd {
 
 /// Starts the fake netd. Networks of kind `zerotier` are refused as
 /// `unsupported_kind` (a build without ZeroTier); dials to port 1 fail
-/// with `dial_failed`.
+/// with `dial_failed`. A `tailscale` network without an auth key waits for
+/// a login (`needs_auth`, `auth: login`, a login URL; its dials answer
+/// `needs_auth`); with one it is up in a tailnet.
 pub async fn start() -> FakeNetd {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("netd.sock");
@@ -134,8 +144,36 @@ async fn serve(conn: UnixStream, log: Arc<Mutex<Log>>) -> std::io::Result<()> {
         let rev = net["revision"].as_str().unwrap_or("").to_string();
         log.lock().running.insert(id.clone(), rev);
     }
+    if op == "dial"
+        && net["kind"] == "tailscale"
+        && net["secret"]["auth_key"].as_str().unwrap_or("").is_empty()
+    {
+        return answer(
+            &mut reader,
+            json!({"ok": false, "code": "needs_auth", "auth": "login",
+                   "message": "the network waits for authorization: the node must be logged in"}),
+        )
+        .await;
+    }
     let running_rev = log.lock().running.get(&id).cloned();
+    let tailscale = net["kind"] == "tailscale";
+    let login = tailscale && net["secret"]["auth_key"].as_str().unwrap_or("").is_empty();
     let status = |state: &str| {
+        if tailscale && state != "down" {
+            if login {
+                return json!({"network_id": id, "state": "needs_auth", "auth": "login",
+                              "message": "the node must be logged in: open the login URL",
+                              "revision": running_rev, "control_url": "https://hs.example.com",
+                              "ephemeral": false,
+                              "node": {"name": "termoak-test", "addresses": [],
+                                       "auth_url": "https://hs.example.com/register/abc"}});
+            }
+            return json!({"network_id": id, "state": "up", "revision": running_rev,
+                          "control_url": "https://hs.example.com", "tailnet": "qa",
+                          "magic_dns_suffix": "ts.qa.test", "peer_count": 2, "ephemeral": true,
+                          "node": {"name": "termoak-test", "addresses": ["100.64.0.1"],
+                                   "dns_name": "termoak-test.ts.qa.test", "node_id": "n1"}});
+        }
         json!({"network_id": id, "state": state, "revision": running_rev,
                "node": {"name": "termoak-test", "addresses": ["100.64.0.1"],
                         "public_key": "ZmFrZQ=="}})
@@ -150,31 +188,44 @@ async fn serve(conn: UnixStream, log: Arc<Mutex<Log>>) -> std::io::Result<()> {
             .await
         }
         "up" => {
-            log.lock().up.push(id.clone());
-            answer(&mut reader, json!({"ok": true, "status": status("up")})).await
+            let st = status("up");
+            {
+                let mut l = log.lock();
+                l.up.push(id.clone());
+                if tailscale {
+                    l.statuses.insert(id.clone(), st.clone());
+                }
+            }
+            answer(&mut reader, json!({"ok": true, "status": st})).await
         }
         "down" => {
             {
                 let mut l = log.lock();
                 l.running.remove(&id);
                 l.downs.push(id.clone());
+                if req["forget"] == true {
+                    l.forgets.push(id.clone());
+                }
             }
             answer(&mut reader, json!({"ok": true})).await
         }
         "status" => {
+            // Only the id comes with `status`: the fake remembers which
+            // networks are Tailscale ones waiting for a login.
             let up = running_rev.is_some();
-            answer(
-                &mut reader,
-                json!({"ok": true, "status": status(if up { "up" } else { "down" })}),
-            )
-            .await
+            let st = match log.lock().statuses.get(&id) {
+                Some(s) if up => s.clone(),
+                _ => status(if up { "up" } else { "down" }),
+            };
+            answer(&mut reader, json!({"ok": true, "status": st})).await
         }
         "peers" => {
             answer(
                 &mut reader,
                 json!({"ok": true, "peers": [
                     {"name": "nas", "dns_name": "nas.tail.ts.net", "addresses": ["100.64.0.7"],
-                     "os": "linux", "online": true}
+                     "os": "linux", "online": true, "tags": ["tag:server"],
+                     "routes": ["192.168.10.0/24"], "id": "nNAS"}
                 ]}),
             )
             .await

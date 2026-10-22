@@ -19,7 +19,7 @@ services:
       # OPENCODE_GO_KEY: "..."
       # CODEX_HOME: /var/lib/termoak/codex
 
-  # Private networks (WireGuard), the "with networks" build: started with
+  # Private networks (WireGuard, Tailscale/Headscale), the "with networks" build: started with
   # `docker compose --profile networks up -d`, with the two commented lines
   # of the termoak service enabled. Built locally (no published image).
   netd:
@@ -31,7 +31,10 @@ services:
     restart: unless-stopped
     volumes:
       - termoak-netd-run:/run/termoak-netd
+      # Persistent Tailscale nodes (ephemeral: false).
+      - termoak-netd-state:/var/lib/termoak-netd
 
 volumes:
   termoak-data:
   termoak-netd-run:
+  termoak-netd-state:

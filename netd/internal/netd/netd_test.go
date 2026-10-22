@@ -189,7 +189,7 @@ func TestKindsAndValidation(t *testing.T) {
 		}
 	}
 	kinds := netd.Kinds()
-	if strings.Join(kinds, ",") != "fake,wireguard" {
+	if strings.Join(kinds, ",") != "fake,slow,wireguard" {
 		t.Fatalf("%v", kinds)
 	}
 }

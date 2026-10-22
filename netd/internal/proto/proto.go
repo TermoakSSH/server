@@ -38,6 +38,16 @@ const (
 	StateError     = "error"
 )
 
+// Why a node in StateNeedsAuth waits (Status.Auth, Error.Auth).
+const (
+	// AuthLogin: the node must be logged in (no auth key): open
+	// Node.AuthURL (Tailscale login, Headscale registration).
+	AuthLogin = "login"
+	// AuthApproval: the node is logged in but an admin must approve it
+	// (Tailscale device approval).
+	AuthApproval = "approval"
+)
+
 // Request is one request line.
 type Request struct {
 	V         int    `json:"v"`
@@ -47,6 +57,10 @@ type Request struct {
 	Host      string `json:"host,omitempty"`
 	Port      int    `json:"port,omitempty"`
 	TimeoutMs int64  `json:"timeout_ms,omitempty"`
+	// Forget (down): the network was deleted. Besides stopping its node,
+	// netd removes what it keeps of it (a persistent Tailscale node is
+	// logged out and its state directory deleted).
+	Forget bool `json:"forget,omitempty"`
 }
 
 // Spec is a whole network as the server sends it with every request that
@@ -119,6 +133,8 @@ type Node struct {
 	PublicKey string   `json:"public_key,omitempty"`
 	NodeID    string   `json:"node_id,omitempty"`
 	AuthURL   string   `json:"auth_url,omitempty"`
+	// DNSName: the node's MagicDNS name (Tailscale).
+	DNSName string `json:"dns_name,omitempty"`
 }
 
 // Status of a network in netd.
@@ -141,6 +157,24 @@ type Status struct {
 	// Connections opened / failed since the network came up.
 	Dials       uint64 `json:"dials"`
 	DialsFailed uint64 `json:"dials_failed"`
+
+	// Tailscale/Headscale (absent for WireGuard):
+	// Auth tells why a needs_auth node waits: AuthLogin (open
+	// Node.AuthURL) or AuthApproval (approve it in the admin console).
+	Auth string `json:"auth,omitempty"`
+	// ControlURL is the control server the node uses (Tailscale's when
+	// the network has none).
+	ControlURL string `json:"control_url,omitempty"`
+	// Tailnet name and its MagicDNS suffix, once logged in.
+	Tailnet        string `json:"tailnet,omitempty"`
+	MagicDNSSuffix string `json:"magic_dns_suffix,omitempty"`
+	// PeerCount: devices the node sees in the tailnet.
+	PeerCount *int `json:"peer_count,omitempty"`
+	// Ephemeral: the node leaves the tailnet when it stops.
+	Ephemeral *bool `json:"ephemeral,omitempty"`
+	// LastError: the latest error of the node (the control server refused
+	// the auth key...), also while it retries.
+	LastError string `json:"last_error,omitempty"`
 }
 
 // Peer is a device of the network ("import hosts").
@@ -153,12 +187,20 @@ type Peer struct {
 	LastSeen  int64    `json:"last_seen,omitempty"`
 	PublicKey string   `json:"public_key,omitempty"`
 	Endpoint  string   `json:"endpoint,omitempty"`
+	// Tailscale: ACL tags of the device and the subnets it routes for the
+	// tailnet (exit routes left out).
+	Tags   []string `json:"tags,omitempty"`
+	Routes []string `json:"routes,omitempty"`
+	// ID: the device's stable id in the tailnet (Tailscale).
+	ID string `json:"id,omitempty"`
 }
 
 // Error is a refused request.
 type Error struct {
 	Code    string
 	Message string
+	// Auth (with CodeNeedsAuth): AuthLogin or AuthApproval.
+	Auth string
 }
 
 func (e *Error) Error() string { return e.Message }
@@ -170,5 +212,9 @@ func Errorf(code, format string, args ...any) *Error {
 
 // ErrorLine is the answer for an Error.
 func ErrorLine(e *Error) map[string]any {
-	return map[string]any{"ok": false, "code": e.Code, "message": e.Message}
+	line := map[string]any{"ok": false, "code": e.Code, "message": e.Message}
+	if e.Auth != "" {
+		line["auth"] = e.Auth
+	}
+	return line
 }

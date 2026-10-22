@@ -477,6 +477,10 @@ async fn info(State(st): State<AppState>) -> ApiResult<Json<Value>> {
             // `/networks`, sync v2 `kinds: ["network"]` and the relay
             // (`GET /hosts/{id}/relay`).
             "networks": st.netd.as_ref().is_some_and(|n| n.is_healthy()),
+            // The kinds netd can join (its `hello`): `wireguard`, and
+            // `tailscale` in builds with Tailscale/Headscale. Empty without
+            // netd. Apps offer a kind only when it is listed.
+            "network_kinds": st.netd.as_ref().map(|n| n.kinds()).unwrap_or_default(),
             "plans": true,
             "web": st.config.web.enabled,
             "email": st.mailer.enabled(),

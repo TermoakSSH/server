@@ -12,11 +12,10 @@ import (
 
 // Backend joins networks of one kind (wireguard, tailscale, zerotier).
 //
-// WireGuard is always built in. Tailscale (tsnet) and ZeroTier (libzt) will
-// be added behind build tags: a file with `//go:build tailscale` in
-// cmd/termoak-netd calls Register("tailscale", …) from its init. Without
-// it, networks of that kind answer `unsupported_kind` and `hello` does not
-// list the kind.
+// WireGuard is always built in. Tailscale (tsnet) is behind the
+// `tailscale` build tag (cmd/termoak-netd/tailscale.go registers it) and
+// ZeroTier (libzt) will be too. Without them, networks of those kinds
+// answer `unsupported_kind` and `hello` does not list the kind.
 type Backend interface {
 	// Start brings a node up for spec. It must not block for long: a node
 	// that needs time (authorization, control server) reports it in Info.
@@ -36,15 +35,43 @@ type Node interface {
 	Close() error
 }
 
+// Settler is a node that takes a while to join its network after Start
+// (Tailscale: the control server, login, approval). Settled returns once
+// the node is up, waits for authorization or failed, or when ctx ends.
+type Settler interface {
+	Settled(ctx context.Context)
+}
+
+// ForgetCloser is a node that keeps something after Close (a persistent
+// Tailscale node's state): CloseAndForget takes it down and removes it
+// (`down` with `forget`, when the network was deleted).
+type ForgetCloser interface {
+	CloseAndForget() error
+}
+
+// Forgetter is a backend that can remove what it keeps of a network that
+// is not running (`down` with `forget`).
+type Forgetter interface {
+	Forget(ctx context.Context, id string, log *slog.Logger) error
+}
+
 // NodeInfo is what a node reports for Status.
 type NodeInfo struct {
-	// State: up, needs_auth or error (starting is the manager's).
+	// State: starting, up, needs_auth or error.
 	State           string
 	Message         string
 	Node            *proto.Node
 	RxBytes         uint64
 	TxBytes         uint64
 	LastHandshakeAt int64
+	// Tailscale (see proto.Status).
+	Auth           string
+	ControlURL     string
+	Tailnet        string
+	MagicDNSSuffix string
+	PeerCount      *int
+	Ephemeral      *bool
+	LastError      string
 }
 
 var (
@@ -78,9 +105,22 @@ func Kinds() []string {
 	return out
 }
 
+// forgetters are the registered backends that keep state between runs.
+func forgetters() []Forgetter {
+	backendsMu.RLock()
+	defer backendsMu.RUnlock()
+	var out []Forgetter
+	for _, b := range backends {
+		if f, ok := b.(Forgetter); ok {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // plannedKinds are known kinds this build may lack (a clean
 // unsupported_kind instead of "unknown kind").
 var plannedKinds = map[string]string{
-	"tailscale": "this termoak-netd cannot join Tailscale or Headscale networks yet (it was built without tsnet)",
+	"tailscale": "this termoak-netd cannot join Tailscale or Headscale networks (it was built without the tailscale tag)",
 	"zerotier":  "this termoak-netd cannot join ZeroTier networks (it was built without libzt)",
 }

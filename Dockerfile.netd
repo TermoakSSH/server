@@ -10,18 +10,28 @@ COPY netd/go.mod netd/go.sum ./
 RUN go mod download
 COPY netd ./
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath \
+# TAGS=tailscale (the default) builds in the Tailscale/Headscale backend
+# (tsnet); TAGS="" leaves it out (WireGuard only, a smaller binary).
+ARG TAGS=tailscale
+RUN CGO_ENABLED=0 go build -trimpath -tags "${TAGS}" \
       -ldflags "-s -w -X github.com/TermoakSSH/server/netd/internal/netd.Version=${VERSION}" \
       -o /out/termoak-netd ./cmd/termoak-netd
 
 FROM debian:bookworm-slim
-RUN useradd --system --home /var/lib/termoak --create-home termoak \
- && mkdir -p /run/termoak-netd \
- && chown termoak:termoak /run/termoak-netd \
- && chmod 0750 /run/termoak-netd
+# ca-certificates: tsnet talks HTTPS to Tailscale's (or a Headscale)
+# control server and DERP relays.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --home /var/lib/termoak --create-home termoak \
+ && mkdir -p /run/termoak-netd /var/lib/termoak-netd \
+ && chown termoak:termoak /run/termoak-netd /var/lib/termoak-netd \
+ && chmod 0750 /run/termoak-netd && chmod 0700 /var/lib/termoak-netd
 COPY --from=build /out/termoak-netd /usr/local/bin/
 USER termoak
-VOLUME ["/run/termoak-netd"]
+# The state volume keeps persistent Tailscale nodes (ephemeral: false).
+VOLUME ["/run/termoak-netd", "/var/lib/termoak-netd"]
 ENV TERMOAK_NETD_SOCKET=/run/termoak-netd/netd.sock \
-    TERMOAK_NETD_IDLE=15m
+    TERMOAK_NETD_STATE_DIR=/var/lib/termoak-netd \
+    TERMOAK_NETD_IDLE=15m \
+    GOMEMLIMIT=384MiB
 ENTRYPOINT ["/usr/local/bin/termoak-netd"]

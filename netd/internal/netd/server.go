@@ -218,7 +218,11 @@ func (s *Server) dispatch(ctx context.Context, req *proto.Request, c net.Conn, r
 		if !proto.ValidID(req.NetworkID) {
 			return nil, proto.Errorf(proto.CodeInvalid, "invalid network_id")
 		}
-		s.M.Down(req.NetworkID, "requested")
+		if req.Forget {
+			s.M.Forget(req.NetworkID)
+		} else {
+			s.M.Down(req.NetworkID, "requested")
+		}
 		return ok(nil), nil
 	case "status":
 		if !proto.ValidID(req.NetworkID) {
