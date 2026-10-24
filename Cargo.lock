@@ -3580,8 +3580,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ai"
-version = "0.7.0-next.4"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.4#606a9c8491ededa9c79cc5303f3fa34e0596652c"
+version = "0.7.0-next.5"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.5#26028986273d661d66bb14d11cf3512187080663"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3605,8 +3605,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-client"
-version = "0.7.0-next.4"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.4#606a9c8491ededa9c79cc5303f3fa34e0596652c"
+version = "0.7.0-next.5"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.5#26028986273d661d66bb14d11cf3512187080663"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3629,13 +3629,14 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "winreg",
  "zeroize",
 ]
 
 [[package]]
 name = "termoak-core"
-version = "0.7.0-next.4"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.4#606a9c8491ededa9c79cc5303f3fa34e0596652c"
+version = "0.7.0-next.5"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.5#26028986273d661d66bb14d11cf3512187080663"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -3662,8 +3663,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ffi"
-version = "0.7.0-next.4"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.4#606a9c8491ededa9c79cc5303f3fa34e0596652c"
+version = "0.7.0-next.5"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.5#26028986273d661d66bb14d11cf3512187080663"
 dependencies = [
  "alacritty_terminal",
  "async-trait",
@@ -3691,7 +3692,7 @@ dependencies = [
 
 [[package]]
 name = "termoak-server"
-version = "0.7.0-next.4"
+version = "0.7.0-next.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3736,8 +3737,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ssh"
-version = "0.7.0-next.4"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.4#606a9c8491ededa9c79cc5303f3fa34e0596652c"
+version = "0.7.0-next.5"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.5#26028986273d661d66bb14d11cf3512187080663"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3760,8 +3761,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-update"
-version = "0.7.0-next.4"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.4#606a9c8491ededa9c79cc5303f3fa34e0596652c"
+version = "0.7.0-next.5"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.5#26028986273d661d66bb14d11cf3512187080663"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4733,6 +4734,16 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+
+[[package]]
+name = "winreg"
+version = "0.55.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
+dependencies = [
+ "cfg-if",
+ "windows-sys 0.59.0",
+]
 
 [[package]]
 name = "wit-bindgen"
