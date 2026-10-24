@@ -1,9 +1,9 @@
 # Teams security: SSH CA, temporary access, policies and fine roles (Termoak 0.7, phase 4b)
 
-Status: **phase 4c** (2026-10-24): design (this file, identical copy in
-`server/docs/TEAMS-SECURITY.md`), core v0.7.0-next.8, server 0.7.0-next.8
+Status: **phase 4d** (2026-10-24): design (this file, identical copy in
+`server/docs/TEAMS-SECURITY.md`), core v0.7.0-next.9, server 0.7.0-next.8
 (staging next.termoak.com, schema v13), QA suite `teams-security`; web and
-desktop UIs done (4c, §13.1); Android + iOS next (4d, §13.2).
+desktop UIs done (4c, §13.1); Android and iOS done (4d, §13.2).
 Plan: `PLAN-0.7.md` §3 items 3, 4 and 6. Builds on `VAULTS-MULTISERVER.md`
 (vaults, roles, Strict, just-in-time credentials), `PUSH.md` (approvals by
 push) and `SSH-PRO.md` (security keys; certificates already work with them).
@@ -795,50 +795,86 @@ apps unless said otherwise.
       Use-only members of normal vaults read `GET /certificates` instead so
       no JIT credential is fetched twice.
 
-### 13.2 Phase 4d — Android + iOS
+### 13.2 Phase 4d — Android + iOS (done 2026-10-24)
 
-- [ ] Core bindings v0.7.0-next.8: handle `VaultRole.ConnectOnly` /
-      `ItemAccess.ConnectOnly` (exhaustive `when`/`switch`), `HostSettings
-      .auth`, `VaultInfo.policy`. ConnectOnly items: never JIT; connect
-      locally only when the host's effective auth (own or nearest group's)
-      is `team_certificate` and `policy.certificates`, else a server session.
-- [ ] Push: `access_request` notifications (category approval:
-      Approve/Deny open the approval screen behind the app lock, never act
-      from the notification), `resolved` removes them, `access_decided`
-      (info) opens "My requests"; add the kind to Settings → Notifications.
-- [ ] Approval screen (request details, Approve with optional shorter
-      window and note, Deny with reason) and approvals inbox; "My requests"
-      with cancel/end. Listings carry `can_decide`; events
-      (`access_request`) carry the bare request without it: refetch the
-      lists on any event (both apps do).
-- [ ] Connect flow: `access_approval_required` → Request access sheet. The
-      error's details differ: the server's (`host_id, policy_id,
-      target_kind, target_id, max_minutes`) vs the engine's own check
-      (adds `vault_id, pending, can_request`). Request on the host (the
-      server applies its effective policy); a group/vault-wide request is
-      optional. `access_duration_too_long` carries `max_minutes`. `/exec`
-      results only carry the text. After an event, ask `host_access` again
-      (the engine caches answers 30 s and forgets them with
-      `forget_access`).
-- [ ] Window countdown on the host row/tab (1 s ticks in the last 2 min, a
-      warning colour in the last 5); `access_expired` / `access_revoked`
-      closing texts.
-- [ ] Host/group editor: Authentication picker (inherit / Team
-      certificate), with "no CA" warning from `policy.certificates`.
-- [ ] Hide reveal/copy/export/AI/network per `policy`; recording badge;
-      `upload_recording` happens in the core after local sessions on
-      recorded hosts (check it on the device builds).
-- [ ] Team security screens (read-only on phones is acceptable: CA
-      fingerprint, sshd line copy, policy summary, compliance list); full
-      editing optional. The install script needs a manager's token: show
-      the heredoc command (copy/share), never a `curl | sh`.
-- [ ] 2FA banner (`team_2fa` from `/me`, or the login answer) with a link
-      to the 2FA setup; a blocked member's team vaults vanish from sync.
-- [ ] Texts en/es for the new codes and close reasons.
-- [ ] Live test against staging (approval from the phone with the staging
-      ntfy; Connect only + certificate login to a `termoak-qa-sshd`
-      container with the install script). Test accounts with 2FA need
-      `totp_code` on every new sign-in: keep refreshing tokens instead.
+Android 0.7.0-next.5 (`next` 491bfc3) and iOS (`next` fe1ddf7, not built
+here) on core **v0.7.0-next.9** (4a58ce6), which adds two FFI calls the
+phones needed: `download_vault_recording` (a `.cast` is not one JSON
+document, so `api_request` can't read `GET /vaults/{id}/recordings/{s}`)
+and `forget_access` (the desktop forgets the engine's cached host answers
+and certificates through termoak-client on every `access_request` event).
+Every item below is in both apps unless said otherwise.
+
+- [x] Core bindings v0.7.0-next.9: `VaultRole.ConnectOnly` /
+      `ItemAccess.ConnectOnly` in every `when`/`switch` (Android needed one;
+      iOS two plus the demo's `VaultInfo`), `HostSettings.auth` kept on
+      edits, `VaultInfo.policy` → the gates. ConnectOnly (and Strict Use)
+      items open on the device only when the host's effective auth (own or
+      nearest group's) is `team_certificate` and `policy.certificates`, else
+      as server sessions; files follow the same rule.
+- [x] Push: `access_request` (approval: Approve/Deny only open the Access
+      screen's confirmation behind the app lock), `resolved` withdraws it
+      (its kind is `resolved`, not `access_request`), `access_decided`
+      (info) opens My requests; the kind in Settings → Notifications.
+- [x] Access screen (Settings; Android: also the desktop layout's sidebar
+      and a badge on the Settings tab): waiting for your decision (approve
+      with a shorter window starting now and a note, deny with a reason),
+      open windows you can end with a reason, recent decisions, my requests
+      with cancel/end. The lists and every host asked about are read again
+      on every event; snackbars/notices for the events that concern you.
+- [x] Connect flow: `access_approval_required` (both detail shapes) →
+      "Approval needed" card on the terminal with Request access (duration
+      up to the max, reason, this host or what the policy covers), then
+      "Waiting for approval" with Cancel request; the terminal connects by
+      itself when `host_access` says it is allowed (after an event, or a
+      20 s fallback). A server session refused with only the English text
+      asks `host_access` to build the card.
+- [x] Countdown on host rows/cards and the terminal bar (1 s ticks in the
+      last 2 min, amber in the last 5); `access_expired` /
+      `access_revoked` close texts, kept over the following
+      `session_ended`.
+- [x] Host/group editors: Authentication (the group's, or Team
+      certificate; a later value kept) with what is inherited and the no-CA
+      warning.
+- [x] Hidden per `policy`: key export and move/copy out of the vault
+      (reveal), terminal AI / Fix chip / new AI tasks (AI), the network
+      picker (networks); "Recorded" chips; `upload_recording` is done by the
+      core after local recorded sessions (to check on devices).
+- [x] Team security with full editing (Teams → a team → Security): CA
+      (create, fingerprint, public key, sshd lines, install command as the
+      `sudo sh -s <<'TERMOAK_CA'` heredoc to copy or share, rotate, disable
+      with the typed name, issued certificates, revoke serial/member/key),
+      team policy (read-only for members), 2FA compliance and principals.
+      Personal CA and your certificates in Settings → SSH certificates.
+- [x] Access policy editor (vault Admins) for the vault (vault page →
+      Access policies), groups and hosts (their menus); vault recordings
+      with download/share and a player (the engine's terminal emulator).
+- [x] 2FA banner (`team2fa_requirements` = `/me` `team_2fa`) with a link to
+      two-step verification.
+- [x] en/es for every code, close reason and screen (Android
+      `strings_teams_security.xml`, iOS `Localizable.xcstrings`; the
+      desktop's texts plus the apps'). Role names Use / Edit / Admin.
+- [x] Live test against staging (Android `LiveAccessTest`, engine built for
+      the PC): team + Connect only vault, CA installed in a
+      `termoak-qa-sshd` container with the install script, vault approval
+      policy; refused with `access_approval_required`; request pushed to the
+      admin's phone through the staging ntfy (Approve/Deny only open),
+      approved for 1 min, `access_decided` on the member's phone, admin's
+      notification withdrawn; ssh from the phone with a certificate for an
+      ephemeral key (principal `qa`, capped to the window); server host test
+      inside the window; a server session closed with `access_expired`; a
+      second window revoked → `access_revoked`, then refused again.
+
+Found on the way (for the next phases):
+- A server session to a new host needs its host key trusted first (a host
+  test with `trust=true`), else it times out "negotiating SSH" while the
+  holder waits for the prompt; the staging holder reaches Docker containers
+  by their bridge IP, not by a port published on 127.0.0.1.
+- iOS type-checking on Linux: `swift-frontend -typecheck -primary-file`
+  per changed file against the whole app (seconds) instead of the driver
+  (ten minutes, one file's errors at a time); the stand-in modules still
+  lack some iOS 16 API (`TextField(axis:)`, `ShareLink`, `Timer.publish`,
+  `alert(Text)`), added as stubs.
 
 ## 14. Deferred / open
 
