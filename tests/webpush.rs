@@ -257,6 +257,7 @@ async fn web_push_end_to_end() {
     assert_eq!(msg["v"], 1);
     assert_eq!(msg["body"], "Notifications work on this device.");
     assert_eq!(msg["server"], info["instance_id"]);
+    assert_eq!(msg["user"], phone.id);
     assert!(tablet_keys.decrypt(&g.body).is_err());
     assert_eq!(g.headers["ttl"], "300");
     assert_eq!(g.headers["urgency"], "high");

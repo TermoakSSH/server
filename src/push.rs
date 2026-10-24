@@ -952,10 +952,11 @@ impl Push {
     }
 
     /// Test notification to one device (waits for the result).
-    pub async fn test(&self, target: &PushTarget, locale: &str) -> Result<(), String> {
+    pub async fn test(&self, target: &PushTarget, user: Id, locale: &str) -> Result<(), String> {
         let l = crate::i18n::resolve(locale);
         let mut p = Payload::new("test", "Termoak", &t!("push.test.body", locale = l));
         p.server = Some(self.instance_id.clone());
+        p.user = Some(user.to_string());
         p.collapse = Some(format!("test-{}", target.device_id));
         self.deliver(target, &p).await
     }
@@ -1472,7 +1473,7 @@ async fn test_push(
         )
         .with_detail("retry_ms", push.tests.wait_ms(&key)));
     }
-    push.test(&target, &u.user.locale)
+    push.test(&target, u.id(), &u.user.locale)
         .await
         .map_err(|e| ApiError::new(axum::http::StatusCode::BAD_GATEWAY, "push_failed", e))?;
     Ok(axum::Json(json!({"ok": true})))
