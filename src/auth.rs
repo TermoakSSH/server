@@ -487,10 +487,9 @@ async fn info(State(st): State<AppState>) -> ApiResult<Json<Value>> {
             "email_verification": crate::account::verification_enforced(&st),
             // `POST /auth/verify-code` and `/auth/resend-code` exist.
             "email_verification_code": crate::account::verification_enforced(&st),
-            "push": {
-                "apns": st.push.as_ref().is_some_and(|p| p.platforms().0),
-                "fcm": st.push.as_ref().is_some_and(|p| p.platforms().1),
-            },
+            // What the server can send: `webpush` (UnifiedPush distributors
+            // and browsers, with `vapid_public_key`), `apns`, `fcm`.
+            "push": crate::push::server_features(&st),
         },
         "support_email": st.config.web.support_email,
         "terms_url": st.config.web.terms_url,

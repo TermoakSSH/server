@@ -83,6 +83,15 @@ impl Sockets {
         self.sign_out(|s| s.user == user && s.kind == SocketKind::Events)
     }
 
+    /// Whether a device has its events socket open (the app is running and
+    /// shows events itself: push stays quiet).
+    pub fn has_events(&self, device: Id) -> bool {
+        self.open
+            .lock()
+            .values()
+            .any(|s| s.device == device && s.kind == SocketKind::Events)
+    }
+
     /// Open WebSockets of a device.
     pub fn count_for_device(&self, device: Id) -> usize {
         self.open

@@ -52,5 +52,11 @@
   "push.join_request.generic": "Someone is waiting to join a session you share.",
   "push.control_request.title": "Keyboard requested",
   "push.control_request.body": "%{name} asks for the keyboard of “%{title}”.",
-  "push.control_request.generic": "Someone asks for the keyboard of a session you share."
+  "push.control_request.generic": "Someone asks for the keyboard of a session you share.",
+  "push.security_key_request.title": "Security key needed",
+  "push.security_key_request.body": "Touch your security key to connect to %{host}.",
+  "push.security_key_request.generic": "A connection is waiting for your security key. Open Termoak to use it.",
+  "push.access_request.title": "Access request",
+  "push.access_request.body": "%{name} asks for access to %{target}.",
+  "push.access_request.generic": "Someone is asking for temporary access and is waiting for your approval."
 }

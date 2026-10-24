@@ -416,19 +416,71 @@ impl Default for WebSection {
     }
 }
 
-/// Push notifications to the mobile apps.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Push notifications to the apps: Web Push (UnifiedPush distributors such
+/// as ntfy, and browsers) with no third party involved, APNs for iOS and,
+/// optionally, FCM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PushSection {
     /// Include details in the text (the command the AI wants to run, the
     /// session title...). Apple and Google see that text; by default only
     /// generic notices are sent and the app fetches the details when opened.
     pub detailed: bool,
+    /// Most notifications per device and minute (withdrawals of answered
+    /// requests do not count).
+    pub max_per_minute: usize,
+    pub webpush: WebPushSection,
     pub apns: Option<ApnsSection>,
     pub fcm: Option<FcmSection>,
 }
 
-/// Apple Push Notification service (iOS), with a `.p8` authentication key.
+impl Default for PushSection {
+    fn default() -> Self {
+        Self {
+            detailed: false,
+            max_per_minute: 30,
+            webpush: WebPushSection::default(),
+            apns: None,
+            fcm: None,
+        }
+    }
+}
+
+/// Web Push (RFC 8030/8291/8292): the endpoint a UnifiedPush distributor or
+/// a browser gives, payloads encrypted for the device and signed with this
+/// server's VAPID key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebPushSection {
+    pub enabled: bool,
+    /// The VAPID private key. Created on first start when missing (mode
+    /// 0600; back it up with the master key: a new one makes browsers drop
+    /// their subscriptions). Default: `<data_dir>/vapid.key`. Its content in
+    /// `TERMOAK_VAPID_KEY` also works.
+    pub key_path: Option<PathBuf>,
+    /// Contact for the push services (`mailto:` or `https:`). Default:
+    /// `mailto:` + `[web] support_email`, else `public_url`.
+    pub subject: Option<String>,
+    /// Endpoints the server may call although they are `http://` or on a
+    /// private or loopback address (URL prefixes, e.g. a self-hosted ntfy
+    /// on the same machine: `"http://127.0.0.1:2586/"`). Anything else must
+    /// be `https://` on a public address.
+    pub allowed_endpoints: Vec<String>,
+}
+
+impl Default for WebPushSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            key_path: None,
+            subject: None,
+            allowed_endpoints: Vec::new(),
+        }
+    }
+}
+
+/// Apple Push Notification service (iOS), with a `.p8` authentication key
+/// (token-based, HTTP/2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApnsSection {
     /// Path of the `.p8` key. Its content in `TERMOAK_APNS_KEY` also works.
@@ -438,13 +490,28 @@ pub struct ApnsSection {
     pub key_id: String,
     /// Apple Developer team id.
     pub team_id: String,
-    /// Bundle id of the iOS app.
+    /// Bundle id of the iOS app (the `apns-topic`).
+    #[serde(alias = "bundle_id")]
     pub topic: String,
+    /// `auto` (each device says whether its build is a development one:
+    /// sandbox), `production` or `sandbox` (every device).
+    #[serde(default)]
+    pub environment: ApnsEnvironment,
     /// Tests only: other endpoints.
     #[serde(default)]
     pub endpoint: Option<String>,
     #[serde(default)]
     pub sandbox_endpoint: Option<String>,
+}
+
+/// Which APNs environment to use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApnsEnvironment {
+    #[default]
+    Auto,
+    Production,
+    Sandbox,
 }
 
 /// Firebase Cloud Messaging (Android), HTTP v1 API with a service account.
@@ -689,16 +756,29 @@ from = "Termoak <no-reply@localhost>"
 # Require a verified email to use the account
 require_verification = false
 
-# Push notifications to the iOS and Android apps (AI approvals, finished
-# tasks, sessions shared with you...). By default the text is generic: Apple
-# and Google never see commands or titles (detailed = true to include them).
+# Push notifications to the apps (AI approvals, session requests, security
+# keys, finished tasks, sessions shared with you...). By default the text is
+# generic: push services never see commands or titles (detailed = true to
+# include them).
 [push]
 detailed = false
+max_per_minute = 30
+# Web Push without Google or Apple: UnifiedPush distributors on Android (the
+# ntfy app with ntfy.sh or your own ntfy, NextPush...) and browsers. The
+# payload is encrypted for each device; the VAPID key is created on first
+# start in <data_dir>/vapid.key (back it up).
+[push.webpush]
+enabled = true
+# subject = "mailto:admin@example.com"
+# allowed_endpoints = ["http://127.0.0.1:2586/"]   # a local ntfy (http/private)
+# iOS: APNs with a .p8 key (Apple Developer: Keys, "Apple Push Notifications
+# service"). Disabled until configured.
 # [push.apns]
 # key_path = "/etc/termoak/AuthKey_ABC123DEFG.p8"   # or TERMOAK_APNS_KEY
 # key_id = "ABC123DEFG"
 # team_id = "TEAMID1234"
-# topic = "com.termoak"
+# bundle_id = "com.termoak"
+# environment = "auto"    # auto (per device), production or sandbox
 # [push.fcm]
 # service_account_path = "/etc/termoak/firebase.json"   # or TERMOAK_FCM_CREDENTIALS
 

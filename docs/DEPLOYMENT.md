@@ -361,31 +361,113 @@ An administrator changes the plan of an account with
 
 ## Push notifications
 
-For the iOS and Android apps to notify you even when closed (AI approvals,
-finished tasks, shared sessions...):
+The apps get notified even when closed (AI approvals, join and keyboard
+requests, security key requests, finished tasks, shared sessions...). Three
+ways, all optional and side by side:
 
-- **iOS (APNs).** In Apple Developer, create an APNs authentication key
-  (`.p8` file) and note its id and your team id:
+### Web Push / UnifiedPush (default, no Google or Apple)
+
+On by default (`[push.webpush] enabled = true`). Android devices register
+the endpoint of their **UnifiedPush distributor** (the ntfy app with
+ntfy.sh or your own ntfy server, NextPush with Nextcloud...) and browsers
+their Push API subscription. The server encrypts every payload for the
+device (RFC 8291) and signs its requests with its **VAPID key** (RFC 8292):
+
+- The key is created on first start in `<data_dir>/vapid.key` (mode 0600)
+  or read from `[push.webpush] key_path` / `TERMOAK_VAPID_KEY` (the raw
+  32-byte private key, base64url). **Back it up with `master.key`**: a new
+  key makes browsers drop their subscriptions. Never commit it.
+- `subject` is the contact the push services see (`mailto:` or `https:`);
+  default `mailto:` + `[web] support_email`, else `public_url`.
+- The server only calls `https://` endpoints on public addresses (no
+  redirects; names resolving to private addresses are refused). A push
+  server on the same machine or network goes in `allowed_endpoints`:
 
   ```toml
-  [push.apns]
-  key_path = "/etc/termoak/AuthKey_ABC123DEFG.p8"   # or its content in TERMOAK_APNS_KEY
-  key_id = "ABC123DEFG"
-  team_id = "TEAMID1234"
-  topic = "com.termoak"                             # bundle id of the app
+  [push.webpush]
+  enabled = true
+  subject = "mailto:admin@example.com"
+  allowed_endpoints = ["http://127.0.0.1:2586/"]   # a local ntfy
   ```
 
-- **Android (FCM).** In the Firebase console, generate a private key for a
-  service account (JSON):
+**Your own ntfy** (optional; the ntfy app works with ntfy.sh out of the
+box): run `ntfy serve` (binary, package or the `binwiederhier/ntfy` image)
+behind your reverse proxy with its own hostname (tested with ntfy 2.33),
+for example:
 
-  ```toml
-  [push.fcm]
-  service_account_path = "/etc/termoak/firebase.json"   # or its content in TERMOAK_FCM_CREDENTIALS
-  ```
+```yaml
+# /etc/ntfy/server.yml
+base-url: "https://ntfy.example.com"
+listen-http: "127.0.0.1:2586"
+behind-proxy: true
+cache-file: "/var/cache/ntfy/cache.db"
+cache-duration: "12h"
+auth-file: "/var/lib/ntfy/user.db"
+auth-default-access: "deny-all"        # nobody reads or writes topics...
+# ...except UnifiedPush topics ("up*"): anyone may publish (the server) and
+# subscribe (the phone), as UnifiedPush expects. Older ntfy without
+# declarative ACLs: `ntfy access everyone 'up*' rw`.
+auth-access:
+  - "*:up*:rw"
+enable-signup: false
+visitor-request-limit-exempt-hosts: "127.0.0.1"
+```
 
-By default the notification text is generic, because Apple and Google see
-it; with `[push] detailed = true` it includes the commands the AI wants to
-run and the session titles. Texts are translated to the recipient's language.
+```caddy
+ntfy.example.com {
+    reverse_proxy 127.0.0.1:2586
+}
+```
+
+In the ntfy Android app, set it as the default server (Settings → Default
+server) before choosing it as the distributor in Termoak. If ntfy runs on
+the same machine as Termoak and the endpoints use its public hostname,
+nothing else is needed; if they use a local address, add it to
+`allowed_endpoints`. Production: same recipe, a hostname of its own (an
+`A`/`AAAA` record to the server), `MemoryMax` around 128 MB is plenty, and
+include `cache.db` in no backup (it only holds messages for 12 hours).
+
+### APNs (iOS)
+
+Token-based (`.p8`), HTTP/2. Stays off until `[push.apns]` is set. In
+Apple Developer: an App ID for the bundle id with the **Push
+Notifications** capability, and **Keys → +** with "Apple Push
+Notifications service (APNs)": download the `.p8` (only once) and note its
+**Key ID** and your **Team ID** (Membership).
+
+```toml
+[push.apns]
+key_path = "/etc/termoak/AuthKey_ABC123DEFG.p8"   # or its content in TERMOAK_APNS_KEY
+key_id = "ABC123DEFG"
+team_id = "TEAMID1234"
+bundle_id = "com.termoak"       # the app's bundle id (apns-topic; `topic` also works)
+environment = "auto"            # auto: each device says if its build is a development one
+                                # (sandbox); or "production" / "sandbox" for every device
+```
+
+Keep the `.p8` readable only by the server's user (`chmod 600`), outside
+the repository and out of backups that leave the machine unencrypted.
+
+### FCM (optional)
+
+Only for Android builds that include Firebase (the published ones do not):
+a service account's private key (JSON).
+
+```toml
+[push.fcm]
+service_account_path = "/etc/termoak/firebase.json"   # or its content in TERMOAK_FCM_CREDENTIALS
+```
+
+### Privacy
+
+By default the text is generic (push services and, for APNs/FCM, Apple and
+Google see it); with `[push] detailed = true` it includes the commands the
+AI wants to run, session titles and names. Web Push payloads are encrypted
+end to end for the device. Texts are translated to the recipient's
+language. Each device chooses its kinds (`PUT /api/v1/push/preferences`),
+gets nothing while its app is open (events socket) unless it asks, and at
+most `[push] max_per_minute` (30) a minute. Nothing about notifications is
+audited and endpoints and tokens are never logged.
 
 ## Environment variables
 
@@ -398,6 +480,7 @@ run and the session titles. Texts are translated to the recipient's language.
 | `TERMOAK_GITHUB_TOKEN` | Read-only GitHub token for `[updates]` (the variable name is set by `github_token_env`) |
 | `TERMOAK_SMTP_URL`, `TERMOAK_EMAIL_FROM` | Outgoing email (see [Email](#email)) |
 | `TERMOAK_APNS_KEY`, `TERMOAK_FCM_CREDENTIALS` | Push notification keys (content of the `.p8` and the JSON) |
+| `TERMOAK_VAPID_KEY` | Web Push VAPID private key (base64url). Without it, `<data_dir>/vapid.key` (created on first start) |
 | `TERMOAK_PASSWORD` | Password for `termoak-server user add` |
 | `TERMOAK_WEB_DIR` | Development only: serve the web app from this directory instead of the embedded one |
 | `AI_PROVIDER`, `AI_FALLBACK` | Default AI provider and fallback chain (comma-separated) |
@@ -411,8 +494,8 @@ The AI providers and their settings are described in [AI.md](https://github.com/
 
 ## Backups
 
-Copy the whole `data_dir`: the `termoak.db` database, `master.key`, the
-recordings and the Codex session. SQLite runs in WAL mode. For a hot copy:
+Copy the whole `data_dir`: the `termoak.db` database, `master.key`,
+`vapid.key` (Web Push), the recordings and the Codex session. SQLite runs in WAL mode. For a hot copy:
 
 ```sh
 sqlite3 /var/lib/termoak/termoak.db ".backup '/backup/termoak.db'"

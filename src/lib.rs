@@ -169,11 +169,29 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
             "email is configured but public_url is not: email links will not work outside this machine"
         );
     }
-    let push = push::Push::from_config(&config.push, store.clone())?;
+    let sockets = devices::Sockets::new();
+    let push = push::Push::from_config(
+        &config.push,
+        push::PushContext {
+            store: store.clone(),
+            sockets: sockets.clone(),
+            data_dir: config.server.data_dir.clone(),
+            instance_id: instance_id.clone(),
+            support_email: config.web.support_email.clone(),
+            public_url: config.server.public_url.clone(),
+            sk_timeout_secs: config.sessions.security_key_timeout_secs,
+        },
+    )?;
     if let Some(p) = &push {
         let (apns, fcm) = p.platforms();
-        tracing::info!(apns, fcm, "push notifications enabled");
+        tracing::info!(
+            webpush = p.webpush(),
+            apns,
+            fcm,
+            "push notifications enabled"
+        );
         p.clone().spawn_dispatcher(ai.clone(), sessions.clone());
+        security_keys.set_waker(Arc::new(push::SkWaker(p.clone())));
     }
     let updates = updates::UpdateProxy::from_config(&config.updates);
     if let Some(updates) = &updates {
@@ -202,7 +220,7 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
             60_000,
         ),
         instance_id,
-        sockets: devices::Sockets::new(),
+        sockets,
         netd,
         relays: Default::default(),
         security_keys,

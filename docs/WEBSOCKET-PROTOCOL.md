@@ -308,6 +308,9 @@ message types they do not know (older apps ignore `vault`).
 The same notices go out as push notifications (`prompt_pending` as
 `session_prompt`, `join_request`, `control_request`) when you are not
 watching that session, with a generic text unless `[push] detailed = true`.
+A device with this socket open gets no push notifications (it shows the
+events itself) unless its push preferences say `when_online` (API.md,
+Push notifications).
 
 If the client falls behind, `{"type":"lagged","missed":n}` arrives. Then
 fetch what was missed with `GET /ai/tasks/{id}/events?after=<last seq>`.
@@ -360,7 +363,19 @@ Rules: the first answer that verifies wins; an error from one device does
 not end the request while other devices can still answer (except
 `cancelled`); with no such device online the connection fails at once with
 `security_key_no_device`, otherwise after `[sessions]
-security_key_timeout_secs` (60) with `security_key_timeout`. The server
+security_key_timeout_secs` (60) with `security_key_timeout`.
+
+Since server 0.7.0-next.7, when no such device is online but the user has
+devices with push notifications that accept `security_key_request` (the
+default), the server sends them a push (`security_key_request`, with
+`request_id` and `expires_at`) and waits instead of failing: a request
+still waiting is sent to every `features=security_keys` socket of that user
+that connects meanwhile, so the phone opens the app, connects and answers
+it. Without any such push device it still fails at once with
+`security_key_no_device`; when nobody answers, `security_key_timeout`. The
+notification is withdrawn (`resolved`) when the request ends. Apps must not
+connect from the background when that push arrives (they would answer
+`no_device`): only when the user opens it. The server
 verifies the signature over the exact `message` (which contains the SSH
 connection's exchange hash, so it is only valid for that connection) before
 using it, and audits every request as `security_key.sign` (`purpose`,

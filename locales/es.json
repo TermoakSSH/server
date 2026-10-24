@@ -52,5 +52,11 @@
   "push.join_request.generic": "Alguien espera para entrar en una sesión que compartes.",
   "push.control_request.title": "Piden el teclado",
   "push.control_request.body": "%{name} pide el teclado de «%{title}».",
-  "push.control_request.generic": "Alguien pide el teclado de una sesión que compartes."
+  "push.control_request.generic": "Alguien pide el teclado de una sesión que compartes.",
+  "push.security_key_request.title": "Se necesita tu llave de seguridad",
+  "push.security_key_request.body": "Toca tu llave de seguridad para conectar con %{host}.",
+  "push.security_key_request.generic": "Una conexión espera tu llave de seguridad. Abre Termoak para usarla.",
+  "push.access_request.title": "Solicitud de acceso",
+  "push.access_request.body": "%{name} pide acceso a %{target}.",
+  "push.access_request.generic": "Alguien pide acceso temporal y espera tu aprobación."
 }

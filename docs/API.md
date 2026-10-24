@@ -219,7 +219,8 @@ Sync, AI, push notifications and updates:
 | `ai_budget_exceeded` | 403 | This month's AI credit for the server's providers is spent (your own API keys keep working) |
 | `unknown_provider` | 400 | The provider does not exist or does not accept your own API key. Extra field: `provider` |
 | `ai_error` | 502 | The AI provider failed |
-| `push_disabled` | 400 | The server has no push notifications configured |
+| `push_disabled` | 400 | The server has no push notifications configured (or not for this device's platform) |
+| `push_endpoint_not_allowed` | 400 | The Web Push endpoint is not `https://` on a public address (and not in `[push.webpush] allowed_endpoints`) |
 | `push_not_registered` | 400 | This device has no push notifications enabled |
 | `push_failed` | 502 | The notification could not be sent |
 | `updates_disabled` | 404 | This server does not serve updates |
@@ -261,7 +262,7 @@ Every sign-in is a device with its own tokens. `GET /devices` lists them,
 most recently used first; `current` is the id of the device making the
 request. Each `Device` has `id`, `name` and `platform` (as sent on sign-in),
 `created_at` (signed in since), `last_seen_at`, `access_expires_at`,
-`refresh_expires_at`, `push` (`apns`/`fcm` when it receives notifications)
+`refresh_expires_at`, `push` (`webpush`/`apns`/`fcm` when it receives notifications)
 and:
 
 - `last_ip`: the last address it was used from: the connection's or, with
@@ -417,18 +418,60 @@ no cap).
 
 | Method | Route | Description |
 |---|---|---|
-| POST | `/push/register` | `{platform: apns\|fcm, token, sandbox?}`. Binds the token to the device of the session |
-| DELETE | `/push/register` | Stops sending notifications to this device |
-| POST | `/push/test` | Sends a test notification to this device |
+| POST | `/push/register` | Binds a push registration to the device of the session (see below). Answers `{ok, server_enabled}` |
+| DELETE | `/push/register` | Stops sending notifications to this device (its preferences stay) |
+| GET | `/push` | `{registered, platform, endpoint, sandbox, preferences, server: {webpush, apns, fcm, vapid_public_key}, kinds}` |
+| PUT | `/push/preferences` | `{kinds: {<kind>: bool}, when_online?: bool}` → `{ok, preferences}` (every kind listed; unknown kinds: 400) |
+| POST | `/push/test` | Sends a test notification to this device (5 a minute: `429 rate_limited`) |
 
-The notification data carries `type` (`ai_approval`, `ai_finished`,
+Registrations (one per device; register once per account):
+
+- **Web Push / UnifiedPush** (0.7): `{platform: "webpush", endpoint,
+  keys: {p256dh, auth}}` — the shape of a browser's
+  `PushSubscription.toJSON()` and of what a UnifiedPush distributor (ntfy,
+  NextPush...) gives. `unifiedpush` is accepted as the platform too. The
+  endpoint must be `https://` on a public address unless it starts with one
+  of `[push.webpush] allowed_endpoints` (`400 push_endpoint_not_allowed`);
+  `p256dh` is the P-256 public key (65 bytes) and `auth` the 16-byte secret,
+  base64url. Payloads are encrypted for the device (RFC 8291 `aes128gcm`)
+  and signed with the server's VAPID key (RFC 8292; public key in
+  `/info` `features.push.vapid_public_key`).
+- **APNs** (iOS): `{platform: "apns", token, sandbox?}`.
+- **FCM** (Android builds with Firebase): `{platform: "fcm", token}`.
+
+`preferences` may come with the registration too. `server_enabled` says
+whether the server can send to that platform now (`/info`
+`features.push`). An endpoint or token that answers 404/410 (APNs:
+`Unregistered`...) is forgotten.
+
+**Payload** (`termoak_core::push::Payload`, the same JSON in every
+platform: the Web Push message; under `termoak` in APNs, flattened to
+strings with the ids at the top level; FCM's `data`):
+
+```json
+{"v":1,"type":"ai_approval","title":"Approval pending","body":"An AI task wants…",
+ "collapse":"approval-<id>","data":{"task_id":"…","approval_id":"…"},
+ "server":"<instance_id>","user":"<user id>","sent_at":1791198108458,"expires_at":null}
+```
+
+`type` (the kinds of `kinds`): `ai_approval`, `ai_finished`,
 `session_shared`, `session_prompt`, `join_request`, `control_request`,
-`team_added`, `test`) and the relevant ids (`task_id`, `approval_id`,
-`session_id`, `prompt_id`, `participant`, `team_id`). `session_prompt`,
-`join_request` and `control_request` are only sent when you are not watching
-that session (no device of yours attached to it). In
-APNs they go under the `termoak` key of the payload; in FCM, in `data`. The
-text is in the recipient's language.
+`team_added`, `security_key_request` (`request_id`, `expires_at`; see
+WEBSOCKET-PROTOCOL.md, Security keys), `access_request` (0.7 phase 4b),
+plus `test` and `resolved` (always delivered: withdraw the notification
+with that `collapse`; sent when an AI approval is decided or a security key
+request ends). The ids: `task_id`, `approval_id`, `session_id`,
+`prompt_id`, `participant`, `team_id`, `request_id`, `status`. The texts
+are generic and in the recipient's language unless `[push] detailed =
+true`; nothing secret is ever sent, and apps fetch the details over the API.
+`session_prompt`, `join_request` and `control_request` are only sent when
+you are not watching that session. A device whose events WebSocket is open
+gets nothing (it shows the events itself) unless `when_online` is true.
+Web Push requests carry `TTL` and `Urgency` per kind and `Topic` (from the
+collapse key); APNs alerts `apns-collapse-id`, `aps.category`
+(`TERMOAK_APPROVAL`, `TERMOAK_SECURITY_KEY`) and `thread-id`; `resolved`
+goes to APNs as a background push. At most `[push] max_per_minute` (30)
+notifications per device and minute.
 
 ### Two-step verification
 

@@ -31,11 +31,28 @@ type Outcome = Result<(SkAssertion, Id), SkError>;
 
 struct Pending {
     owner: Id,
+    /// The request, for sockets that connect while it waits.
+    msg: Value,
     /// Sockets asked (and the ones that answered with an error).
     targets: HashSet<u64>,
     failed: HashSet<u64>,
     errors: Vec<SkError>,
     done: Option<oneshot::Sender<Outcome>>,
+}
+
+/// Wakes a user's devices (push) when none that can sign is online.
+pub trait Waker: Send + Sync {
+    /// Notifies the user's devices about request `request_id`; returns how
+    /// many were notified (0: nobody can answer).
+    fn wake(
+        &self,
+        owner: Id,
+        request_id: String,
+        expires_at: i64,
+        host: Option<String>,
+    ) -> futures::future::BoxFuture<'static, usize>;
+    /// The request was answered or expired: withdraw the notification.
+    fn resolved(&self, owner: Id, request_id: &str);
 }
 
 /// The signature requests in flight and the sockets that can answer them.
@@ -45,6 +62,7 @@ pub struct SkBroker {
     next: AtomicU64,
     signers: Mutex<HashMap<Id, Vec<SignerSocket>>>,
     pending: Mutex<HashMap<String, Pending>>,
+    waker: std::sync::OnceLock<Arc<dyn Waker>>,
 }
 
 /// Unregisters a signer socket when dropped.
@@ -98,7 +116,14 @@ impl SkBroker {
             next: AtomicU64::new(1),
             signers: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            waker: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Push notifications that wake the owner's devices when none can sign
+    /// (docs-next/PUSH.md §6).
+    pub fn set_waker(&self, waker: Arc<dyn Waker>) {
+        let _ = self.waker.set(waker);
     }
 
     /// Registers an events socket of `user` that declared `security_keys`;
@@ -114,7 +139,21 @@ impl SkBroker {
             .lock()
             .entry(user)
             .or_default()
-            .push(SignerSocket { id, device, tx });
+            .push(SignerSocket {
+                id,
+                device,
+                tx: tx.clone(),
+            });
+        // Requests of this user still waiting (a phone woken by a push
+        // connects now): this socket is asked too.
+        {
+            let mut pending = self.pending.lock();
+            for p in pending.values_mut() {
+                if p.owner == user && p.done.is_some() && p.targets.insert(id) {
+                    let _ = tx.send(p.msg.clone());
+                }
+            }
+        }
         (
             SignerGuard {
                 broker: self.clone(),
@@ -193,29 +232,59 @@ impl SkBroker {
         let expires_at = now_ms() + self.timeout.as_millis() as i64;
         let msg = wire::request(&id, req, expires_at);
         let (tx, rx) = oneshot::channel();
+        // The sockets online now, read while the request is registered (a
+        // socket that registers at the same time is asked by `register`).
         let targets: Vec<(u64, mpsc::UnboundedSender<Value>)> = {
-            let signers = self.signers.lock();
-            signers
+            let mut pending = self.pending.lock();
+            let targets: Vec<_> = self
+                .signers
+                .lock()
                 .get(&owner)
                 .map(|l| l.iter().map(|s| (s.id, s.tx.clone())).collect())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            pending.insert(
+                id.clone(),
+                Pending {
+                    owner,
+                    msg: msg.clone(),
+                    targets: targets.iter().map(|(s, _)| *s).collect(),
+                    failed: HashSet::new(),
+                    errors: Vec::new(),
+                    done: Some(tx),
+                },
+            );
+            targets
         };
+        // Nobody online: wake the owner's devices with a push and wait for
+        // one of them to connect and answer.
+        let mut woken = false;
         if targets.is_empty() {
-            return Err(SkError::new(
-                SkErrorCode::NoDevice,
-                "none of your devices that can use security keys is online: open Termoak on your phone or computer (signed in) and try again",
-            ));
+            let n = match self.waker.get() {
+                Some(w) => {
+                    w.wake(
+                        owner,
+                        id.clone(),
+                        expires_at,
+                        Some(req.context.host.clone()).filter(|h| !h.is_empty()),
+                    )
+                    .await
+                }
+                None => 0,
+            };
+            woken = n > 0;
+            let connected = self
+                .pending
+                .lock()
+                .get(&id)
+                .is_some_and(|p| !p.targets.is_empty());
+            if !woken && !connected {
+                self.pending.lock().remove(&id);
+                return Err(SkError::new(
+                    SkErrorCode::NoDevice,
+                    "none of your devices that can use security keys is online: open Termoak on your phone or computer (signed in) and try again",
+                ));
+            }
         }
-        self.pending.lock().insert(
-            id.clone(),
-            Pending {
-                owner,
-                targets: targets.iter().map(|(s, _)| *s).collect(),
-                failed: HashSet::new(),
-                errors: Vec::new(),
-                done: Some(tx),
-            },
-        );
         for (_, t) in &targets {
             let _ = t.send(msg.clone());
         }
@@ -230,7 +299,12 @@ impl SkBroker {
                 ),
             )),
         };
-        self.pending.lock().remove(&id);
+        let asked = self
+            .pending
+            .lock()
+            .remove(&id)
+            .map(|p| p.targets)
+            .unwrap_or_default();
         let result = match &outcome {
             Ok(_) => "signed",
             Err(e) if e.code == SkErrorCode::Timeout => "timeout",
@@ -238,8 +312,22 @@ impl SkBroker {
             Err(_) => "failed",
         };
         let done = wire::done(&id, result);
-        for (_, t) in &targets {
+        let sockets: Vec<mpsc::UnboundedSender<Value>> = self
+            .signers
+            .lock()
+            .get(&owner)
+            .map(|l| {
+                l.iter()
+                    .filter(|s| asked.contains(&s.id))
+                    .map(|s| s.tx.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for t in &sockets {
             let _ = t.send(done.clone());
+        }
+        if woken && let Some(w) = self.waker.get() {
+            w.resolved(owner, &id);
         }
         outcome
     }

@@ -1165,6 +1165,7 @@ async fn owner_notices_and_push() {
             key_id: "KEYID12345".into(),
             team_id: "TEAM123456".into(),
             topic: "com.termoak".into(),
+            environment: Default::default(),
             endpoint: Some(mock_url.clone()),
             sandbox_endpoint: Some(mock_url.clone()),
         });
@@ -1177,6 +1178,15 @@ async fn owner_notices_and_push() {
         "/api/v1/push/register",
         &ana,
         Some(json!({"platform": "apns", "token": "ana-phone"})),
+    )
+    .await;
+    // The same device has the events socket open: push stays quiet there
+    // unless it asks for notifications while online.
+    srv.ok(
+        Method::PUT,
+        "/api/v1/push/preferences",
+        &ana,
+        Some(json!({"when_online": true})),
     )
     .await;
     let mut events = srv.ws("/api/v1/events/ws", Some(&ana)).await;

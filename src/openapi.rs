@@ -579,6 +579,22 @@ fn endpoints() -> Vec<Ep> {
             Object,
         ),
         ep(
+            Get,
+            "/api/v1/push",
+            "account",
+            "This device's push registration, preferences and what the server can send",
+            None,
+            Object,
+        ),
+        ep(
+            Put,
+            "/api/v1/push/preferences",
+            "account",
+            "Choose which notifications this device gets ({kinds: {kind: bool}, when_online})",
+            Object,
+            Object,
+        ),
+        ep(
             Post,
             "/api/v1/push/test",
             "account",
@@ -1536,6 +1552,7 @@ pub fn document() -> OpenApi {
         .schema_from::<crate::config::Plan>()
         .schema_from::<crate::config::PlanLimits>()
         .schema_from::<crate::push::RegisterPush>()
+        .schema_from::<crate::push::WebPushKeys>()
         .schema_from::<Device>()
         .schema_from::<SignOutAll>()
         .schema_from::<TokenPair>()

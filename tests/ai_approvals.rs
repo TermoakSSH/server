@@ -247,6 +247,14 @@ async fn approvals_preview_edit_and_deny_with_reason() {
     };
     let host = host["id"].as_str().unwrap().to_string();
 
+    // Ana's phone gets notifications (FCM here; Web Push works the same).
+    srv.ok(
+        "/api/v1/push/register",
+        &ana,
+        json!({"platform": "fcm", "token": "ana-phone"}),
+    )
+    .await;
+
     // --- Deny with a reason ---------------------------------------------------
     let (task, approval) = task_with_approval(&srv, &ana, &host).await;
     let preview = &approval["preview"];
@@ -316,6 +324,41 @@ async fn approvals_preview_edit_and_deny_with_reason() {
         .find(|e| e["kind"] == "approval_requested")
         .unwrap();
     assert_eq!(requested["data"]["preview"]["risk"], "high");
+    // The approval was announced (Approve/Deny) and, once decided, withdrawn.
+    let collapse = format!("approval-{approval_id}");
+    let mut withdrawn = false;
+    for _ in 0..100 {
+        let fcm = seen.fcm.lock().clone();
+        let asked = fcm
+            .iter()
+            .find(|m| m["message"]["data"]["type"] == "ai_approval");
+        let gone = fcm
+            .iter()
+            .find(|m| m["message"]["data"]["type"] == "resolved");
+        if let (Some(asked), Some(gone)) = (asked, gone) {
+            let (a, g) = (&asked["message"], &gone["message"]);
+            assert_eq!(a["data"]["collapse"], collapse.as_str());
+            assert_eq!(a["data"]["category"], "approval");
+            assert_eq!(a["data"]["approval_id"], approval_id.as_str());
+            assert!(
+                !a.to_string().contains("rm -rf"),
+                "no command without detailed: {a}"
+            );
+            assert_eq!(g["data"]["collapse"], collapse.as_str());
+            assert!(
+                g.get("notification").is_none(),
+                "a data-only withdrawal: {g}"
+            );
+            withdrawn = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        withdrawn,
+        "no approval push and withdrawal: {:?}",
+        seen.fcm.lock()
+    );
     let entry = audit_entry(&srv, &ana, "ai.approval.denied", &approval_id).await;
     assert_eq!(entry["detail"]["reason"], "not on this server", "{entry}");
     assert_eq!(entry["detail"]["task"], task.as_str());

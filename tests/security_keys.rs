@@ -296,7 +296,7 @@ async fn the_ffi_answers_as_the_users_phone() {
             let a = self
                 .0
                 .sign_now(&req)
-                .map_err(|e| SecurityKeyError::Failed { message: e.message })?;
+                .map_err(|e| SecurityKeyError::Failed { reason: e.message })?;
             Ok(SecurityKeyAssertion {
                 flags: a.flags,
                 counter: a.counter,
@@ -320,7 +320,7 @@ async fn the_ffi_answers_as_the_users_phone() {
             _: SecurityKeyResidentRequest,
         ) -> Result<Vec<SecurityKeyResident>, SecurityKeyError> {
             Err(SecurityKeyError::Unsupported {
-                message: String::new(),
+                reason: String::new(),
             })
         }
     }

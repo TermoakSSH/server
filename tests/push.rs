@@ -184,6 +184,7 @@ async fn push_notifications() {
         key_id: "KEYID12345".into(),
         team_id: "TEAM123456".into(),
         topic: "com.termoak".into(),
+        environment: Default::default(),
         endpoint: Some(mock_url.clone()),
         sandbox_endpoint: Some(mock_url.clone()),
     });
@@ -201,7 +202,9 @@ async fn push_notifications() {
     };
 
     let (_, info) = srv.call(Method::GET, "/api/v1/info", None, None).await;
-    assert_eq!(info["features"]["push"], json!({"apns": true, "fcm": true}));
+    assert_eq!(info["features"]["push"]["apns"], true);
+    assert_eq!(info["features"]["push"]["fcm"], true);
+    assert_eq!(info["features"]["push"]["webpush"], true);
 
     // Ana (iPhone and Android) and Beto.
     for email in ["ana@example.test", "beto@example.test"] {
