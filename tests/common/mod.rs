@@ -38,6 +38,12 @@ pub fn free_port() -> u16 {
 }
 
 pub fn start_sshd() -> Option<Sshd> {
+    start_sshd_with(&[])
+}
+
+/// Like [`start_sshd`], also accepting the `authorized_keys` lines in
+/// `extra` (security keys...).
+pub fn start_sshd_with(extra: &[String]) -> Option<Sshd> {
     // Linux only (on other systems the system sshd needs a different setup).
     if !cfg!(target_os = "linux") {
         return None;
@@ -56,7 +62,12 @@ pub fn start_sshd() -> Option<Sshd> {
         .ok()?;
     let key =
         termoak_ssh::keys::generate(termoak_ssh::keys::KeyType::Ed25519, "e2e", None).unwrap();
-    std::fs::write(d.join("ak"), format!("{}\n", key.public_openssh)).unwrap();
+    let mut ak = format!("{}\n", key.public_openssh);
+    for line in extra {
+        ak.push_str(line);
+        ak.push('\n');
+    }
+    std::fs::write(d.join("ak"), ak).unwrap();
     let port = free_port();
     std::fs::create_dir_all("/run/sshd").ok();
     let cfg = d.join("cfg");

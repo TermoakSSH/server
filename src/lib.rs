@@ -22,6 +22,7 @@ pub mod openapi;
 pub mod push;
 pub mod room;
 pub mod routes;
+pub mod security_keys;
 pub mod sessions;
 pub mod state;
 pub mod updates;
@@ -122,6 +123,19 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
         config.sessions.clone(),
         config.server.data_dir.clone(),
     );
+    // FIDO2 security keys: signatures forwarded to the users' devices for
+    // everything that connects from the server.
+    let security_keys = security_keys::SkBroker::new(
+        store.clone(),
+        Duration::from_secs(config.sessions.security_key_timeout_secs),
+    );
+    sessions.set_security_keys(security_keys.clone());
+    {
+        let sk = security_keys.clone();
+        pool.set_security_keys(Some(Arc::new(move |user, vault| {
+            Some(sk.signer(user, Some(vault), None))
+        })));
+    }
     // Private networks: everything that connects from the server (sessions,
     // tests, exec, SFTP, AI) dials hosts with a network through netd.
     let netd = config.networks.netd_socket.clone().map(|socket| {
@@ -191,5 +205,6 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
         sockets: devices::Sockets::new(),
         netd,
         relays: Default::default(),
+        security_keys,
     })))
 }

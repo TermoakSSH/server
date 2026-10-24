@@ -16,8 +16,8 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{mpsc, oneshot};
 
 use super::proto::{
-    FEATURE_INPUT_AUTHORS, FEATURE_NETWORKS, Frame, PROTOCOL, ToHolder, ToServer, read_frame,
-    write_frame,
+    FEATURE_INPUT_AUTHORS, FEATURE_NETWORKS, FEATURE_SECURITY_KEYS, Frame, PROTOCOL, ToHolder,
+    ToServer, read_frame, write_frame,
 };
 use crate::sessions::SessionManager;
 
@@ -29,6 +29,8 @@ pub struct HolderClient {
     authors: AtomicBool,
     /// The holder knows private networks ([`FEATURE_NETWORKS`]).
     networks: AtomicBool,
+    /// The holder asks for security key signatures ([`FEATURE_SECURITY_KEYS`]).
+    security_keys: AtomicBool,
 }
 
 impl HolderClient {
@@ -38,7 +40,13 @@ impl HolderClient {
             tx: Mutex::new(None),
             authors: AtomicBool::new(false),
             networks: AtomicBool::new(false),
+            security_keys: AtomicBool::new(false),
         }
+    }
+
+    /// The holder can use FIDO2 security keys (through the server).
+    pub fn knows_security_keys(&self) -> bool {
+        self.security_keys.load(Ordering::Relaxed)
     }
 
     /// The holder dials hosts with a private network through netd.
@@ -143,6 +151,10 @@ async fn connection(
             client.authors.store(authors, Ordering::Relaxed);
             client.networks.store(
                 features.iter().any(|f| f == FEATURE_NETWORKS),
+                Ordering::Relaxed,
+            );
+            client.security_keys.store(
+                features.iter().any(|f| f == FEATURE_SECURITY_KEYS),
                 Ordering::Relaxed,
             );
             if !authors {

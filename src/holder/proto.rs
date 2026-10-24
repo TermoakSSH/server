@@ -41,8 +41,17 @@ pub const FEATURE_INPUT_AUTHORS: &str = "input_authors";
 /// the server keeps their sessions in its own process instead.
 pub const FEATURE_NETWORKS: &str = "networks";
 
+/// The holder asks the server to sign with FIDO2 security keys
+/// ([`Question::SecurityKey`], forwarded to the owner's devices): an older
+/// holder cannot, so the server keeps such sessions in its own process.
+pub const FEATURE_SECURITY_KEYS: &str = "security_keys";
+
 /// What this holder understands beyond [`PROTOCOL`].
-pub const FEATURES: &[&str] = &[FEATURE_INPUT_AUTHORS, FEATURE_NETWORKS];
+pub const FEATURES: &[&str] = &[
+    FEATURE_INPUT_AUTHORS,
+    FEATURE_NETWORKS,
+    FEATURE_SECURITY_KEYS,
+];
 
 /// Maximum frame size (a session's scrollback fits comfortably).
 const MAX_FRAME: usize = 64 << 20;
@@ -112,6 +121,10 @@ pub struct OpenSession {
     /// Detect the host's OS and report it with [`ToServer::Os`].
     #[serde(default)]
     pub detect_os: bool,
+    /// The server answers [`Question::SecurityKey`] (only servers that know
+    /// [`FEATURE_SECURITY_KEYS`] set it).
+    #[serde(default)]
+    pub security_keys: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -205,14 +218,30 @@ pub enum Question {
         host: String,
         user: String,
     },
+    /// Sign with a FIDO2 security key: a `security_key_request` (the
+    /// events WebSocket's JSON, docs/SSH-PRO.md §5.1). Only asked when
+    /// [`OpenSession::security_keys`] is set.
+    SecurityKey {
+        request: Value,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Answer {
-    HostKey { error: Option<HostKeyError> },
-    Answers { answers: Option<Vec<String>> },
-    Text { text: Option<String> },
+    HostKey {
+        error: Option<HostKeyError>,
+    },
+    Answers {
+        answers: Option<Vec<String>>,
+    },
+    Text {
+        text: Option<String>,
+    },
+    /// A `security_key_response` (signature or error).
+    SecurityKey {
+        response: Value,
+    },
 }
 
 /// Why a key is not trusted (the same errors as in the server, so the user

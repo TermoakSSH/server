@@ -249,11 +249,16 @@ Clients without `proto=2` (apps released before protocol 2) keep working:
 
 ## User events: `GET /api/v1/events/ws`
 
-Receive only, with user authentication. On connect:
+Receive only, with user authentication (except the security key answers
+below). On connect:
 
 ```json
-{"type":"hello","user":{…},"pending_approvals":[…]}
+{"type":"hello","user":{…},"pending_approvals":[…],"features":[]}
 ```
+
+`?features=` (comma list) declares what this client can do; `hello` echoes
+the ones the server knows. Today: `security_keys` (see
+[Security keys](#security-keys)).
 
 and then three kinds of messages (plus `signed_out`, below):
 
@@ -306,3 +311,60 @@ watching that session, with a generic text unless `[push] detailed = true`.
 
 If the client falls behind, `{"type":"lagged","missed":n}` arrives. Then
 fetch what was missed with `GET /ai/tasks/{id}/events?after=<last seq>`.
+
+### Security keys
+
+Since server 0.7.0-next.4. When a connection made **by the server**
+(server sessions, also in the session holder; `POST /hosts/{id}/test`;
+`/exec`; SFTP; AI tools) uses a FIDO2 security key (`sk-*` key), the server
+asks the key owner's devices to sign. Only events sockets of that user
+opened with `?features=security_keys` get these messages (older clients
+never do). Design and security rules: SSH-PRO.md §5 in the core repository.
+
+Server → device:
+
+```json
+{"type":"security_key_request","request_id":"…","expires_at":1791198108458,
+ "purpose":"server_session","session_id":"…","host":"web1","address":"10.0.0.5",
+ "username":"deploy",
+ "key":{"id":"…","label":"YubiKey","fingerprint":"SHA256:…","public_key":"sk-ssh-ed25519@openssh.com AAAA…",
+        "algorithm":"sk-ssh-ed25519@openssh.com","application":"ssh:",
+        "key_handle":"<base64>","device":"YubiKey 5C"},
+ "message":"<base64>","client_data_hash":"<base64>",
+ "require_presence":true,"require_verification":false}
+```
+
+`purpose` is `server_session`, `test`, `server` (`/exec`, SFTP and AI
+through the connection pool). The device runs CTAP2 get assertion with
+`rpId = key.application`, the allow list `[key_handle]`, `clientDataHash =
+client_data_hash` (the SHA-256 of `message`), `up = require_presence` and
+`uv = require_verification`, and answers on the same socket:
+
+```json
+{"type":"security_key_response","request_id":"…","flags":1,"counter":42,"signature":"<base64>"}
+{"type":"security_key_response","request_id":"…","error":{"code":"cancelled","message":"…"}}
+```
+
+`flags` and `counter` come from the assertion's authenticator data;
+`signature` is DER (ECDSA, as CTAP2 returns it; 64-byte `r || s` works too)
+or the 64 Ed25519 bytes. Error codes: `cancelled`, `timeout`, `not_found`,
+`pin_required`, `pin_invalid`, `no_device`, `unsupported`, `failed`.
+
+When the request is decided, every device that got it receives:
+
+```json
+{"type":"security_key_done","request_id":"…","result":"signed"|"failed"|"timeout"|"cancelled"}
+```
+
+Rules: the first answer that verifies wins; an error from one device does
+not end the request while other devices can still answer (except
+`cancelled`); with no such device online the connection fails at once with
+`security_key_no_device`, otherwise after `[sessions]
+security_key_timeout_secs` (60) with `security_key_timeout`. The server
+verifies the signature over the exact `message` (which contains the SSH
+connection's exchange hash, so it is only valid for that connection) before
+using it, and audits every request as `security_key.sign` (`purpose`,
+`session`, `host`, `key` fingerprint, answering `device`, `result`, `code`).
+While it waits, a server session shows `connecting` with "Touch your
+security key (…) on one of your devices…".
+

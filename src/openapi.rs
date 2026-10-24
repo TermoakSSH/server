@@ -845,7 +845,7 @@ fn endpoints() -> Vec<Ep> {
             Post,
             "/api/v1/exec",
             "hosts",
-            "Run a command or snippet on several hosts",
+            "Run a command or snippet on several hosts (a snippet is rendered per host: its built-ins come from each host)",
             Ref("ExecRequest"),
             List("ExecResult"),
         ),
@@ -1482,6 +1482,7 @@ pub fn document() -> OpenApi {
         .schema_from::<Group>()
         .schema_from::<Identity>()
         .schema_from::<SshKey>()
+        .schema_from::<termoak_core::model::SecurityKeyInfo>()
         .schema_from::<Snippet>()
         .schema_from::<PortForward>()
         .schema_from::<KnownHost>()
@@ -1739,5 +1740,8 @@ mod tests {
         assert!(schemas["Network"]["properties"]["wireguard"].is_object());
         assert!(schemas["PlanLimits"]["properties"]["max_networks"].is_object());
         assert!(schemas["SyncV2Request"]["properties"]["kinds"].is_object());
+        // Security keys and snippets with variables (0.7 phase 3a).
+        assert!(schemas["SshKey"]["properties"]["security_key"].is_object());
+        assert!(schemas["SecurityKeyInfo"]["properties"]["application"].is_object());
     }
 }

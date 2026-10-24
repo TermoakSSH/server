@@ -343,6 +343,7 @@ async fn save_key(
                 comment: material.comment.clone(),
                 has_passphrase: material.encrypted,
                 certificate,
+                security_key: material.security_key.clone(),
             },
             SecretUpdate::Set(SshKeySecret {
                 private_key: Some(material.private_openssh.clone()),
@@ -495,6 +496,7 @@ async fn test_host(
         kind: n.network.kind.as_str().to_string(),
     });
     let trust = q.get("trust").is_some_and(|v| v == "true" || v == "1");
+    let signer = st.security_keys.signer(ctx.id(), Some(vault), None);
     let opts = ConnectOptions::new(Arc::new(StoreVerifier::for_host(
         st.store.clone(),
         ctx.access.clone(),
@@ -506,7 +508,9 @@ async fn test_host(
         },
         None,
     )))
-    .with_dialer(st.netd.as_ref().map(|n| n.dialer()));
+    .with_dialer(st.netd.as_ref().map(|n| n.dialer()))
+    .with_security_key(Some(signer))
+    .with_purpose("test", None);
     let started = Instant::now();
     match Connection::connect(&resolved, &opts).await {
         Ok(conn) => {
@@ -559,6 +563,8 @@ async fn test_host(
                 termoak_ssh::SshError::Timeout(_) => ("timeout", None, None),
                 // network_unavailable, network_dial_failed...
                 termoak_ssh::SshError::Network { code, .. } => (*code, None, None),
+                // security_key_no_device, security_key_timeout...
+                termoak_ssh::SshError::SecurityKey { code, .. } => (*code, None, None),
                 _ => ("connect_failed", None, None),
             };
             Ok(Json(HostTest {
@@ -910,14 +916,21 @@ async fn exec_many(
     if req.host_ids.is_empty() || req.host_ids.len() > 200 {
         return Err(ApiError::bad_request("give between 1 and 200 hosts"));
     }
-    let command = match (&req.command, req.snippet_id) {
-        (Some(c), None) if !c.trim().is_empty() => c.clone(),
-        (None, Some(sid)) => st
-            .store
-            .get_in::<Snippet>(&ctx.access, sid)
-            .await?
-            .data
-            .render(&req.variables)?,
+    // A snippet is rendered per host: the same variables, each host's own
+    // built-ins ({{host}}, {{user}}...; docs/SSH-PRO.md §7.3).
+    let (command, template) = match (&req.command, req.snippet_id) {
+        (Some(c), None) if !c.trim().is_empty() => (c.clone(), None),
+        (None, Some(sid)) => {
+            let snippet = st.store.get_in::<Snippet>(&ctx.access, sid).await?.data;
+            let template = snippet.template();
+            // Every prompt needs a value (or a default) before anything runs.
+            let any_host = termoak_core::template::TemplateContext {
+                host: Some(String::new()),
+                ..Default::default()
+            };
+            template.render(&req.variables, &any_host)?;
+            (snippet.script, Some(template))
+        }
         _ => {
             return Err(ApiError::bad_request(
                 "give `command` or `snippet_id` (only one)",
@@ -938,6 +951,8 @@ async fn exec_many(
     let futures = req.host_ids.iter().map(|&host_id| {
         let st = st.clone();
         let command = command.clone();
+        let template = template.clone();
+        let variables = req.variables.clone();
         let owner = ctx.id();
         let access = ctx.access.clone();
         async move {
@@ -948,6 +963,19 @@ async fn exec_many(
                 .map(|h| h.data.label)
                 .unwrap_or_else(|_| host_id.to_string());
             let result = async {
+                let command = match &template {
+                    Some(t) => {
+                        let mut resolved = st
+                            .store
+                            .resolve_in(&access, host_id, termoak_core::store::SecretUse::Server)
+                            .await?;
+                        let mut c = resolved.template_context();
+                        resolved.zeroize_secrets();
+                        c.now = Some(chrono::Utc::now().fixed_offset());
+                        t.render(&variables, &c)?
+                    }
+                    None => command,
+                };
                 let conn = st.pool.get(owner, host_id).await?;
                 conn.exec(
                     &command,

@@ -31,9 +31,10 @@ ago must keep working with a new server, so `/api/v1` only grows:
   the legacy sync never sends them.
 - A field that older clients do not know and drop when they edit an item
   must survive their edits: `settings.network_id` of hosts and groups
-  (0.7) is always written by newer cores (`null` when empty), so a PUT or a
-  sync push **without the key** keeps the stored value, and `null` clears
-  it. Clients must send the whole object they read.
+  (0.7), `tailscale.ephemeral` of networks and `security_key` of keys
+  (0.7.0-next.4) are always written by newer cores (`null` when empty), so a
+  PUT or a sync push **without the key** keeps the stored value, and `null`
+  clears it. Clients must send the whole object they read.
 
 An incompatible change goes into a new API (`/api/v2`) that lives alongside
 the old one while clients still use it. One deliberate exception: since
@@ -166,6 +167,26 @@ SSH and SFTP:
 | `invalid_mode` | 400 | Invalid mode (use octal, for example `644`) |
 | `cannot_delete_root` | 400 | The root directory cannot be deleted |
 | `runbook_empty` | 400 | `POST /ai/tasks/{id}/runbook`: the task ran no commands to save |
+| `invalid_snippet` | 400 | `POST`/`PUT /snippets`: the script has malformed variable tags (`{{select:Env}}` without options, `{{secret:X\|default}}`, an empty label, the same label with two kinds, more than 50 variables). Extra field: `issues` (`[{start, end, tag, message}]`, offsets in characters). See [Snippets](#snippets) |
+
+FIDO2 security keys (connections made by the server with an `sk-*` key:
+sessions, host tests, `/exec`, SFTP, AI; the signature is forwarded to your
+devices, see [WEBSOCKET-PROTOCOL.md](WEBSOCKET-PROTOCOL.md#security-keys)).
+Sessions report them in their closing `reason`; `POST /hosts/{id}/test` in
+`error_code`:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `security_key_required` | 409 | The key is a security key and this connection cannot ask for it |
+| `security_key_no_device` | 409 | None of your devices that can sign is online (a Termoak app open and signed in, with security keys) |
+| `security_key_timeout` | 504 | Nobody touched the key in time (`[sessions] security_key_timeout_secs`, 60 s) |
+| `security_key_cancelled` | 409 | You cancelled on the device |
+| `security_key_not_found` | 409 | The device does not have this key |
+| `security_key_pin_required` / `security_key_pin_invalid` | 409 | The key needs its PIN / wrong PIN |
+| `security_key_wrong_key` | 409 | The signature does not match the key (another device answered) |
+| `security_key_unsupported` | 422 | The device cannot do it |
+| `security_key_invalid` | 400 | Malformed answer or key file |
+| `security_key_failed` | 502 | Other error from the device |
 
 Sync, AI, push notifications and updates:
 
@@ -590,6 +611,24 @@ Hosts and groups have `settings.network_id` (0.7): the private network
 groups like `proxy`; `null` is direct. A PUT without the key keeps the
 stored value (see [Compatibility](#compatibility)).
 
+SSH keys (`/keys`) have `security_key` (0.7.0-next.4) when they are FIDO2
+security keys (`algorithm` `sk-ssh-ed25519@openssh.com` or
+`sk-ecdsa-sha2-nistp256@openssh.com`): `{application, user, touch_required,
+verify_required, resident, device}` (`null` for other keys). Their secret
+`private_key` is the OpenSSH sk file (`id_ed25519_sk`): it holds the key
+handle, not a secret key, and is treated like any private key.
+`/keys/import` accepts those files and fills `security_key`; the server
+cannot generate them (that needs the device: the apps do it).
+
+<a id="snippets"></a>Snippets (`/snippets`) are `{name, script, description,
+tags}`; the script may use variables: built-ins filled per host (`{{host}}`
+= address, `{{label}}`, `{{user}}`, `{{port}}`, `{{group}}`, `{{date}}`,
+`{{time}}`, `{{datetime}}`, `{{timestamp}}`), `{{name}}` and
+`{{prompt:Label|default}}` (text), `{{select:Label|a|b}}` and
+`{{secret:Label}}`; `\{{` is a literal `{{`; anything else between `{{` and
+`}}` stays literal. `POST`/`PUT` refuse malformed tags (`invalid_snippet`);
+sync pushes are not checked. Rules: SSH-PRO.md §7 in the core repository.
+
 Private networks (`/networks`) are `{name, kind: "wireguard" | "tailscale" |
 "zerotier", description, wireguard?: {addresses, dns, mtu, peers:
 [{public_key, endpoint, allowed_ips, persistent_keepalive}], public_key},
@@ -613,7 +652,7 @@ Other entity routes:
 | POST | `/hosts/{id}/test` | Tests the connection (any role); returns the detected OS (saved by Editors only) and the latency. `?trust=true` accepts a new host key: it is saved in the host's vault if you are Editor there, otherwise in your personal vault. SSH only: a Telnet host answers `{ok: false, error_code: "telnet_not_supported"}` |
 | GET | `/hosts/{id}/effective` | Effective settings after applying groups and identity (any role) |
 | POST | `/hosts/{id}/credentials` | Just-in-time credentials for a connection from this device (below) |
-| POST | `/exec` | `{host_ids, command \| snippet_id + variables, timeout_secs?}`. Runs in parallel; any role, each host checked on its own |
+| POST | `/exec` | `{host_ids, command \| snippet_id + variables, timeout_secs?}`. Runs in parallel; any role, each host checked on its own. A snippet is rendered per host (its built-ins come from each host; `variables` are keyed by label and a value given for a built-in wins); a prompt or secret without a value is a `400` before anything runs. The audit (`exec.batch`) keeps the snippet's script, never the values |
 | POST | `/sync` | Legacy sync (below) |
 | POST | `/vaults/sync` | Sync v2 (below) |
 | GET | `/audit` | `?before=&limit=` |

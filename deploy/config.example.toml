@@ -32,6 +32,10 @@ max_per_user = 50
 # updating or restarting the server does not cut the sessions. Without it,
 # sessions live in the server and are closed when it restarts.
 # holder_socket = "/run/termoak-sessions/sessions.sock"
+# FIDO2 security keys: how long a connection made by the server waits for
+# one of the user's devices to sign (seconds, 10-300; docs/SSH-PRO.md in the
+# core repository).
+security_key_timeout_secs = 60
 
 # Private networks (WireGuard; Tailscale/Headscale and ZeroTier later): the
 # server joins them through termoak-netd, a separate service of the "with

@@ -904,6 +904,8 @@ pub struct SessionManager {
     holder: OnceLock<Arc<HolderClient>>,
     /// Dialer for hosts with a private network (`termoak-netd`).
     dialer: OnceLock<termoak_ssh::Dialer>,
+    /// FIDO2 security keys: signatures forwarded to the owner's devices.
+    security_keys: OnceLock<Arc<crate::security_keys::SkBroker>>,
 }
 
 impl SessionManager {
@@ -917,6 +919,7 @@ impl SessionManager {
             notices,
             holder: OnceLock::new(),
             dialer: OnceLock::new(),
+            security_keys: OnceLock::new(),
         });
         let weak = Arc::downgrade(&mgr);
         tokio::spawn(async move {
@@ -943,6 +946,33 @@ impl SessionManager {
     /// Uses `dialer` for hosts with a private network.
     pub fn set_dialer(&self, dialer: termoak_ssh::Dialer) {
         let _ = self.dialer.set(dialer);
+    }
+
+    /// Forwards security key signatures through `broker`.
+    pub fn set_security_keys(&self, broker: Arc<crate::security_keys::SkBroker>) {
+        let _ = self.security_keys.set(broker);
+    }
+
+    /// The security key signer of a session: forwarded to the owner's
+    /// devices, with "Touch your security key…" as the session's state
+    /// while it waits.
+    fn security_key_signer(
+        &self,
+        live: &Arc<LiveSession>,
+    ) -> Option<Arc<dyn termoak_ssh::sk::SecurityKeySigner>> {
+        let broker = self.security_keys.get()?;
+        let weak = Arc::downgrade(live);
+        let label = live.title();
+        let hook: crate::security_keys::WaitHook = Arc::new(move |msg: Option<String>| {
+            if let Some(l) = weak.upgrade()
+                && matches!(l.state(), SessionState::Connecting { .. })
+            {
+                l.set_state(SessionState::Connecting {
+                    message: msg.unwrap_or_else(|| format!("Connecting to {label}…")),
+                });
+            }
+        });
+        Some(broker.signer(live.owner, live.vault_id, Some(hook)))
     }
 
     /// Per-user notices.
@@ -1074,17 +1104,28 @@ impl SessionManager {
         // (The network of a chain is the first jump's or this host's; a
         // network missing from the vault fails here with
         // `network_not_found`.)
-        let network = self
+        let resolved = self
             .store
             .resolve_in(&access, host_id, termoak_core::store::SecretUse::Server)
-            .await?
-            .first_hop_network_id()
-            .is_some();
+            .await?;
+        let network = resolved.first_hop_network_id().is_some();
         if network && self.dialer.get().is_none() {
             return Err(crate::netd::not_configured());
         }
-        // An older holder would dial such hosts directly: they live here.
-        let holder = holder.filter(|h| !network || h.knows_networks());
+        // A FIDO2 key somewhere in the chain: its signature is forwarded.
+        let security_key = std::iter::once(&resolved)
+            .chain(resolved.jumps.iter())
+            .any(|h| {
+                h.key
+                    .as_ref()
+                    .is_some_and(|k| termoak_ssh::sk::is_security_key(&k.private_key))
+            });
+        drop(resolved);
+        // An older holder would dial such hosts directly (or could not ask
+        // for the signature): they live here.
+        let holder = holder.filter(|h| {
+            (!network || h.knows_networks()) && (!security_key || h.knows_security_keys())
+        });
         let record = record
             .or(settings.record_sessions)
             .unwrap_or(self.cfg.record);
@@ -1192,7 +1233,9 @@ impl SessionManager {
             Some(prompter.clone()),
         )))
         .with_prompter(prompter)
-        .with_dialer(self.dialer.get().cloned());
+        .with_dialer(self.dialer.get().cloned())
+        .with_security_key(self.security_key_signer(live))
+        .with_purpose("server_session", Some(live.id.to_string()));
         let conn = Connection::connect(&resolved, &opts).await?;
         live.set_state(SessionState::Connecting {
             message: "Opening terminal…".into(),
@@ -1505,6 +1548,7 @@ impl SessionManager {
             }),
             detect_os,
             host: resolved,
+            security_keys: holder.knows_security_keys(),
         };
         if holder.send(ToHolder::Open(Box::new(open))) {
             Ok(())
@@ -1696,6 +1740,28 @@ impl SessionManager {
                     None => None,
                 },
             },
+            Question::SecurityKey { request } => {
+                use termoak_ssh::sk::{SkError, SkErrorCode, wire};
+                let result = match (&live, wire::parse_request(&request)) {
+                    (None, _) => Err(SkError::new(
+                        SkErrorCode::Failed,
+                        "the session no longer exists",
+                    )),
+                    (_, Err(e)) => Err(e),
+                    (Some(l), Ok((_, mut req))) => match self.security_key_signer(l) {
+                        Some(signer) => {
+                            // The session is the server's: its id and owner win.
+                            req.context.session_id = Some(l.id.to_string());
+                            req.context.purpose = "server_session".into();
+                            signer.sign(req).await
+                        }
+                        None => Err(SkError::of(SkErrorCode::Required)),
+                    },
+                };
+                Answer::SecurityKey {
+                    response: wire::response("holder", &result),
+                }
+            }
         }
     }
 

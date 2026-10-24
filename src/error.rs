@@ -110,7 +110,7 @@ impl From<CoreError> for ApiError {
                     | codes::MEMBER_EXISTS
                     | codes::ID_IN_USE => StatusCode::CONFLICT,
                     codes::CROSS_VAULT_REFERENCE => StatusCode::UNPROCESSABLE_ENTITY,
-                    codes::INVALID_ROLE => StatusCode::BAD_REQUEST,
+                    codes::INVALID_ROLE | codes::INVALID_SNIPPET => StatusCode::BAD_REQUEST,
                     codes::NETWORK_NOT_FOUND => StatusCode::NOT_FOUND,
                     codes::NETWORK_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
                     codes::NETWORK_DIAL_FAILED => StatusCode::BAD_GATEWAY,
@@ -154,6 +154,10 @@ impl From<SshError> for ApiError {
             }
             // Private networks: `network_unavailable` (no netd, or it is
             // down), `network_not_found`, `network_dial_failed`.
+            // FIDO2 security keys (docs/SSH-PRO.md §3.6).
+            SshError::SecurityKey { code, message } => {
+                ApiError::new(security_key_status(code), code, message)
+            }
             SshError::Network { code, message } => {
                 let status = match code {
                     codes::NETWORK_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
@@ -164,6 +168,17 @@ impl From<SshError> for ApiError {
             }
             other => ApiError::new(StatusCode::BAD_GATEWAY, "ssh_error", other.to_string()),
         }
+    }
+}
+
+/// HTTP status of a `security_key_*` code.
+pub fn security_key_status(code: &str) -> StatusCode {
+    match code {
+        codes::SECURITY_KEY_TIMEOUT => StatusCode::GATEWAY_TIMEOUT,
+        codes::SECURITY_KEY_UNSUPPORTED => StatusCode::UNPROCESSABLE_ENTITY,
+        codes::SECURITY_KEY_INVALID => StatusCode::BAD_REQUEST,
+        codes::SECURITY_KEY_FAILED => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::CONFLICT,
     }
 }
 

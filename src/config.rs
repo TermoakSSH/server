@@ -83,6 +83,9 @@ pub struct SessionsSection {
     /// keeps the SSH connections open so restarting the server does not cut
     /// the sessions. Without it, sessions live in the server process.
     pub holder_socket: Option<PathBuf>,
+    /// How long a server connection waits for one of the user's devices to
+    /// sign with a FIDO2 security key (seconds, 10–300).
+    pub security_key_timeout_secs: u64,
 }
 
 impl Default for SessionsSection {
@@ -96,6 +99,7 @@ impl Default for SessionsSection {
             max_per_user: 50,
             relay_grace_minutes: 5,
             holder_socket: None,
+            security_key_timeout_secs: crate::security_keys::DEFAULT_TIMEOUT_SECS,
         }
     }
 }

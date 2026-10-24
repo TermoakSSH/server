@@ -385,8 +385,13 @@ impl Holder {
             id: held.id,
         });
         let opts = ConnectOptions::new(asker.clone())
-            .with_prompter(asker)
-            .with_dialer(self.dialer.clone());
+            .with_prompter(asker.clone())
+            .with_dialer(self.dialer.clone())
+            .with_security_key(
+                o.security_keys
+                    .then(|| asker.clone() as Arc<dyn termoak_ssh::sk::SecurityKeySigner>),
+            )
+            .with_purpose("server_session", Some(held.id.to_string()));
         let conn = Connection::connect(&o.host, &opts).await?;
         self.set_status(
             held,
@@ -590,6 +595,30 @@ impl HostKeyVerifier for Asker {
                 target: format!("{host}:{port}"),
                 reason: "the server did not answer the host key verification".into(),
             }),
+        }
+    }
+}
+
+/// Security keys: the server forwards the request to the owner's devices.
+#[async_trait]
+impl termoak_ssh::sk::SecurityKeySigner for Asker {
+    async fn sign(
+        &self,
+        request: termoak_ssh::sk::SkSignRequest,
+    ) -> Result<termoak_ssh::sk::SkAssertion, termoak_ssh::sk::SkError> {
+        use termoak_ssh::sk::{SkError, SkErrorCode, wire};
+        let question = Question::SecurityKey {
+            request: wire::request("holder", &request, 0),
+        };
+        match self.ask(question).await {
+            Some(Answer::SecurityKey { response }) => match wire::parse_response(&response) {
+                Some((_, result)) => result,
+                None => Err(SkError::invalid("invalid answer from the server")),
+            },
+            _ => Err(SkError::new(
+                SkErrorCode::Required,
+                "the server did not answer the security key request",
+            )),
         }
     }
 }

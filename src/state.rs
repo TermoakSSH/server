@@ -43,6 +43,8 @@ pub struct Inner {
     pub netd: Option<Arc<crate::netd::Netd>>,
     /// Open network relays per user.
     pub relays: crate::routes::networks::RelayCounter,
+    /// Security key signatures forwarded to the users' devices.
+    pub security_keys: Arc<crate::security_keys::SkBroker>,
 }
 
 #[derive(Clone)]

@@ -3,10 +3,16 @@
 //! changes (`{"type":"vault","event":"changed"|"access",...}`). The mobile
 //! app uses it for notifications. When the device is signed out it gets
 //! `{"type":"signed_out"}` and the socket closes (code 4007, `signed_out`).
+//!
+//! A device that connects with `?features=security_keys` also gets the
+//! server's `security_key_request`s and answers them on the same socket
+//! (`security_key_response`): docs/SSH-PRO.md §5.
+
+use std::collections::HashMap;
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Query, State};
 use axum::response::Response;
 use axum::routing::get;
 use serde_json::json;
@@ -21,20 +27,45 @@ pub fn routes() -> Router<AppState> {
     Router::new().route("/api/v1/events/ws", get(ws))
 }
 
-async fn ws(State(st): State<AppState>, u: AuthUser, upgrade: WebSocketUpgrade) -> Response {
+async fn ws(
+    State(st): State<AppState>,
+    u: AuthUser,
+    Query(q): Query<HashMap<String, String>>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     // Closed as soon as this device is signed out.
     let guard = st.sockets.register(u.id(), u.device.id, SocketKind::Events);
-    upgrade.on_upgrade(move |socket| run(st, u, socket, guard))
+    let features: Vec<String> = q
+        .get("features")
+        .map(|f| {
+            f.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| x == termoak_ssh::sk::wire::FEATURE)
+                .collect()
+        })
+        .unwrap_or_default();
+    upgrade.on_upgrade(move |socket| run(st, u, socket, guard, features))
 }
 
-async fn run(st: AppState, u: AuthUser, mut socket: WebSocket, guard: SocketGuard) {
+async fn run(
+    st: AppState,
+    u: AuthUser,
+    mut socket: WebSocket,
+    guard: SocketGuard,
+    features: Vec<String>,
+) {
     let owner = u.id();
     let mut ai = st.ai.subscribe();
     let mut sessions = st.sessions.notices();
     let mut vaults = st.vault_events.subscribe();
+    // A device that can sign with security keys (server forwarding).
+    let mut signer = features
+        .iter()
+        .any(|f| f == termoak_ssh::sk::wire::FEATURE)
+        .then(|| st.security_keys.register(owner, u.device.id));
     // Initial state: pending approvals.
     let pending = st.ai.pending_approvals(owner).await.unwrap_or_default();
-    let hello = json!({"type": "hello", "user": u.user, "pending_approvals": pending});
+    let hello = json!({"type": "hello", "user": u.user, "pending_approvals": pending, "features": features});
     if socket
         .send(Message::Text(hello.to_string().into()))
         .await
@@ -47,7 +78,22 @@ async fn run(st: AppState, u: AuthUser, mut socket: WebSocket, guard: SocketGuar
         tokio::select! {
             msg = socket.recv() => match msg {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Text(t))) => {
+                    if let Some((g, _)) = &signer
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&t)
+                    {
+                        st.security_keys.on_message(owner, g.id(), &v);
+                    }
+                }
                 _ => {}
+            },
+            Some(v) = async {
+                match signer.as_mut() {
+                    Some((_, rx)) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if socket.send(Message::Text(v.to_string().into())).await.is_err() { break; }
             },
             ev = ai.recv() => match ev {
                 Ok(ev) if ev.owner == owner => {
