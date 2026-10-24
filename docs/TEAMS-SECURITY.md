@@ -1,9 +1,9 @@
 # Teams security: SSH CA, temporary access, policies and fine roles (Termoak 0.7, phase 4b)
 
-Status: **phase 4b** (2026-10-24): design (this file, identical copy in
+Status: **phase 4c** (2026-10-24): design (this file, identical copy in
 `server/docs/TEAMS-SECURITY.md`), core v0.7.0-next.8, server 0.7.0-next.8
-(staging next.termoak.com, schema v13), QA suite `teams-security`. The UIs
-come in 4c (web + desktop) and 4d (Android + iOS): checklists in §13.
+(staging next.termoak.com, schema v13), QA suite `teams-security`; web and
+desktop UIs done (4c, §13.1); Android + iOS next (4d, §13.2).
 Plan: `PLAN-0.7.md` §3 items 3, 4 and 6. Builds on `VAULTS-MULTISERVER.md`
 (vaults, roles, Strict, just-in-time credentials), `PUSH.md` (approvals by
 push) and `SSH-PRO.md` (security keys; certificates already work with them).
@@ -742,72 +742,103 @@ of the deployment.
 
 ## 13. Checklists for the UIs
 
-### 13.1 Phase 4c — web + desktop
+### 13.1 Phase 4c — web + desktop (done 2026-10-24)
 
-- [ ] Send `X-Termoak-Features: roles_v2,policies,certificates,recording`
-      (web: on every fetch; desktop: comes with the core) and
-      `features=…,roles_v2,policies` on the events socket.
-- [ ] Vault members: role picker with Connect only / Use / Edit / Admin (and
-      help text per role); `connect_only` badge; explicit Admin cannot
-      delete the vault (hide).
-- [ ] Team → Security tab (owners/admins): **CA** (create with algorithm,
-      fingerprint, public key copy, `sshd_config` lines, install command
-      `curl -fsSL <install url> | sudo sh` with toggles KRL/principals/refresh,
-      rotate with overlap, disable with confirmation, issued certificates
-      list with filters and revoke, revoke key/user), **policy** form
-      (2FA + grace, reveal, AI allowed/approval, networks, recording, CA
-      defaults: TTLs, principals templates with preview, extensions,
-      source address), **compliance** list (who lacks 2FA, deadline,
-      blocked), member principal editor.
-- [ ] Personal CA in Account settings (same component).
-- [ ] Host/group editor: "Authentication: Password/key · Team certificate"
-      (`settings.auth`, inherited state shown), disabled without a CA.
-- [ ] Access policies editor (vault managers) on vault/group/host: mode,
-      approvers picker, max window, request TTL, self-approval,
-      require-for-managers, certificate overrides, recording.
-- [ ] Connect flow: on `access_approval_required` show **Request access**
-      (minutes ≤ max, reason) instead of an error; show pending state and
-      the remaining window ("Access until 15:42") in the host list and tab.
-- [ ] **Approvals inbox** (requests to approve: requester, target, reason,
-      minutes; Approve with optional shorter window and note / Deny with
-      reason; revoke active windows), live via events `access_request`;
-      desktop toast + tray badge; web badge.
-- [ ] "My requests" list (status, cancel).
-- [ ] Hide reveal/copy/export when `policy.reveal_allowed = false`; hide AI
-      actions when `ai_allowed = false`; hide the network picker when
-      `networks_allowed = false`; show "Recorded" badge and upload
-      recordings (desktop: `upload_recording` after local sessions when
-      `record_required`); managers: recordings list per vault (download).
-- [ ] 2FA banner from `team_2fa` (login and `/me`): deadline, link to setup;
-      blocked state explains why vaults vanished.
-- [ ] Error texts (en/es) for every new code (§7) and the close reasons.
-- [ ] Desktop: certificate details (principals, validity) in the
-      connection info panel (`parse_certificate`).
+Web `next` 14b9d59 (staging), desktop 0.7.0-next.4 `next` 2afd3c5, QA
+`teams-security` browser tests (qa 15019cf). Every item below is in both
+apps unless said otherwise.
+
+- [x] Features: the desktop gets `X-Termoak-Features:
+      roles_v2,policies,certificates,recording` and `features=roles_v2,policies`
+      from the core. The web sends `roles_v2,policies` only (a fetch wrapper
+      for same-origin `/api/` requests, so public-web is untouched): it never
+      asks for certificates or JIT credentials, so it does not claim
+      `certificates`/`recording`.
+- [x] Role picker Connect only / Use / Edit / Admin with help per role
+      (servers without `teams_security`: Use and Edit); Connect only badge;
+      an explicit Admin sees no Delete (implicit = owner of a shared vault or
+      an `implicit` member entry of the team's owners/admins).
+- [x] Team → Security: CA, policy form (validated with the core's
+      `TeamPolicy::validate` on the desktop), compliance, member principal.
+      **Install command**: `install.sh` needs the manager's token, so
+      `curl … | sudo sh` cannot work from a host; both apps copy the script
+      itself in a heredoc (`sudo sh -s <<'TERMOAK_CA' … TERMOAK_CA`) and offer
+      to download it, plus the `sshd_config` lines and the public keys URL.
+- [x] Personal CA (desktop: Settings → General under the account; web:
+      Account → Certificates), same component.
+- [x] Host/group Authentication with the inherited state. There is no
+      "password/key" value that opts a host out of its group's Team
+      certificate (`auth` is `null` = inherit, or `team_certificate`).
+- [x] Access policy editor on vault (desktop: vault dialog → Access tab with
+      every policy of the vault), group and host (menus).
+- [x] `access_approval_required` → Request access (duration ≤ max, reason,
+      this host or what the policy covers); pending state with Cancel;
+      the desktop terminal connects by itself when the window opens; host
+      chips "Until 15:42 · 42 min", tab time left, bar "Access until 15:42 ·
+      42 min left". Server sessions close with `access_expired` /
+      `access_revoked` in the session state's `reason` (bare codes), followed
+      by the shared-session `ended` with `session_ended`: keep the reason.
+- [x] Approvals inbox + My requests (desktop: Access section with sidebar
+      badge, toasts, system notifications with their own switch; web:
+      `/app/access`, badge on the Vaults link, toasts, live).
+- [x] Hide reveal/copy/export (`Vault.policy.reveal_allowed`; the REST host
+      list does **not** set `secret_hidden` for Editors under Forbid reveal),
+      AI (desktop: hosts left out of "Ask AI"), the network picker;
+      "Recorded" badges; desktop uploads recordings through the core;
+      recordings list + download + an asciicast player (desktop replays into
+      its terminal model, honouring `"r"` resize events).
+- [x] 2FA banner (deadline or blocked) with the link to set it up.
+- [x] en/es texts for every code (desktop: always the app's text, not the
+      server's English message) and the close reasons.
+- [x] Desktop: connection details dialog with the certificate in use
+      (`parse_certificate`): resolves the host again (cached certificate);
+      Use-only members of normal vaults read `GET /certificates` instead so
+      no JIT credential is fetched twice.
 
 ### 13.2 Phase 4d — Android + iOS
 
 - [ ] Core bindings v0.7.0-next.8: handle `VaultRole.ConnectOnly` /
       `ItemAccess.ConnectOnly` (exhaustive `when`/`switch`), `HostSettings
-      .auth`, `VaultInfo.policy`.
+      .auth`, `VaultInfo.policy`. ConnectOnly items: never JIT; connect
+      locally only when the host's effective auth (own or nearest group's)
+      is `team_certificate` and `policy.certificates`, else a server session.
 - [ ] Push: `access_request` notifications (category approval:
       Approve/Deny open the approval screen behind the app lock, never act
       from the notification), `resolved` removes them, `access_decided`
       (info) opens "My requests"; add the kind to Settings → Notifications.
 - [ ] Approval screen (request details, Approve with optional shorter
-      window and note, Deny with reason) and approvals inbox; "My requests".
-- [ ] Connect flow: `access_approval_required` → Request access sheet;
-      window countdown on the host row/tab; Connect only hosts connect with
-      team certificates (automatic in the core) or a server session.
-- [ ] Host/group editor: Authentication picker (Team certificate).
-- [ ] Hide reveal/copy/export/AI/network per `policy`; recording badge and
-      `upload_recording` after local sessions on recorded hosts.
+      window and note, Deny with reason) and approvals inbox; "My requests"
+      with cancel/end. Listings carry `can_decide`; events
+      (`access_request`) carry the bare request without it: refetch the
+      lists on any event (both apps do).
+- [ ] Connect flow: `access_approval_required` → Request access sheet. The
+      error's details differ: the server's (`host_id, policy_id,
+      target_kind, target_id, max_minutes`) vs the engine's own check
+      (adds `vault_id, pending, can_request`). Request on the host (the
+      server applies its effective policy); a group/vault-wide request is
+      optional. `access_duration_too_long` carries `max_minutes`. `/exec`
+      results only carry the text. After an event, ask `host_access` again
+      (the engine caches answers 30 s and forgets them with
+      `forget_access`).
+- [ ] Window countdown on the host row/tab (1 s ticks in the last 2 min, a
+      warning colour in the last 5); `access_expired` / `access_revoked`
+      closing texts.
+- [ ] Host/group editor: Authentication picker (inherit / Team
+      certificate), with "no CA" warning from `policy.certificates`.
+- [ ] Hide reveal/copy/export/AI/network per `policy`; recording badge;
+      `upload_recording` happens in the core after local sessions on
+      recorded hosts (check it on the device builds).
 - [ ] Team security screens (read-only on phones is acceptable: CA
       fingerprint, sshd line copy, policy summary, compliance list); full
-      editing optional.
-- [ ] 2FA banner (`team_2fa`) with a link to the 2FA setup.
-- [ ] Texts en/es for the new codes.
+      editing optional. The install script needs a manager's token: show
+      the heredoc command (copy/share), never a `curl | sh`.
+- [ ] 2FA banner (`team_2fa` from `/me`, or the login answer) with a link
+      to the 2FA setup; a blocked member's team vaults vanish from sync.
+- [ ] Texts en/es for the new codes and close reasons.
 - [ ] Live test against staging (approval from the phone with the staging
-      ntfy; Connect only + certificate login to the QA sshd).
+      ntfy; Connect only + certificate login to a `termoak-qa-sshd`
+      container with the install script). Test accounts with 2FA need
+      `totp_code` on every new sign-in: keep refreshing tokens instead.
 
 ## 14. Deferred / open
 
