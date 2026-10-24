@@ -906,6 +906,8 @@ pub struct SessionManager {
     dialer: OnceLock<termoak_ssh::Dialer>,
     /// FIDO2 security keys: signatures forwarded to the owner's devices.
     security_keys: OnceLock<Arc<crate::security_keys::SkBroker>>,
+    /// Teams security (mandatory recording, 0.7 phase 4b).
+    security: OnceLock<Arc<crate::security::Security>>,
 }
 
 impl SessionManager {
@@ -920,6 +922,7 @@ impl SessionManager {
             holder: OnceLock::new(),
             dialer: OnceLock::new(),
             security_keys: OnceLock::new(),
+            security: OnceLock::new(),
         });
         let weak = Arc::downgrade(&mgr);
         tokio::spawn(async move {
@@ -946,6 +949,11 @@ impl SessionManager {
     /// Uses `dialer` for hosts with a private network.
     pub fn set_dialer(&self, dialer: termoak_ssh::Dialer) {
         let _ = self.dialer.set(dialer);
+    }
+
+    /// Teams security (mandatory recording).
+    pub fn set_security(&self, security: Arc<crate::security::Security>) {
+        let _ = self.security.set(security);
     }
 
     /// Forwards security key signatures through `broker`.
@@ -1126,9 +1134,15 @@ impl SessionManager {
         let holder = holder.filter(|h| {
             (!network || h.knows_networks()) && (!security_key || h.knows_security_keys())
         });
-        let record = record
-            .or(settings.record_sessions)
-            .unwrap_or(self.cfg.record);
+        // Mandatory recording (team or access policy) wins over the request.
+        let forced = match self.security.get() {
+            Some(sec) => sec.record_required(&access, vault, &host).await,
+            None => access.must_record(vault),
+        };
+        let record = forced
+            || record
+                .or(settings.record_sessions)
+                .unwrap_or(self.cfg.record);
         let id = new_id();
         let term = OnceLock::new();
         if let Some(h) = &holder {
@@ -1869,6 +1883,48 @@ impl SessionManager {
             .await;
         }
         affected.len()
+    }
+
+    /// Open server sessions of a user on hosts of a vault: `(session,
+    /// host)`.
+    pub fn server_sessions_in(&self, user: Id, vault: Id) -> Vec<(Id, Option<Id>)> {
+        self.sessions
+            .read()
+            .values()
+            .filter(|s| {
+                s.vault_id == Some(vault)
+                    && s.owner == user
+                    && matches!(s.backing, Backing::Server { .. })
+                    && !s.state().is_closed()
+            })
+            .map(|s| (s.id, s.host_id))
+            .collect()
+    }
+
+    /// Closes one server session with a reason code (an access window
+    /// ended or was revoked: `access_expired`, `access_revoked`).
+    pub async fn close_with_reason(self: &Arc<Self>, id: Id, reason: &str) -> bool {
+        let Some(s) = self.get(id) else {
+            return false;
+        };
+        if s.state().is_closed() {
+            return false;
+        }
+        if let Backing::Server { term, .. } = &s.backing
+            && let Some(t) = term.get()
+        {
+            t.close().await;
+        }
+        self.finish(&s, SessionStatus::Closed, None, Some(reason.into()))
+            .await;
+        self.audit(
+            &s,
+            "system",
+            "session.close",
+            serde_json::json!({"reason": reason}),
+        )
+        .await;
+        true
     }
 
     pub fn recording_path(&self, owner: Id, id: Id) -> PathBuf {

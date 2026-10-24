@@ -495,7 +495,10 @@ The AI providers and their settings are described in [AI.md](https://github.com/
 ## Backups
 
 Copy the whole `data_dir`: the `termoak.db` database, `master.key`,
-`vapid.key` (Web Push), the recordings and the Codex session. SQLite runs in WAL mode. For a hot copy:
+`vapid.key` (Web Push), the recordings and the Codex session. SQLite runs in WAL mode. The
+teams' and users' SSH certificate authorities (0.7.0-next.8) live in the database with their
+private keys sealed by `master.key`: restoring both keeps every host that trusts them working;
+losing `master.key` means creating new CAs and running the install script on the hosts again. For a hot copy:
 
 ```sh
 sqlite3 /var/lib/termoak/termoak.db ".backup '/backup/termoak.db'"

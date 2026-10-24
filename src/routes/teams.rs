@@ -69,9 +69,15 @@ pub struct AddMember {
     pub role: TeamRole,
 }
 
+/// `PATCH /teams/{id}/members/{user_id}`: the role, and/or (0.7 phase 4b)
+/// the member's certificate principal (`{member}` in principal templates;
+/// empty clears it).
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetRole {
-    pub role: TeamRole,
+    #[serde(default)]
+    pub role: Option<TeamRole>,
+    #[serde(default)]
+    pub principal: Option<String>,
 }
 
 fn default_role() -> TeamRole {
@@ -185,6 +191,11 @@ async fn remove(
         Err(_) => Vec::new(),
     };
     st.store.delete_team(id).await?;
+    // Its CA stops signing (0.7 phase 4b).
+    let _ = st
+        .store
+        .disable_ca(termoak_core::store::security::CaOwner::Team(id))
+        .await;
     crate::routes::networks::down_later(&st, networks);
     for v in &team_vaults {
         st.sessions.close_for_vault(None, *v).await;
@@ -430,6 +441,30 @@ async fn set_role(
         .team_role(id, user_id)
         .await?
         .ok_or_else(|| ApiError::not_found("not a team member"))?;
+    if let Some(p) = &req.principal {
+        let p = p.trim();
+        if !p.is_empty() {
+            termoak_core::access::validate_principal(p)
+                .map_err(|e| ApiError::bad_request(e.to_string()).with_code("invalid_principal"))?;
+        }
+        st.store
+            .set_team_member_principal(id, user_id, Some(p.to_string()).filter(|p| !p.is_empty()))
+            .await?;
+        st.security.forget_user(user_id);
+        st.store
+            .audit(
+                u.id(),
+                &u.actor(),
+                "team.principal_changed",
+                Some(id.to_string()),
+                json!({"user": user_id, "principal": p}),
+            )
+            .await?;
+    }
+    let Some(role) = req.role else {
+        return Ok(Json(st.store.team_members(id).await?));
+    };
+    let req = SetRoleResolved { role };
     // Changing an owner or appointing one is up to owners.
     if (current == TeamRole::Owner || req.role == TeamRole::Owner) && mine != TeamRole::Owner {
         return Err(ApiError::forbidden("only an owner can change other owners")
@@ -459,6 +494,10 @@ async fn set_role(
     Ok(Json(st.store.team_members(id).await?))
 }
 
+struct SetRoleResolved {
+    role: TeamRole,
+}
+
 async fn remove_member(
     State(st): State<AppState>,
     u: AuthUser,
@@ -483,6 +522,30 @@ async fn remove_member(
     // team's vaults (server sessions on their hosts close).
     st.sessions.reevaluate_user(user_id).await;
     crate::vaults::apply_revocations(&st, before, &[]).await;
+    // No more certificates from the team's CA, and the unexpired ones are
+    // revoked (KRL) (0.7 phase 4b).
+    st.security.forget_user(user_id);
+    let revoked = st
+        .store
+        .revoke_certificates(
+            Some(termoak_core::store::security::CaOwner::Team(id)),
+            termoak_core::store::security::CertSelector::User(user_id),
+            u.id(),
+            Some("removed from the team".into()),
+        )
+        .await
+        .unwrap_or_default();
+    if !revoked.is_empty() {
+        st.store
+            .audit(
+                u.id(),
+                &u.actor(),
+                "cert.revoke",
+                Some(id.to_string()),
+                json!({"user": user_id, "serials": revoked, "reason": "removed from the team"}),
+            )
+            .await?;
+    }
     st.store
         .audit(
             u.id(),

@@ -851,6 +851,19 @@ async fn credentials(
         .store
         .resolve_in(&ctx.access, id, SecretUse::Credentials)
         .await?;
+    // Mandatory recording (0.7 phase 4b): only clients that record get
+    // credentials for these hosts.
+    if !ctx.user.features.recording
+        && st
+            .security
+            .record_required(&ctx.access, vault, &resolved.host)
+            .await
+    {
+        return Err(ApiError::forbidden(
+            "sessions on this host must be recorded: update the app or open a server session",
+        )
+        .with_code(termoak_core::error::codes::RECORDING_REQUIRED));
+    }
     let mut hops: Vec<CredentialHop> = resolved.jumps.iter().map(hop).collect();
     hops.push(hop(&resolved));
     st.store

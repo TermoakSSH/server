@@ -34,7 +34,15 @@ ago must keep working with a new server, so `/api/v1` only grows:
   (0.7), `tailscale.ephemeral` of networks and `security_key` of keys
   (0.7.0-next.4) are always written by newer cores (`null` when empty), so a
   PUT or a sync push **without the key** keeps the stored value, and `null`
-  clears it. Clients must send the whole object they read.
+  clears it. Clients must send the whole object they read. Also
+  `settings.auth` of hosts and groups (0.7.0-next.8).
+- Clients declare what they understand in the `X-Termoak-Features` header
+  (comma list; cores from 0.7.0-next.8 send `roles_v2,policies,certificates,
+  recording`). Without `roles_v2` the role `connect_only` is shown as
+  `use_only` everywhere (vaults, members, sync v2, events); without
+  `policies` vaults come without `policy`; without `recording` no
+  just-in-time credentials or certificates are given for hosts whose
+  sessions must be recorded (`recording_required`).
 
 An incompatible change goes into a new API (`/api/v2`) that lives alongside
 the old one while clients still use it. One deliberate exception: since
@@ -202,7 +210,7 @@ Sync, AI, push notifications and updates:
 | `cross_vault_reference` | 422 | A reference points to an item of another vault. Extra field: `field` (`group_id`, `settings.key_id`...) |
 | `still_referenced` | 409 | You are moving a key or identity that other items still use (`force: true` detaches them). Extra field: `used_by` (`[{kind, id, field}]`) |
 | `use_only_strict` | 403 | Strict vault: Use-only members only connect through the server (no `/credentials`) |
-| `invalid_role` | 400 | Only `editor` and `use_only` can be granted |
+| `invalid_role` | 400 | Grantable roles: `connect_only`, `use_only`, `editor` and `manager` (the role of plain team members cannot be `manager`) |
 | `member_exists` | 409 | That user or team already has access to the vault |
 | `id_in_use` | 409 | The id belongs to an item you cannot see |
 | `not_team_member` | 403 | You can only share a vault with a team you belong to |
@@ -214,6 +222,26 @@ Sync, AI, push notifications and updates:
 | `network_dial_failed` | 502 | The network could not reach the host. Extra fields: `netd_code` (`dial_failed`, `needs_auth`, `timeout`, `network_error`, `limit`...) and, with `needs_auth` (a Tailscale node), `auth`: `login` (log the node in: the network's status has the URL) or `approval` (approve the device in the tailnet's admin console) |
 | `not_in_network` | 422 | `/hosts/{id}/relay` for a host without a private network: connect to it directly |
 | `relay_limit` | 429 | Too many relays open (`[networks] max_relays_per_user`). Extra field: `max` |
+| `connect_only` | 403 | Connect only members get no just-in-time credentials (they connect through the server or with team certificates) |
+| `secret_reveal_forbidden` | 403 | The team does not allow Editors to reveal, export or take out the secrets of this vault |
+| `vault_owner_only` | 403 | Only the vault's owner (or the team's owners and admins) can delete it: an explicit Admin grant cannot |
+| `access_approval_required` | 403 | The host needs an approved access window. Extra fields: `host_id`, `policy_id`, `target_kind`, `target_id`, `max_minutes` |
+| `access_request_exists` | 409 | You already have a pending request for this. Extra field: `id` |
+| `access_request_not_needed` | 409 | The target has no approval policy, or you are a manager exempt from it |
+| `access_request_closed` | 409 | The request is no longer pending (or the window ended). Extra field: `status` |
+| `access_duration_too_long` | 400 | More minutes than the policy allows (or, approving, than were asked). Extra field: `max_minutes` |
+| `not_an_approver` | 403 | You cannot decide this request |
+| `self_approval_forbidden` | 403 | You cannot approve your own request (unless the policy has `allow_self_approval`) |
+| `ca_not_configured` | 404 | The vault's owner has no SSH certificate authority |
+| `ca_exists` | 409 | There is already an active certificate authority (rotate it instead) |
+| `certificate_key_not_owned` | 403 | The key is not one you may use (another vault, Connect only, Strict), or `public_key` does not match `key_id` |
+| `certificate_key_revoked` | 403 | That public key was revoked by the certificate authority |
+| `certificate_proof_invalid` | 403 | The proof of possession does not verify, or its timestamp is more than 5 minutes off |
+| `certificate_no_principals` | 400 | No valid principal for the certificate (the host has no username for `{login}`) |
+| `team_2fa_required` | 409 | A team you belong to requires two-step verification (you cannot turn it off) |
+| `policy_requires_2fa` | 409 | Turn on two-step verification for yourself before requiring it from the team |
+| `networks_forbidden_by_policy` | 403 | The team does not allow private networks in this vault |
+| `recording_required` | 403 | Sessions on this host must be recorded and this client does not record: update the app or open a server session |
 | `ai_not_configured` | 503 | The AI provider is not configured |
 | `ai_key_required` | 403 | The plan does not include the server's AI and you have no API key of your own that can be used: add one in Settings → AI (`PUT /me/ai/keys/{provider}`) |
 | `ai_budget_exceeded` | 403 | This month's AI credit for the server's providers is spent (your own API keys keep working) |
@@ -514,7 +542,7 @@ team. It expires after 7 days unless told otherwise (`0` = never). The
 | GET, POST | `/teams` | Your teams (all of them, for server administrators), or creates one `{name}` (you become its owner) |
 | GET, PATCH, DELETE | `/teams/{id}` | Shows, renames `{name}` or deletes it. Deleting it revokes what was shared with it |
 | GET, POST | `/teams/{id}/members` | Members, or adds one `{email, role}` |
-| PATCH, DELETE | `/teams/{id}/members/{user_id}` | Changes the role `{role}` or removes the member. Removing yourself leaves the team |
+| PATCH, DELETE | `/teams/{id}/members/{user_id}` | Changes the role `{role}` and/or the member's certificate principal `{principal}` (empty clears it), or removes the member. Removing yourself leaves the team (and revokes your unexpired certificates of the team's CA) |
 | GET, POST | `/teams/{id}/invites` | Pending invitations, or invites by email `{email, role}`: someone who already has an account joins directly (`{added: true}`); otherwise they get an invitation to sign up (`{added: false, token, url, web_url, emailed}`) |
 | DELETE | `/teams/{id}/invites/{invite_id}` | Revokes a team invitation |
 
@@ -526,6 +554,28 @@ with it, and to its vaults (their server sessions on those hosts close).
 Deleting a team deletes its vaults with their items (`GET /vaults` shows the
 item counts first).
 
+### Team security (0.7.0-next.8)
+
+Design and rules: [TEAMS-SECURITY.md](TEAMS-SECURITY.md). `/info`
+`features.teams_security` says the server has them.
+
+| Method | Route | Description |
+|---|---|---|
+| GET, POST, DELETE | `/teams/{id}/ca` | The team's SSH CA (`{ca, previous, keys_file, sshd_config, sshd_config_optional, urls, policy, can_manage}`; members read), creates it `{algorithm?: "ed25519" \| "ecdsa-p256"}` or retires it `?confirm=<team name>` (owners and admins) |
+| POST | `/teams/{id}/ca/rotate` | New CA; the old one stays published `{overlap_hours?: 1-720}` (24) |
+| GET | `/teams/{id}/ca/install.sh` | Host install script (`sh`, public data): `?krl=1` (`RevokedKeys`), `principals=1` (`AuthorizedPrincipalsFile`), `refresh=1` (cron refresh from the public URLs) |
+| GET | `/teams/{id}/ca/krl` | The KRL (binary) |
+| GET | `/teams/{id}/ca/certificates` | Issued certificates (`?user_id=&active=1&limit=`) |
+| POST | `/teams/{id}/ca/revoke` | `{serial}` \| `{user_id}` \| `{public_key}` + `reason?` → `{revoked: [serials]}` (a key stays revoked: no new certificates, listed in the KRL) |
+| | `/me/ca…` | The same routes for your personal CA (confirm with `personal`) |
+| GET | `/ssh-ca/{owner}/keys`, `/ssh-ca/{owner}/krl` | Public: the `TrustedUserCAKeys` file (active and retiring keys) and the KRL of a CA owner (team or user id) |
+| GET, PUT | `/teams/{id}/policy` | The team's `TeamPolicy` (members read; owners and admins replace it): `require_2fa`, `grace_days`, `allow_reveal`, `ai {allowed, approval}`, `networks_allowed`, `record_sessions`, `ca {default_ttl_minutes, max_ttl_minutes, principals, extensions, source_address}`, `notifications` |
+| GET | `/teams/{id}/compliance` | `{require_2fa, grace_days, members: [{user_id, email, name, role, totp_enabled, deadline, blocked, principal}]}` (owners and admins) |
+
+`POST /auth/login` and `GET /me` include `team_2fa: [{team_id, team_name,
+deadline, blocked}]` when a team requires 2FA and the account does not have
+it; after the grace period the team's vaults are hidden until it does.
+
 ## Vaults
 
 A **vault** is the unit of ownership, sharing and sync of entities (hosts,
@@ -536,10 +586,14 @@ item is in exactly one vault (`vault_id`).
   shared, deleted or left.
 - Users create **shared** vaults (they own them) and team owners and admins
   create **team** vaults (the team owns them).
-- **Roles:** `use_only` < `editor` < `manager`. `manager` is computed: the
-  owner of a shared vault, the owners and admins of the team of a team
-  vault. Grants give `editor` or `use_only` to a user or to a team (you must
-  belong to it). Plain members of the owning team get the vault's
+- **Roles:** `connect_only` < `use_only` < `editor` < `manager` (UI: Connect
+  only, Use, Edit, Admin). `manager` is the owner of a shared vault, the
+  owners and admins of the team of a team vault, or (0.7.0-next.8) an
+  explicit grant, which manages members, settings and access policies but
+  cannot delete the vault (`vault_owner_only`). Grants give `connect_only`,
+  `use_only`, `editor` or `manager` to a user or to a team (you must belong
+  to it). `connect_only` members never get secrets, not even just in time
+  (`connect_only`): they use the server or team certificates. Plain members of the owning team get the vault's
   `team_member_role` (default `editor`; `null`: no access). The effective
   role is the maximum of every grant.
 - **Use-only** members use the items (server sessions, SFTP, exec, the AI,
@@ -585,6 +639,36 @@ on hosts of that vault close (`session_closed` with reason
 `vault_access_revoked`) and the server drops its pooled connections. A
 downgrade to Use-only keeps the sessions running. Session shares are
 independent of vaults: sharing a terminal never grants its vault.
+
+### Access policies and temporary access (0.7.0-next.8)
+
+| Method | Route | Description |
+|---|---|---|
+| GET, PUT | `/vaults/{id}/access-policies` | Policies of a vault (members), or sets one `{target_kind: "host" \| "group" \| "vault", target_id, policy}` (managers; upsert per target) |
+| DELETE | `/vaults/{id}/access-policies/{policy_id}` | Deletes one (managers) |
+| GET | `/hosts/{id}/access` | `HostAccess`: `mode`, `policy` (the one that applies and its target), `exempt`, `allowed`, `grant`, `pending`, `can_request`, `max_minutes`, `certificates`, `team_certificate`, `record_required`, `ai_allowed`, `reveal_allowed` |
+| GET, POST | `/access-requests` | Requests (`?scope=mine` (default) \| `approvals` \| `vault&vault_id=`, `status=`), or asks `{host_id \| group_id \| vault_id, minutes, reason}` |
+| GET | `/access-requests/{id}` | One request (requester, approvers, managers); `can_decide` says whether you may decide it |
+| POST | `/access-requests/{id}/approve` | `{minutes?, reason?}` (a shorter window only); `self_approval_forbidden` for your own unless the policy allows it |
+| POST | `/access-requests/{id}/deny`, `/revoke` | `{reason?}`; revoke ends an active window (and revokes its certificates) |
+| POST | `/access-requests/{id}/cancel` | The requester cancels (or ends their window) |
+| POST, GET | `/certificates` | A certificate for one of your keys `{host_id, key_id}` or `{host_id, public_key, proof, timestamp}` (+ `ttl_minutes?`) → `{certificate, serial, key_id, principals, valid_after, valid_before, ca_fingerprint, request_id, extensions, record_required}`; GET: your recent ones. 60 per minute |
+| POST | `/recordings?host_id=&started_at=&title=` | Uploads the asciicast of a local session (≤ 64 MiB) → `{id}` |
+| GET | `/vaults/{id}/recordings`, `/vaults/{id}/recordings/{session_id}` | Recorded sessions of the vault and their download (managers) |
+
+Policies: `{mode: "direct" | "approval", approvers, max_minutes,
+request_ttl_minutes, allow_self_approval, require_for_managers, principals,
+cert_ttl_minutes, extensions, source_address, force_command,
+record_sessions}`. A host's policy is its own, else its nearest group's,
+else the vault's. Windows gate everything the server hands out for those
+hosts: certificates, just-in-time credentials, server sessions, SFTP, exec,
+the AI and relays (`access_approval_required`). Requests are pushed to the
+approvers (`access_request`, withdrawn with `resolved` when decided) and the
+requester gets `access_decided`.
+
+Proof of possession: an SSHSIG (`ssh-keygen -Y sign -n
+termoak-cert@termoak.com`) over
+`termoak-cert-request\n<instance_id>\n<user id>\n<key type> <base64>\n<timestamp ms>`.
 
 ### Move and copy
 

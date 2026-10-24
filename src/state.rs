@@ -45,6 +45,12 @@ pub struct Inner {
     pub relays: crate::routes::networks::RelayCounter,
     /// Security key signatures forwarded to the users' devices.
     pub security_keys: Arc<crate::security_keys::SkBroker>,
+    /// Teams security: SSH CA, access policies (0.7 phase 4b).
+    pub security: Arc<crate::security::Security>,
+    /// Certificates per user (`POST /certificates`).
+    pub cert_limiter: crate::limiter::RateLimiter,
+    /// Access requests per user.
+    pub request_limiter: crate::limiter::RateLimiter,
 }
 
 #[derive(Clone)]

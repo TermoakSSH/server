@@ -6,7 +6,11 @@
 //!
 //! A device that connects with `?features=security_keys` also gets the
 //! server's `security_key_request`s and answers them on the same socket
-//! (`security_key_response`): docs/SSH-PRO.md §5.
+//! (`security_key_response`): docs/SSH-PRO.md §5. `roles_v2` (0.7 phase 4b):
+//! roles as they are (`connect_only`); without it they are shown as older
+//! clients understand them. Teams security events: `access_request`
+//! (created, approved, denied, cancelled, expired, revoked, ended) and
+//! `team` (`policy`), docs-next/TEAMS-SECURITY.md §5.6.
 
 use std::collections::HashMap;
 
@@ -40,7 +44,10 @@ async fn ws(
         .map(|f| {
             f.split(',')
                 .map(|x| x.trim().to_string())
-                .filter(|x| x == termoak_ssh::sk::wire::FEATURE)
+                .filter(|x| {
+                    x == termoak_ssh::sk::wire::FEATURE
+                        || matches!(x.as_str(), "roles_v2" | "policies")
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -55,6 +62,9 @@ async fn run(
     features: Vec<String>,
 ) {
     let owner = u.id();
+    // Roles as this client understands them (`connect_only` is `use_only`
+    // for clients without `roles_v2`, 0.7 phase 4b).
+    let roles_v2 = features.iter().any(|f| f == "roles_v2");
     let mut ai = st.ai.subscribe();
     let mut sessions = st.sessions.notices();
     let mut vaults = st.vault_events.subscribe();
@@ -116,7 +126,10 @@ async fn run(
                 Err(RecvError::Closed) => break,
             },
             ev = vaults.recv() => match ev {
-                Ok((user, v)) if user == owner => {
+                Ok((user, mut v)) if user == owner => {
+                    if !roles_v2 && v["type"] == "vault" && v["role"] == "connect_only" {
+                        v["role"] = serde_json::json!("use_only");
+                    }
                     if socket.send(Message::Text(v.to_string().into())).await.is_err() { break; }
                 }
                 Ok(_) => {}

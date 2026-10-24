@@ -1270,7 +1270,7 @@ fn endpoints() -> Vec<Ep> {
             Ref("AiAccess"),
         ),
         Ep {
-            query: &["access_token"],
+            query: &["access_token", "features"],
             ..ep(
                 Get,
                 "/api/v1/events/ws",
@@ -1281,6 +1281,7 @@ fn endpoints() -> Vec<Ep> {
             )
         },
     ];
+    v.extend(security_endpoints());
     for (name, schema) in [
         ("hosts", "Host"),
         ("groups", "Group"),
@@ -1389,6 +1390,284 @@ fn schema_for(body: Body) -> Option<RefOr<Schema>> {
 }
 
 /// Builds the OpenAPI document.
+/// Teams security (0.7 phase 4b, docs-next/TEAMS-SECURITY.md §7).
+fn security_endpoints() -> Vec<Ep> {
+    use Body::*;
+    use HttpMethod::*;
+    let mut v = Vec::new();
+    for (base, who) in [
+        ("/api/v1/teams/{id}/ca", "a team's"),
+        ("/api/v1/me/ca", "your personal"),
+    ] {
+        let at = |suffix: &str| -> &'static str {
+            Box::leak(format!("{base}{suffix}").into_boxed_str())
+        };
+        let text = |t: String| -> &'static str { Box::leak(t.into_boxed_str()) };
+        v.push(ep(
+            Get,
+            at(""),
+            "teams",
+            text(format!(
+                "SSH CA of {who}: keys, sshd_config lines, URLs, policy"
+            )),
+            None,
+            Object,
+        ));
+        v.push(ep(
+            Post,
+            at(""),
+            "teams",
+            text(format!("Create {who} SSH CA (owners/admins)")),
+            Ref("CreateCa"),
+            Object,
+        ));
+        v.push(Ep {
+            query: &["confirm"],
+            ..ep(
+                Delete,
+                at(""),
+                "teams",
+                text(format!(
+                    "Disable {who} SSH CA (?confirm=<team name|personal>)"
+                )),
+                None,
+                Object,
+            )
+        });
+        v.push(ep(
+            Post,
+            at("/rotate"),
+            "teams",
+            text(format!("Rotate {who} SSH CA with an overlap")),
+            Ref("RotateCa"),
+            Object,
+        ));
+        v.push(Ep {
+            query: &["krl", "principals", "refresh"],
+            ..ep(
+                Get,
+                at("/install.sh"),
+                "teams",
+                text(format!(
+                    "Install script trusting {who} CA (sh, public data)"
+                )),
+                None,
+                Binary,
+            )
+        });
+        v.push(ep(
+            Get,
+            at("/krl"),
+            "teams",
+            text(format!("KRL (RevokedKeys) of {who} CA")),
+            None,
+            Binary,
+        ));
+        v.push(Ep {
+            query: &["user_id", "active", "limit"],
+            ..ep(
+                Get,
+                at("/certificates"),
+                "teams",
+                text(format!("Certificates issued by {who} CA")),
+                None,
+                List("IssuedCertificate"),
+            )
+        });
+        v.push(ep(
+            Post,
+            at("/revoke"),
+            "teams",
+            text(format!(
+                "Revoke certificates of {who} CA (serial, user or key)"
+            )),
+            Ref("RevokeCerts"),
+            Object,
+        ));
+    }
+    v.push(Ep {
+        auth: false,
+        ..ep(
+            Get,
+            "/api/v1/ssh-ca/{owner}/keys",
+            "teams",
+            "TrustedUserCAKeys file of a CA owner (public)",
+            None,
+            Binary,
+        )
+    });
+    v.push(Ep {
+        auth: false,
+        ..ep(
+            Get,
+            "/api/v1/ssh-ca/{owner}/krl",
+            "teams",
+            "KRL of a CA owner (public)",
+            None,
+            Binary,
+        )
+    });
+    v.push(ep(
+        Get,
+        "/api/v1/teams/{id}/policy",
+        "teams",
+        "A team's security policy",
+        None,
+        Ref("TeamPolicy"),
+    ));
+    v.push(ep(
+        Put,
+        "/api/v1/teams/{id}/policy",
+        "teams",
+        "Replace a team's security policy (owners/admins)",
+        Ref("TeamPolicy"),
+        Ref("TeamPolicy"),
+    ));
+    v.push(ep(
+        Get,
+        "/api/v1/teams/{id}/compliance",
+        "teams",
+        "Members and their 2FA state (owners/admins)",
+        None,
+        Object,
+    ));
+    v.push(ep(
+        Get,
+        "/api/v1/vaults/{id}/access-policies",
+        "vaults",
+        "Access policies of a vault",
+        None,
+        List("AccessPolicyRecord"),
+    ));
+    v.push(ep(
+        Put,
+        "/api/v1/vaults/{id}/access-policies",
+        "vaults",
+        "Set the policy of a host, group or the vault (managers)",
+        Ref("SetAccessPolicy"),
+        Ref("AccessPolicyRecord"),
+    ));
+    v.push(ep(
+        Delete,
+        "/api/v1/vaults/{id}/access-policies/{policy_id}",
+        "vaults",
+        "Delete an access policy (managers)",
+        None,
+        Object,
+    ));
+    v.push(ep(
+        Get,
+        "/api/v1/hosts/{id}/access",
+        "hosts",
+        "What you can do with a host now (mode, window, request, recording)",
+        None,
+        Ref("HostAccess"),
+    ));
+    v.push(Ep {
+        query: &["scope", "status", "vault_id", "limit"],
+        ..ep(
+            Get,
+            "/api/v1/access-requests",
+            "vaults",
+            "Access requests (mine, to approve, of a vault)",
+            None,
+            List("AccessRequest"),
+        )
+    });
+    v.push(ep(
+        Post,
+        "/api/v1/access-requests",
+        "vaults",
+        "Ask for temporary access to a host, group or vault",
+        Ref("CreateAccessRequest"),
+        Ref("AccessRequest"),
+    ));
+    v.push(ep(
+        Get,
+        "/api/v1/access-requests/{id}",
+        "vaults",
+        "An access request",
+        None,
+        Ref("AccessRequest"),
+    ));
+    v.push(ep(
+        Post,
+        "/api/v1/access-requests/{id}/approve",
+        "vaults",
+        "Approve (optionally a shorter window)",
+        Ref("DecideRequest"),
+        Ref("AccessRequest"),
+    ));
+    v.push(ep(
+        Post,
+        "/api/v1/access-requests/{id}/deny",
+        "vaults",
+        "Deny",
+        Ref("DecideRequest"),
+        Ref("AccessRequest"),
+    ));
+    v.push(ep(
+        Post,
+        "/api/v1/access-requests/{id}/cancel",
+        "vaults",
+        "Cancel your request (or end your window)",
+        None,
+        Ref("AccessRequest"),
+    ));
+    v.push(ep(
+        Post,
+        "/api/v1/access-requests/{id}/revoke",
+        "vaults",
+        "End a window early (approvers, managers)",
+        Ref("DecideRequest"),
+        Ref("AccessRequest"),
+    ));
+    v.push(ep(
+        Post,
+        "/api/v1/certificates",
+        "keychain",
+        "A short-lived SSH certificate for one of your keys",
+        Ref("CertificateRequest"),
+        Ref("IssuedCert"),
+    ));
+    v.push(ep(
+        Get,
+        "/api/v1/certificates",
+        "keychain",
+        "Your recent certificates",
+        None,
+        List("IssuedCertificate"),
+    ));
+    v.push(Ep {
+        query: &["host_id", "started_at", "title"],
+        ..ep(
+            Post,
+            "/api/v1/recordings",
+            "sessions",
+            "Upload the recording (asciicast) of a local session",
+            Binary,
+            Object,
+        )
+    });
+    v.push(ep(
+        Get,
+        "/api/v1/vaults/{id}/recordings",
+        "vaults",
+        "Recorded sessions of a vault (managers)",
+        None,
+        Object,
+    ));
+    v.push(ep(
+        Get,
+        "/api/v1/vaults/{id}/recordings/{session_id}",
+        "vaults",
+        "Download a recording of a vault (managers)",
+        None,
+        Binary,
+    ));
+    v
+}
+
 pub fn document() -> OpenApi {
     let mut items: BTreeMap<&'static str, PathItemBuilder> = BTreeMap::new();
     for e in endpoints() {
@@ -1639,6 +1918,30 @@ pub fn document() -> OpenApi {
         .schema_from::<Credentials>()
         .schema_from::<CredentialHop>()
         .schema_from::<CredentialKey>()
+        .schema_from::<termoak_core::access::VaultPolicy>()
+        .schema_from::<termoak_core::access::AiApproval>()
+        .schema_from::<termoak_core::access::AiPolicy>()
+        .schema_from::<termoak_core::access::CaPolicy>()
+        .schema_from::<termoak_core::access::TeamPolicy>()
+        .schema_from::<termoak_core::access::AccessMode>()
+        .schema_from::<termoak_core::access::AccessTargetKind>()
+        .schema_from::<termoak_core::access::AccessPolicy>()
+        .schema_from::<termoak_core::access::AccessPolicyRecord>()
+        .schema_from::<termoak_core::access::AccessRequestStatus>()
+        .schema_from::<termoak_core::access::AccessRequest>()
+        .schema_from::<termoak_core::access::HostAccess>()
+        .schema_from::<termoak_core::access::Team2fa>()
+        .schema_from::<termoak_core::access::CaStatus>()
+        .schema_from::<termoak_core::access::CaInfo>()
+        .schema_from::<termoak_core::access::IssuedCertificate>()
+        .schema_from::<crate::security::IssuedCert>()
+        .schema_from::<crate::routes::security::CreateCa>()
+        .schema_from::<crate::routes::security::RotateCa>()
+        .schema_from::<crate::routes::security::RevokeCerts>()
+        .schema_from::<crate::routes::security::SetAccessPolicy>()
+        .schema_from::<crate::routes::security::CreateAccessRequest>()
+        .schema_from::<crate::routes::security::DecideRequest>()
+        .schema_from::<crate::routes::security::CertificateRequest>()
         .build();
 
     let tags = [
@@ -1667,10 +1970,14 @@ pub fn document() -> OpenApi {
         ("events", "Real-time events"),
         ("audit", "Action log"),
         ("admin", "User administration"),
-        ("teams", "Teams and sessions shared with teams"),
+        (
+            "teams",
+            "Teams, sessions shared with teams, team SSH CA and security policies",
+        ),
         (
             "vaults",
-            "Vaults: ownership, sharing (editor / use only) and sync of items",
+            "Vaults: ownership, sharing (connect only / use / edit / admin), sync of items, \
+             access policies and temporary access requests",
         ),
         (
             "account",

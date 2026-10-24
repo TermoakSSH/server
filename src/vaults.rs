@@ -122,6 +122,11 @@ impl VaultEvents {
         }
     }
 
+    /// Any event for a user's events sockets (`access_request`, `team`...).
+    pub fn send(&self, user: Id, v: Value) {
+        let _ = self.tx.send((user, v));
+    }
+
     /// A user's access to a vault changed (`role: null`: lost).
     pub fn access(&self, user: Id, vault: Id, role: Option<VaultRole>, reason: &str) {
         let _ = self.tx.send((

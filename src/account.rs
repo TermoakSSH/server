@@ -547,10 +547,12 @@ async fn verify_code(
             json!({"device": req.device_name, "platform": req.platform, "via": "email_code", "ip": ip}),
         )
         .await?;
+    let team_2fa = crate::routes::security::team_2fa(&st, &user).await;
     Ok(Json(AuthResponse {
         user,
         tokens,
         verification_required: false,
+        team_2fa,
     }))
 }
 

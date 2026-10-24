@@ -258,7 +258,8 @@ below). On connect:
 
 `?features=` (comma list) declares what this client can do; `hello` echoes
 the ones the server knows. Today: `security_keys` (see
-[Security keys](#security-keys)).
+[Security keys](#security-keys)), `roles_v2` and `policies` (0.7.0-next.8:
+without `roles_v2`, `vault/access` shows `connect_only` as `use_only`).
 
 and then three kinds of messages (plus `signed_out`, below):
 
@@ -294,7 +295,28 @@ and then three kinds of messages (plus `signed_out`, below):
 | `vault.event` | Fields | Meaning |
 |---|---|---|
 | `changed` | `vault_id`, `rev` | Items of a vault you can access changed: sync (v2). Coalesced per vault (one every 500 ms at most) and sent to every member online |
-| `access` | `vault_id`, `role`, `reason` | Your access changed. `role` is the new role (`manager`, `editor`, `use_only`) or `null` when you lost it; `reason` is `granted`, `role_changed`, `revoked`, `deleted` or `updated` (settings such as the Strict switch). Sync after it |
+| `access` | `vault_id`, `role`, `reason` | Your access changed. `role` is the new role (`manager`, `editor`, `use_only`, `connect_only` with `roles_v2`) or `null` when you lost it; `reason` is `granted`, `role_changed`, `revoked`, `deleted` or `updated` (settings such as the Strict switch). Sync after it |
+
+Teams security (0.7.0-next.8, [TEAMS-SECURITY.md](TEAMS-SECURITY.md)) adds:
+
+```json
+{"type":"access_request","event":"created","request":{AccessRequest}}
+{"type":"team","event":"policy","team_id":"…"}
+```
+
+| `access_request.event` | To | Meaning |
+|---|---|---|
+| `created` | requester, approvers | A request waits for a decision |
+| `approved` / `denied` | requester, approvers | Decided (`request.decided_by`, `decision_reason`, `starts_at`, `ends_at`) |
+| `cancelled` | requester, approvers | The requester cancelled it (or ended the window) |
+| `expired` | requester, approvers | Nobody decided in time |
+| `revoked` | requester, approvers | An approver ended the window early |
+| `ended` | requester | The window ran out |
+
+`team/policy`: the team's policy changed: sync (the vaults' `policy` and
+access may have changed). When a window ends or is revoked, the requester's
+server sessions on hosts no longer allowed close with `session_closed` and
+`reason: "access_expired"` or `"access_revoked"`.
 
 When the device is signed out (from another device, a password reset or an
 administrator), the server sends `{"type":"signed_out","message":"…"}` and

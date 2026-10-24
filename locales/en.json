@@ -58,5 +58,14 @@
   "push.security_key_request.generic": "A connection is waiting for your security key. Open Termoak to use it.",
   "push.access_request.title": "Access request",
   "push.access_request.body": "%{name} asks for access to %{target}.",
-  "push.access_request.generic": "Someone is asking for temporary access and is waiting for your approval."
+  "push.access_request.generic": "Someone is asking for temporary access and is waiting for your approval.",
+  "push.access_decided.title": "Access request",
+  "push.access_decided.approved": "Your access to %{target} was approved.",
+  "push.access_decided.approved_generic": "Your access request was approved.",
+  "push.access_decided.denied": "Your access to %{target} was denied.",
+  "push.access_decided.denied_generic": "Your access request was denied.",
+  "push.access_decided.revoked": "Your access to %{target} was ended early.",
+  "push.access_decided.revoked_generic": "Your temporary access was ended early.",
+  "push.access_decided.expired": "Your request for %{target} expired without an answer.",
+  "push.access_decided.expired_generic": "Your access request expired without an answer."
 }

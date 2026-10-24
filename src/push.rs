@@ -829,7 +829,13 @@ impl Push {
 
     /// Sends to one device.
     async fn send_to(&self, t: &PushTarget, p: &Payload) -> Sent {
-        let (ttl, urgency) = delivery(&p.kind, self.sk_timeout_secs);
+        let (mut ttl, urgency) = delivery(&p.kind, self.sk_timeout_secs);
+        // An access request lives until it expires (at most a day).
+        if p.kind == "access_request"
+            && let Some(exp) = p.expires_at
+        {
+            ttl = ((exp - termoak_core::time::now_ms()) / 1000).clamp(60, 86_400) as u64;
+        }
         match t.platform.as_str() {
             "webpush" => match &self.web {
                 Some(w) => w.send(t, p, ttl, urgency).await,
@@ -1074,6 +1080,48 @@ impl Push {
     /// 0.7 phase 4b: the access request was decided (or expired).
     pub fn access_request_resolved(self: &Arc<Self>, approver: Id, request_id: Id) {
         self.resolve(approver, "access_request", format!("access-{request_id}"));
+    }
+
+    /// 0.7 phase 4b: your access request was approved, denied, revoked or
+    /// expired (`status`). `target` only shows with `[push] detailed`.
+    pub fn access_decided(
+        self: &Arc<Self>,
+        requester: Id,
+        request_id: Id,
+        status: &str,
+        target: &str,
+    ) {
+        let (detailed, status, target) = (self.detailed, status.to_string(), target.to_string());
+        self.notify(requester, "access_decided", move |l| {
+            let (full, generic) = match status.as_str() {
+                "approved" => (
+                    t!("push.access_decided.approved", locale = l, target = target),
+                    t!("push.access_decided.approved_generic", locale = l),
+                ),
+                "denied" => (
+                    t!("push.access_decided.denied", locale = l, target = target),
+                    t!("push.access_decided.denied_generic", locale = l),
+                ),
+                "revoked" => (
+                    t!("push.access_decided.revoked", locale = l, target = target),
+                    t!("push.access_decided.revoked_generic", locale = l),
+                ),
+                _ => (
+                    t!("push.access_decided.expired", locale = l, target = target),
+                    t!("push.access_decided.expired_generic", locale = l),
+                ),
+            };
+            let body = Self::text(detailed, full.into_owned(), generic);
+            let mut p = Payload::new(
+                "access_decided",
+                &t!("push.access_decided.title", locale = l),
+                &body,
+            )
+            .with("request_id", request_id)
+            .with("status", status.as_str());
+            p.collapse = Some(format!("access-decided-{request_id}"));
+            p
+        });
     }
 
     /// Listens to the AI and the sessions and notifies whoever is concerned.

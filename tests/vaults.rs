@@ -318,7 +318,9 @@ async fn permission_matrix() {
         .post(
             &format!("/api/v1/vaults/{ops}/members"),
             &w.ana,
-            json!({"email": w.dan.email, "role": "manager"}),
+            // `manager` (Admin) is grantable since 0.7 phase 4b; an unknown
+            // role is not.
+            json!({"email": w.dan.email, "role": "owner"}),
         )
         .await;
     assert_eq!((r.status, r.code()), (400, "invalid_role"));

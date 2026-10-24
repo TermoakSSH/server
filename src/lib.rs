@@ -22,6 +22,7 @@ pub mod openapi;
 pub mod push;
 pub mod room;
 pub mod routes;
+pub mod security;
 pub mod security_keys;
 pub mod sessions;
 pub mod state;
@@ -94,6 +95,8 @@ pub async fn start_sessions(state: &AppState) -> anyhow::Result<()> {
         }
         None => Vec::new(),
     };
+    // Teams security: expire access requests, end windows, retire CAs.
+    routes::security::spawn_job(state.clone());
     let closed = state.store.close_orphan_sessions(&keep).await?;
     if closed > 0 {
         tracing::info!(closed, "sessions marked as closed after the restart");
@@ -193,6 +196,13 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
         p.clone().spawn_dispatcher(ai.clone(), sessions.clone());
         security_keys.set_waker(Arc::new(push::SkWaker(p.clone())));
     }
+    // Teams security (0.7 phase 4b): access policies and team certificates
+    // on every server resolution.
+    let security = security::Security::new(store.clone(), instance_id.clone());
+    store.set_resolve_hook(Some(
+        security.clone() as Arc<dyn termoak_core::store::ResolveHook>
+    ));
+    sessions.set_security(security.clone());
     let updates = updates::UpdateProxy::from_config(&config.updates);
     if let Some(updates) = &updates {
         tracing::info!(
@@ -224,5 +234,8 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
         netd,
         relays: Default::default(),
         security_keys,
+        security,
+        cert_limiter: limiter::RateLimiter::new(routes::security::CERTS_PER_MINUTE, 60_000),
+        request_limiter: limiter::RateLimiter::new(routes::security::REQUESTS_PER_MINUTE, 60_000),
     })))
 }

@@ -4,6 +4,7 @@ pub mod ai;
 pub mod entities;
 pub mod events;
 pub mod networks;
+pub mod security;
 pub mod sessions;
 pub mod sftp;
 pub mod teams;
@@ -36,7 +37,11 @@ pub fn router(state: AppState) -> Router {
             Method::PATCH,
             Method::DELETE,
         ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            axum::http::HeaderName::from_static("x-termoak-features"),
+        ]);
 
     // SFTP uploads are streamed and unlimited; everything else, 8 MiB.
     let uploads = sftp::routes().layer(DefaultBodyLimit::disable());
@@ -51,7 +56,9 @@ pub fn router(state: AppState) -> Router {
         .merge(teams::routes())
         .merge(vaults::routes())
         .merge(networks::routes())
+        .merge(security::routes())
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+        .merge(security::upload_routes())
         .merge(uploads)
         .merge(crate::updates::routes())
         .route(

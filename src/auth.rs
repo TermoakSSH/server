@@ -23,6 +23,49 @@ use crate::state::AppState;
 pub struct AuthUser {
     pub user: User,
     pub device: Device,
+    /// What the client declares it understands (`X-Termoak-Features`).
+    pub features: ClientFeatures,
+}
+
+/// Features a client declares in `X-Termoak-Features` (0.7 phase 4b,
+/// docs-next/TEAMS-SECURITY.md §10). Older clients send none: the server
+/// shows them `connect_only` as `use_only`, leaves `Vault.policy` out and
+/// gives no credentials for hosts with mandatory recording.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientFeatures {
+    pub roles_v2: bool,
+    pub policies: bool,
+    pub certificates: bool,
+    pub recording: bool,
+}
+
+impl ClientFeatures {
+    /// From a comma-separated list.
+    pub fn parse(list: &str) -> Self {
+        let mut f = Self::default();
+        for item in list.split(',').map(str::trim) {
+            match item {
+                "roles_v2" => f.roles_v2 = true,
+                "policies" => f.policies = true,
+                "certificates" => f.certificates = true,
+                "recording" => f.recording = true,
+                _ => {}
+            }
+        }
+        f
+    }
+
+    pub fn from_headers(h: &axum::http::HeaderMap) -> Self {
+        h.get("x-termoak-features")
+            .and_then(|v| v.to_str().ok())
+            .map(Self::parse)
+            .unwrap_or_default()
+    }
+
+    /// A role as this client understands it.
+    pub fn role(&self, role: termoak_core::model::VaultRole) -> termoak_core::model::VaultRole {
+        if self.roles_v2 { role } else { role.legacy() }
+    }
 }
 
 impl AuthUser {
@@ -88,7 +131,11 @@ impl FromRequestParts<AppState> for AuthUser {
                 if !own_account && crate::account::verification_required(state, &user) {
                     return Err(crate::account::email_not_verified(&user));
                 }
-                Ok(AuthUser { user, device })
+                Ok(AuthUser {
+                    user,
+                    device,
+                    features: ClientFeatures::from_headers(&parts.headers),
+                })
             }
             None => Err(ApiError::unauthorized("invalid or expired token")),
         }
@@ -107,13 +154,13 @@ impl FromRequestParts<AppState> for MaybeUser {
     ) -> Result<Self, Self::Rejection> {
         match bearer_token(parts) {
             None => Ok(MaybeUser(None)),
-            Some(token) => Ok(MaybeUser(
-                state
-                    .store
-                    .authenticate(&token)
-                    .await?
-                    .map(|(user, device)| AuthUser { user, device }),
-            )),
+            Some(token) => Ok(MaybeUser(state.store.authenticate(&token).await?.map(
+                |(user, device)| AuthUser {
+                    user,
+                    device,
+                    features: ClientFeatures::from_headers(&parts.headers),
+                },
+            ))),
         }
     }
 }
@@ -258,6 +305,11 @@ pub struct AuthResponse {
     /// (`POST /auth/verify-code`, which signs in with new tokens) or its link
     /// is opened.
     pub verification_required: bool,
+    /// Teams that require two-step verification and this account does not
+    /// have it (0.7 phase 4b): the deadline of the grace period and whether
+    /// it is over (the team's vaults are hidden until 2FA is on).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub team_2fa: Vec<termoak_core::access::Team2fa>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -490,6 +542,17 @@ async fn info(State(st): State<AppState>) -> ApiResult<Json<Value>> {
             // What the server can send: `webpush` (UnifiedPush distributors
             // and browsers, with `vapid_public_key`), `apns`, `fcm`.
             "push": crate::push::server_features(&st),
+            // Teams security (0.7 phase 4b, docs-next/TEAMS-SECURITY.md):
+            // team/personal SSH CA and certificates, access policies and
+            // requests, team policies, fine roles (`connect_only`, granted
+            // `manager`) and recording uploads.
+            "teams_security": {
+                "ca": true,
+                "access_requests": true,
+                "policies": true,
+                "roles_v2": true,
+                "recording_upload": true,
+            },
         },
         "support_email": st.config.web.support_email,
         "terms_url": st.config.web.terms_url,
@@ -629,6 +692,7 @@ async fn register(
         user,
         tokens,
         verification_required,
+        team_2fa: Vec::new(),
     }))
 }
 
@@ -761,10 +825,12 @@ async fn login(
     if verification_required {
         crate::account::refresh_code_on_login(&st, &user, ip).await;
     }
+    let team_2fa = crate::routes::security::team_2fa(&st, &user).await;
     Ok(Json(AuthResponse {
         user,
         tokens,
         verification_required,
+        team_2fa,
     }))
 }
 
@@ -790,11 +856,13 @@ async fn logout(State(st): State<AppState>, u: AuthUser) -> ApiResult<Json<Value
 async fn me(State(st): State<AppState>, u: AuthUser) -> Json<Value> {
     let plan = st.config.plans.get(&u.user.plan);
     let verification_required = crate::account::verification_required(&st, &u.user);
+    let team_2fa = crate::routes::security::team_2fa(&st, &u.user).await;
     Json(json!({
         "user": u.user,
         "device": u.device,
         "plan": plan,
         "verification_required": verification_required,
+        "team_2fa": team_2fa,
     }))
 }
 
@@ -1024,6 +1092,23 @@ async fn totp_disable(
 ) -> ApiResult<Json<Value>> {
     if st.limiter.is_blocked(&u.user.email, ip) {
         return Err(too_many_attempts());
+    }
+    // A team that requires 2FA (0.7 phase 4b): it stays on.
+    let requiring: Vec<String> = st
+        .store
+        .teams_with_policy(u.id())
+        .await?
+        .into_iter()
+        .filter(|(_, _, p, _)| p.require_2fa)
+        .map(|(_, name, _, _)| name)
+        .collect();
+    if !requiring.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "your team requires two-step verification ({})",
+            requiring.join(", ")
+        ))
+        .with_code(termoak_core::error::codes::TEAM_2FA_REQUIRED)
+        .with_detail("teams", requiring));
     }
     let password_ok = st.store.check_password(u.id(), &req.password).await?;
     let code_ok = password_ok

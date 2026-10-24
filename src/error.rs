@@ -108,7 +108,17 @@ impl From<CoreError> for ApiError {
                     | codes::USE_TRANSFER
                     | codes::STILL_REFERENCED
                     | codes::MEMBER_EXISTS
-                    | codes::ID_IN_USE => StatusCode::CONFLICT,
+                    | codes::ID_IN_USE
+                    | codes::CA_EXISTS
+                    | codes::ACCESS_REQUEST_EXISTS
+                    | codes::ACCESS_REQUEST_NOT_NEEDED
+                    | codes::ACCESS_REQUEST_CLOSED
+                    | codes::TEAM_2FA_REQUIRED
+                    | codes::POLICY_REQUIRES_2FA => StatusCode::CONFLICT,
+                    codes::CA_NOT_CONFIGURED => StatusCode::NOT_FOUND,
+                    codes::ACCESS_DURATION_TOO_LONG | codes::CERTIFICATE_NO_PRINCIPALS => {
+                        StatusCode::BAD_REQUEST
+                    }
                     codes::CROSS_VAULT_REFERENCE => StatusCode::UNPROCESSABLE_ENTITY,
                     codes::INVALID_ROLE | codes::INVALID_SNIPPET => StatusCode::BAD_REQUEST,
                     codes::NETWORK_NOT_FOUND => StatusCode::NOT_FOUND,

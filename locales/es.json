@@ -58,5 +58,14 @@
   "push.security_key_request.generic": "Una conexión espera tu llave de seguridad. Abre Termoak para usarla.",
   "push.access_request.title": "Solicitud de acceso",
   "push.access_request.body": "%{name} pide acceso a %{target}.",
-  "push.access_request.generic": "Alguien pide acceso temporal y espera tu aprobación."
+  "push.access_request.generic": "Alguien pide acceso temporal y espera tu aprobación.",
+  "push.access_decided.title": "Solicitud de acceso",
+  "push.access_decided.approved": "Se aprobó tu acceso a %{target}.",
+  "push.access_decided.approved_generic": "Se aprobó tu solicitud de acceso.",
+  "push.access_decided.denied": "Se denegó tu acceso a %{target}.",
+  "push.access_decided.denied_generic": "Se denegó tu solicitud de acceso.",
+  "push.access_decided.revoked": "Se terminó antes de tiempo tu acceso a %{target}.",
+  "push.access_decided.revoked_generic": "Se terminó antes de tiempo tu acceso temporal.",
+  "push.access_decided.expired": "Tu solicitud para %{target} caducó sin respuesta.",
+  "push.access_decided.expired_generic": "Tu solicitud de acceso caducó sin respuesta."
 }

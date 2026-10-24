@@ -117,7 +117,12 @@ struct AuditQuery {
 }
 
 async fn list(State(st): State<AppState>, ctx: AccessCtx) -> ApiResult<Json<Vec<Vault>>> {
-    Ok(Json(st.store.vaults_for(ctx.id()).await?))
+    let vaults = st.store.vaults_for(ctx.id()).await?;
+    Ok(Json(
+        st.security
+            .present_vaults(&ctx.access, ctx.user.features, vaults)
+            .await?,
+    ))
 }
 
 async fn one(
@@ -125,7 +130,12 @@ async fn one(
     ctx: AccessCtx,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Vault>> {
-    Ok(Json(st.store.vault_for(id, ctx.id()).await?))
+    let v = st.store.vault_for(id, ctx.id()).await?;
+    let mut list = st
+        .security
+        .present_vaults(&ctx.access, ctx.user.features, vec![v])
+        .await?;
+    Ok(Json(list.remove(0)))
 }
 
 /// Creates a `shared` vault, or a `team` vault with `team_id`.
@@ -226,6 +236,23 @@ async fn remove(
 ) -> ApiResult<Json<Value>> {
     ctx.access.require(id, VaultRole::Manager)?;
     let vault = st.store.vault(id).await?;
+    // An explicit Admin grant manages the vault but does not delete it
+    // (0.7 phase 4b): only its owner or the team's owners and admins.
+    let implicit = match (vault.owner_user_id, vault.owner_team_id) {
+        (Some(o), _) => o == ctx.id(),
+        (None, Some(t)) => st
+            .store
+            .team_role(t, ctx.id())
+            .await?
+            .is_some_and(|r| r.can_manage()),
+        _ => false,
+    };
+    if !implicit && !ctx.user.user.is_admin {
+        return Err(ApiError::forbidden(
+            "only the vault's owner (or the team's owners and admins) can delete it",
+        )
+        .with_code("vault_owner_only"));
+    }
     if q.confirm.as_deref().map(str::trim) != Some(vault.name.trim()) {
         // The personal vault is refused whatever the confirmation says.
         if vault.kind == termoak_core::model::VaultKind::Personal {
@@ -263,7 +290,7 @@ async fn leave(
     ctx: AccessCtx,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Value>> {
-    ctx.access.require(id, VaultRole::UseOnly)?;
+    ctx.access.require(id, VaultRole::ConnectOnly)?;
     let before = snapshot(&st, [ctx.id()]).await;
     let m = st.store.leave_vault(id, ctx.id()).await?;
     apply_revocations(&st, before, &[]).await;
@@ -285,8 +312,12 @@ async fn members(
     ctx: AccessCtx,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Vec<VaultMember>>> {
-    ctx.access.require(id, VaultRole::UseOnly)?;
-    Ok(Json(st.store.vault_members(id).await?))
+    ctx.access.require(id, VaultRole::ConnectOnly)?;
+    let mut list = st.store.vault_members(id).await?;
+    for m in &mut list {
+        m.role = ctx.user.features.role(m.role);
+    }
+    Ok(Json(list))
 }
 
 /// Users a grant reaches (a user, or the members of a team).
@@ -602,6 +633,7 @@ async fn sync_v2(
             resync.push(vault);
             start = 0;
         }
+        let role = ctx.user.features.role(role);
         if remaining == 0 {
             more = true;
             cursors.push(VaultCursor {
@@ -649,8 +681,12 @@ async fn sync_v2(
     }
     changes.retain(|c| kinds.contains(&c.kind));
     removed.retain(|r| kinds.contains(&r.kind));
+    let vaults = st.store.vaults_for(ctx.id()).await?;
     Ok(Json(SyncV2Response {
-        vaults: st.store.vaults_for(ctx.id()).await?,
+        vaults: st
+            .security
+            .present_vaults(&access, ctx.user.features, vaults)
+            .await?,
         cursors,
         changes,
         removed,
