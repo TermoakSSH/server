@@ -268,6 +268,7 @@ fn connect_only_member_uses_team_certificates_from_the_device() {
                 vault_id: Some(prod.id.clone()),
                 access: None,
                 secret_hidden: false,
+                e2ee_locked: false,
             },
             SecretChange::Keep,
         )

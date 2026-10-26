@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
 use axum::routing::{delete, get, patch, post};
@@ -37,6 +37,9 @@ pub struct ClientFeatures {
     pub policies: bool,
     pub certificates: bool,
     pub recording: bool,
+    /// End-to-end encrypted vaults (0.7 phase 5a): the client seals and
+    /// opens their secrets. Clients without it never see those vaults.
+    pub e2ee: bool,
 }
 
 impl ClientFeatures {
@@ -49,6 +52,7 @@ impl ClientFeatures {
                 "policies" => f.policies = true,
                 "certificates" => f.certificates = true,
                 "recording" => f.recording = true,
+                "e2ee" => f.e2ee = true,
                 _ => {}
             }
         }
@@ -440,14 +444,6 @@ pub struct ResetPassword {
     pub password: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct AuditQuery {
-    #[serde(default)]
-    pub before: Option<i64>,
-    #[serde(default)]
-    pub limit: Option<i64>,
-}
-
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/info", get(info))
@@ -488,7 +484,6 @@ pub fn routes() -> Router<AppState> {
             get(list_invites).post(create_invite),
         )
         .route("/api/v1/admin/invites/{id}", delete(revoke_invite))
-        .route("/api/v1/admin/audit", get(admin_audit))
 }
 
 /// Public server information.
@@ -553,6 +548,22 @@ async fn info(State(st): State<AppState>) -> ApiResult<Json<Value>> {
                 "roles_v2": true,
                 "recording_upload": true,
             },
+            // End-to-end encrypted vaults (0.7 phase 5a, docs/E2EE-SSO-AUDIT.md
+            // §2): `/me/e2ee`, `/vaults/{id}/e2ee*`, sealed secrets in sync v2
+            // and REST, per-session unlock (`unlock` in sessions and tests).
+            // Clients declare `e2ee` in X-Termoak-Features to see such vaults.
+            "e2ee": true,
+            // Single sign-on for teams (OpenID Connect): `/auth/sso/*`,
+            // `/teams/{id}/sso`, `/teams/{id}/domains`. Needs public_url.
+            "sso": st.config.sso.enabled && st.config.server.public_url.is_some(),
+            // Audit search filters, exports, team retention and SIEM sinks
+            // (webhook, syslog).
+            "audit_v2": {
+                "filters": true,
+                "export": ["csv", "json", "ndjson"],
+                "retention": true,
+                "sinks": ["webhook", "syslog"],
+            },
         },
         "support_email": st.config.web.support_email,
         "terms_url": st.config.web.terms_url,
@@ -590,6 +601,10 @@ async fn register(
 ) -> ApiResult<Json<AuthResponse>> {
     let users = st.store.count_users().await?;
     let first = users == 0;
+    // Emails of a team that enforces SSO sign up through it (0.7 phase 5a).
+    if let Some(e) = crate::sso::sso_required(&st, &req.email, None).await {
+        return Err(e);
+    }
     // With an invitation, sign-up works even when registration is closed.
     let invite = match req
         .invite
@@ -767,11 +782,29 @@ async fn login(
         return Err(too_many_attempts());
     }
     let Some(user) = st.store.verify_login(&req.email, &req.password).await? else {
+        // A team that enforces SSO: say so even for an SSO-only account
+        // (it has no usable password).
+        if let Some(e) = crate::sso::sso_required(&st, &req.email, None).await {
+            return Err(e);
+        }
         st.limiter.failure(&req.email, ip);
         return Err(
             ApiError::unauthorized("wrong email or password").with_code("invalid_credentials")
         );
     };
+    // The account's team signs in through single sign-on (0.7 phase 5a).
+    if let Some(e) = crate::sso::sso_required(&st, &user.email, Some(&user)).await {
+        st.store
+            .audit(
+                user.id,
+                &format!("user:{}", user.id),
+                "auth.login_refused",
+                None,
+                json!({"reason": "sso_required", "ip": ip, "platform": req.platform}),
+            )
+            .await?;
+        return Err(e);
+    }
     let mut via = "password";
     if user.totp_enabled {
         let code = req
@@ -1346,16 +1379,4 @@ async fn admin_revoke_device(
         )
         .await?;
     Ok(Json(json!({"ok": true})))
-}
-
-async fn admin_audit(
-    State(st): State<AppState>,
-    _a: AdminUser,
-    Query(q): Query<AuditQuery>,
-) -> ApiResult<Json<Value>> {
-    let rows = st
-        .store
-        .audit_list_all(q.before, q.limit.unwrap_or(100).clamp(1, 1000))
-        .await?;
-    Ok(Json(json!(rows)))
 }

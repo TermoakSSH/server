@@ -23,7 +23,6 @@ use axum::response::IntoResponse;
 use termoak_core::error::codes;
 use termoak_core::store::{SecretUse, VaultChange};
 
-use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::vaults::AccessCtx;
@@ -45,7 +44,6 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/hosts/{id}/effective", get(effective))
         .route("/api/v1/hosts/{id}/credentials", post(credentials))
         .route("/api/v1/sync", post(sync))
-        .route("/api/v1/audit", get(audit))
         .route("/api/v1/exec", post(exec_many))
 }
 
@@ -78,6 +76,14 @@ fn split_body<T: Entity>(mut body: Value) -> ApiResult<Split<T>> {
             Some(serde_json::from_value(v).map_err(|e| ApiError::bad_request(e.to_string()))?)
         }
     };
+    // End-to-end encrypted vaults: the secret sealed by the client.
+    let sealed = match obj.remove("sealed") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            serde_json::from_value::<SealedSecret>(v)
+                .map_err(|e| ApiError::bad_request(format!("invalid sealed: {e}")))?,
+        ),
+    };
     let vault_id = match obj.remove("vault_id") {
         None | Some(Value::Null) => None,
         Some(v) => Some(
@@ -93,6 +99,7 @@ fn split_body<T: Entity>(mut body: Value) -> ApiResult<Split<T>> {
         "has_secret",
         "updated_by",
         "secret_hidden",
+        "e2ee_locked",
     ] {
         obj.remove(meta);
     }
@@ -101,6 +108,7 @@ fn split_body<T: Entity>(mut body: Value) -> ApiResult<Split<T>> {
     Ok(Split {
         data,
         secret,
+        sealed,
         sync_mode,
         vault_id,
     })
@@ -110,8 +118,34 @@ fn split_body<T: Entity>(mut body: Value) -> ApiResult<Split<T>> {
 struct Split<T: Entity> {
     data: T,
     secret: SecretUpdate<T::Secret>,
+    sealed: Option<SealedSecret>,
     sync_mode: Option<SyncMode>,
     vault_id: Option<Id>,
+}
+
+/// Saves a body: a sealed secret (end-to-end encrypted vaults) or the
+/// usual plaintext/keep/clear.
+async fn save_split<T: Entity>(
+    st: &AppState,
+    ctx: &AccessCtx,
+    vault: Id,
+    b: Split<T>,
+) -> ApiResult<Record<T>> {
+    Ok(match b.sealed {
+        Some(sealed) => {
+            if !matches!(b.secret, SecretUpdate::Keep) {
+                return Err(ApiError::bad_request("send either `secret` or `sealed`"));
+            }
+            st.store
+                .save_in_sealed(&ctx.access, vault, b.data, sealed, b.sync_mode)
+                .await?
+        }
+        None => {
+            st.store
+                .save_in(&ctx.access, vault, b.data, b.secret, b.sync_mode)
+                .await?
+        }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,10 +185,7 @@ async fn create<T: Entity>(
         crate::routes::networks::check_new_networks(&st, vault, 1).await?;
         b.data = with_public_key(&st, &ctx, None, b.data, &b.secret).await?;
     }
-    let rec = st
-        .store
-        .save_in(&ctx.access, vault, b.data, b.secret, b.sync_mode)
-        .await?;
+    let rec = save_split(&st, &ctx, vault, b).await?;
     Ok(Json(rec))
 }
 
@@ -227,10 +258,7 @@ async fn update<T: Entity>(
     if T::KIND == EntityKind::Network {
         b.data = with_public_key(&st, &ctx, Some(id), b.data, &b.secret).await?;
     }
-    let rec = st
-        .store
-        .save_in(&ctx.access, vault, b.data, b.secret, b.sync_mode)
-        .await?;
+    let rec = save_split(&st, &ctx, vault, b).await?;
     if T::KIND == EntityKind::Network {
         // A new key or configuration: the running node stops.
         crate::routes::networks::reconcile_later(&st, &ctx.access, vec![id]);
@@ -438,6 +466,15 @@ async fn effective(
     ))
 }
 
+/// Optional body of a host test.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct TestHostBody {
+    /// Credentials of a host of an end-to-end encrypted vault for this
+    /// test only (per-session unlock).
+    #[serde(default)]
+    pub unlock: Option<termoak_core::resolve::E2eeUnlock>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HostTest {
     pub ok: bool,
@@ -470,12 +507,26 @@ async fn test_host(
     ctx: AccessCtx,
     Path(id): Path<Id>,
     Query(q): Query<BTreeMap<String, String>>,
+    body: Option<Json<TestHostBody>>,
 ) -> ApiResult<Json<HostTest>> {
     let vault = st.store.vault_of::<Host>(&ctx.access, id).await?;
+    let unlock = body.and_then(|b| b.0.unlock);
     let resolved = st
         .store
-        .resolve_in(&ctx.access, id, SecretUse::Server)
+        .resolve_in_with(&ctx.access, id, SecretUse::Server, unlock.as_ref())
         .await?;
+    if unlock.is_some() {
+        st.store
+            .audit_vault(
+                ctx.id(),
+                &ctx.actor(),
+                "e2ee.unlock",
+                Some(format!("host:{id}")),
+                json!({"purpose": "test", "device": ctx.user.device.name}),
+                vault,
+            )
+            .await?;
+    }
     // The server only tests SSH (the apps test Telnet hosts themselves).
     if let Err(e) = crate::sessions::check_server_protocol(&resolved.host) {
         return Ok(Json(HostTest {
@@ -617,6 +668,14 @@ async fn sync(
                 .with_code("too_many_changes"),
         );
     }
+    // An end-to-end encrypted personal vault is not for this protocol
+    // (cores before vaults cannot seal secrets): refused, nothing changes.
+    if ctx.access.role(ctx.personal()).is_none() {
+        return Err(ApiError::conflict(
+            "your personal vault is end-to-end encrypted: update the app",
+        )
+        .with_code(codes::E2EE_CLIENT_REQUIRED));
+    }
     let mut pushed = req.changes;
     // Apps on this protocol (cores before vaults) only know the legacy
     // kinds: anything else they push is ignored and never sent to them.
@@ -735,24 +794,6 @@ pub fn tombstone(id: Id, kind: EntityKind, rev: i64, at: i64) -> SyncRecord {
         sealed: None,
         base_rev: None,
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct AuditQuery {
-    before: Option<i64>,
-    limit: Option<i64>,
-}
-
-async fn audit(
-    State(st): State<AppState>,
-    u: AuthUser,
-    Query(q): Query<AuditQuery>,
-) -> ApiResult<Json<Vec<AuditEntry>>> {
-    Ok(Json(
-        st.store
-            .audit_list(u.id(), q.before, q.limit.unwrap_or(100).clamp(1, 1000))
-            .await?,
-    ))
 }
 
 /// Just-in-time credentials, for a connection from the user's device.

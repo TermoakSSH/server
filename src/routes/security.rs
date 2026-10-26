@@ -846,7 +846,9 @@ async fn compliance(
     let now = now_ms();
     let mut members = Vec::new();
     for m in st.store.team_compliance(id).await? {
-        let deadline = (!m.totp_enabled)
+        // Signing in through the team's SSO counts when the team says so.
+        let sso = st.store.sso_2fa_teams(m.user_id).await?.contains(&id);
+        let deadline = (!m.totp_enabled && !sso)
             .then(|| policy.twofa_deadline(m.added_at))
             .flatten();
         members.push(json!({
@@ -855,6 +857,7 @@ async fn compliance(
             "name": m.name,
             "role": m.role.as_str(),
             "totp_enabled": m.totp_enabled,
+            "sso_2fa": sso,
             "deadline": deadline,
             "blocked": deadline.is_some_and(|d| d <= now),
             "principal": st.store.team_member_principal(id, m.user_id).await?,
@@ -876,11 +879,14 @@ pub async fn team_2fa(
         return Vec::new();
     }
     let now = now_ms();
+    // Teams whose SSO counts as 2FA (0.7 phase 5a).
+    let sso = st.store.sso_2fa_teams(user.id).await.unwrap_or_default();
     st.store
         .teams_with_policy(user.id)
         .await
         .unwrap_or_default()
         .into_iter()
+        .filter(|(id, ..)| !sso.contains(id))
         .filter_map(|(id, name, p, joined)| {
             p.twofa_deadline(joined)
                 .map(|deadline| termoak_core::access::Team2fa {

@@ -696,6 +696,11 @@ async fn forgot_password(
     if let Some(user) = st.store.user_by_email(&req.email).await?
         && !user.disabled
     {
+        // A team that enforces SSO: no password resets for its accounts
+        // (the owner's break glass excepted).
+        if let Some(e) = crate::sso::sso_required(&st, &user.email, Some(&user)).await {
+            return Err(e);
+        }
         let token = st
             .store
             .create_email_token(

@@ -677,10 +677,18 @@ impl Security {
         } else {
             HashMap::new()
         };
+        // End-to-end encrypted vaults: only for clients that declare `e2ee`,
+        // with this member's wrap (0.7 phase 5a).
+        if !features.e2ee {
+            vaults.retain(|v| v.crypto != termoak_core::model::VaultCrypto::E2ee);
+        }
         for v in &mut vaults {
             v.role = v.role.map(|r| features.role(r));
             v.team_member_role = v.team_member_role.map(|r| features.role(r));
             v.policy = policies.get(&v.id).cloned();
+            if v.crypto == termoak_core::model::VaultCrypto::E2ee {
+                v.e2ee = self.store.vault_e2ee_info(v.id, access.user).await?;
+            }
         }
         Ok(vaults)
     }

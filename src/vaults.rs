@@ -49,7 +49,13 @@ impl FromRequestParts<AppState> for AccessCtx {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let user = AuthUser::from_request_parts(parts, state).await?;
-        let access = state.store.vault_access(user.id()).await?;
+        let mut access = state.store.vault_access(user.id()).await?;
+        // End-to-end encrypted vaults do not exist for clients that cannot
+        // seal their secrets (docs/E2EE-SSO-AUDIT.md §2.9): they would show
+        // them without secrets or push plaintext.
+        if !user.features.e2ee && !access.e2ee.is_empty() {
+            access = Arc::new(access.without_e2ee());
+        }
         Ok(AccessCtx { user, access })
     }
 }

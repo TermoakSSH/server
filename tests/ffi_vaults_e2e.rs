@@ -77,6 +77,7 @@ fn host(label: &str, account: Option<&str>, vault: Option<&str>) -> SshHost {
         vault_id: vault.map(str::to_string),
         access: None,
         secret_hidden: false,
+        e2ee_locked: false,
     }
 }
 

@@ -114,7 +114,27 @@ impl From<CoreError> for ApiError {
                     | codes::ACCESS_REQUEST_NOT_NEEDED
                     | codes::ACCESS_REQUEST_CLOSED
                     | codes::TEAM_2FA_REQUIRED
-                    | codes::POLICY_REQUIRES_2FA => StatusCode::CONFLICT,
+                    | codes::POLICY_REQUIRES_2FA
+                    | codes::E2EE_LOCKED
+                    | codes::E2EE_NOT_SET_UP
+                    | codes::E2EE_KEY_EXISTS
+                    | codes::E2EE_PLAINTEXT_REJECTED
+                    | codes::E2EE_KEY_OUTDATED
+                    | codes::E2EE_VAULT
+                    | codes::E2EE_UNLOCK_REQUIRED
+                    | codes::E2EE_INCOMPLETE
+                    | codes::E2EE_NOT_ENABLED
+                    | codes::E2EE_ALREADY_ENABLED
+                    | codes::E2EE_CLIENT_REQUIRED
+                    | codes::E2EE_PAIRING_CLOSED
+                    | codes::E2EE_STALE
+                    | codes::E2EE_KEY_MISMATCH
+                    | codes::SSO_DOMAIN_TAKEN => StatusCode::CONFLICT,
+                    codes::E2EE_WRAP_INVALID
+                    | codes::E2EE_PASSPHRASE_TOO_SHORT
+                    | codes::E2EE_DECRYPT_FAILED
+                    | codes::E2EE_RECOVERY_KEY_INVALID
+                    | codes::E2EE_PASSPHRASE_INVALID => StatusCode::BAD_REQUEST,
                     codes::CA_NOT_CONFIGURED => StatusCode::NOT_FOUND,
                     codes::ACCESS_DURATION_TOO_LONG | codes::CERTIFICATE_NO_PRINCIPALS => {
                         StatusCode::BAD_REQUEST

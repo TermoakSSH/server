@@ -463,6 +463,7 @@ fn server_end_to_end() {
                 vault_id: None,
                 access: None,
                 secret_hidden: false,
+                e2ee_locked: false,
             },
             SecretChange::Keep,
         )

@@ -392,6 +392,10 @@ pub struct LiveSession {
     /// Serializes input and keeps who typed last (so the recording gets an
     /// author mark only when it changes, right before their input).
     input_author: tokio::sync::Mutex<Option<InputAuthor>>,
+    /// Credentials sent by the owner's device for this session only (a
+    /// host of an end-to-end encrypted vault, 0.7 phase 5a): used for the
+    /// connection and dropped (wiped) right after.
+    unlock: Mutex<Option<termoak_core::resolve::E2eeUnlock>>,
 }
 
 /// Public view of a session.
@@ -1043,6 +1047,7 @@ impl SessionManager {
             prompt_reqs: Mutex::new(HashMap::new()),
             last_activity: AtomicI64::new(now_ms()),
             input_author: tokio::sync::Mutex::new(None),
+            unlock: Mutex::new(None),
         });
         // Control periods are audited as they end.
         let mut rx = live.signals();
@@ -1080,6 +1085,7 @@ impl SessionManager {
     }
 
     /// Opens an SSH session that lives on the server.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_server(
         self: &Arc<Self>,
         owner: Id,
@@ -1088,6 +1094,7 @@ impl SessionManager {
         rows: u16,
         title: Option<String>,
         record: Option<bool>,
+        unlock: Option<termoak_core::resolve::E2eeUnlock>,
     ) -> ApiResult<Arc<LiveSession>> {
         self.check_quota(owner)?;
         let holder = self.holder.get().cloned();
@@ -1114,8 +1121,14 @@ impl SessionManager {
         // `network_not_found`.)
         let resolved = self
             .store
-            .resolve_in(&access, host_id, termoak_core::store::SecretUse::Server)
+            .resolve_in_with(
+                &access,
+                host_id,
+                termoak_core::store::SecretUse::Server,
+                unlock.as_ref(),
+            )
             .await?;
+        let unlocked = unlock.is_some();
         let network = resolved.first_hop_network_id().is_some();
         if network && self.dialer.get().is_none() {
             return Err(crate::netd::not_configured());
@@ -1185,7 +1198,20 @@ impl SessionManager {
             })
             .await?;
         self.store.set_session_vault(live.id, Some(vault)).await?;
+        *live.unlock.lock() = unlock;
         self.sessions.write().insert(live.id, live.clone());
+        if unlocked {
+            self.store
+                .audit_vault(
+                    owner,
+                    &format!("user:{owner}"),
+                    "e2ee.unlock",
+                    Some(format!("host:{host_id}")),
+                    serde_json::json!({"purpose": "session", "session": live.id}),
+                    vault,
+                )
+                .await?;
+        }
         self.store
             .audit_vault(
                 owner,
@@ -1822,9 +1848,16 @@ impl SessionManager {
         if live.vault_id.is_some_and(|v| v != vault) {
             return Err(ApiError::not_found(format!("host {host_id}")));
         }
+        // A per-session unlock is used once, then wiped.
+        let unlock = live.unlock.lock().take();
         let resolved = self
             .store
-            .resolve_in(&access, host_id, termoak_core::store::SecretUse::Server)
+            .resolve_in_with(
+                &access,
+                host_id,
+                termoak_core::store::SecretUse::Server,
+                unlock.as_ref(),
+            )
             .await?;
         Ok((resolved, access, vault))
     }

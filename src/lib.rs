@@ -9,9 +9,12 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod account;
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod devices;
+pub mod e2ee;
+pub mod egress;
 pub mod email;
 pub mod error;
 pub mod holder;
@@ -25,6 +28,7 @@ pub mod routes;
 pub mod security;
 pub mod security_keys;
 pub mod sessions;
+pub mod sso;
 pub mod state;
 pub mod updates;
 pub mod vaults;
@@ -97,6 +101,8 @@ pub async fn start_sessions(state: &AppState) -> anyhow::Result<()> {
     };
     // Teams security: expire access requests, end windows, retire CAs.
     routes::security::spawn_job(state.clone());
+    // Audit sinks and retention (0.7 phase 5a).
+    audit::spawn_jobs(state.clone());
     let closed = state.store.close_orphan_sessions(&keep).await?;
     if closed > 0 {
         tracing::info!(closed, "sessions marked as closed after the restart");
@@ -237,5 +243,6 @@ pub async fn build_state(config: ServerConfig) -> anyhow::Result<AppState> {
         security,
         cert_limiter: limiter::RateLimiter::new(routes::security::CERTS_PER_MINUTE, 60_000),
         request_limiter: limiter::RateLimiter::new(routes::security::REQUESTS_PER_MINUTE, 60_000),
+        sso: sso::new_oidc(),
     })))
 }

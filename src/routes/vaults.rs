@@ -10,9 +10,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use termoak_core::Id;
-use termoak_core::model::{
-    AuditEntry, EntityKind, SyncRecord, Vault, VaultMember, VaultRole, VaultSettings,
-};
+use termoak_core::model::{EntityKind, SyncRecord, Vault, VaultMember, VaultRole, VaultSettings};
 use termoak_core::store::{
     NewVault, SyncRejection, SyncWarning, VaultChange, VaultGrantee, VaultPatch,
 };
@@ -36,7 +34,6 @@ pub fn routes() -> Router<AppState> {
             patch(set_member_role).delete(remove_member),
         )
         .route("/api/v1/vaults/{id}/transfer", post(transfer))
-        .route("/api/v1/vaults/{id}/audit", get(audit))
 }
 
 /// `absent` → `None`, `null` → `Some(None)`, value → `Some(Some(v))`.
@@ -108,12 +105,6 @@ pub struct AddVaultMember {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetVaultMemberRole {
     pub role: VaultRole,
-}
-
-#[derive(Debug, Deserialize)]
-struct AuditQuery {
-    before: Option<i64>,
-    limit: Option<i64>,
 }
 
 async fn list(State(st): State<AppState>, ctx: AccessCtx) -> ApiResult<Json<Vec<Vault>>> {
@@ -494,21 +485,6 @@ async fn transfer(
         }
     }
     Ok(Json(result))
-}
-
-/// Audit of a vault (managers).
-async fn audit(
-    State(st): State<AppState>,
-    ctx: AccessCtx,
-    Path(id): Path<Id>,
-    Query(q): Query<AuditQuery>,
-) -> ApiResult<Json<Vec<AuditEntry>>> {
-    ctx.access.require(id, VaultRole::Manager)?;
-    Ok(Json(
-        st.store
-            .vault_audit(id, q.before, q.limit.unwrap_or(100).clamp(1, 1000))
-            .await?,
-    ))
 }
 
 // --- Sync v2 -----------------------------------------------------------------

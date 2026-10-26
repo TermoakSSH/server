@@ -469,6 +469,46 @@ gets nothing while its app is open (events socket) unless it asks, and at
 most `[push] max_per_minute` (30) a minute. Nothing about notifications is
 audited and endpoints and tokens are never logged.
 
+## Single sign-on and the audit (0.7.0-next.10)
+
+Teams set up OpenID Connect sign-in themselves (Team → Single sign-on:
+Google Workspace, Microsoft Entra, Keycloak, Authentik or any provider with
+discovery); the server needs `public_url` (the redirect URI they register
+at their provider is `<public_url>/api/v1/auth/sso/callback`). A team
+proves its domain with a DNS TXT record (`_termoak-challenge.<domain>`)
+checked through the system resolver or `[sso] dns_servers`; an
+administrator can vouch for an internal domain (`POST
+/api/v1/admin/teams/{id}/domains/{domain}/verify`). The server only calls
+providers on `https://` public addresses; a provider on your own network
+needs its prefix in `[sso] allowed_issuers`:
+
+```toml
+[sso]
+enabled = true
+allowed_issuers = ["http://keycloak.lan:8080/realms/"]
+# dns_servers = ["10.0.0.53:53"]
+```
+
+The audit keeps entries `retention_days` (365; 0 forever; teams may choose
+their own up to `max_team_retention_days`) and delivers them to the teams'
+and administrators' SIEM sinks: webhooks signed with HMAC-SHA256 and syslog
+(RFC 5424 over TLS, or TCP to allowed targets). Sinks on private addresses
+or plain `http://`/TCP need a prefix in `[audit] allowed_targets`
+(`"http://10.0.0.9:8088/"`, `"syslog://10.0.0.5:514"`):
+
+```toml
+[audit]
+retention_days = 365
+max_team_retention_days = 3650
+max_export_rows = 100000
+max_sinks_per_team = 5
+# allowed_targets = ["syslog://10.0.0.5:514"]
+```
+
+End-to-end encrypted vaults need nothing on the server: the keys never
+reach it. Back up as usual; the server cannot recover an E2EE vault whose
+members lost their devices and recovery keys.
+
 ## Environment variables
 
 | Variable | Use |
@@ -504,7 +544,10 @@ losing `master.key` means creating new CAs and running the install script on the
 sqlite3 /var/lib/termoak/termoak.db ".backup '/backup/termoak.db'"
 ```
 
-Without `master.key` the stored secrets cannot be recovered.
+Without `master.key` the stored secrets cannot be recovered. Teams' SSO
+client secrets and the audit webhooks' signing secrets (0.7.0-next.10) are
+sealed with it too; secrets of end-to-end encrypted vaults are not (only
+their members' devices open them).
 
 ## Publishing releases
 

@@ -51,6 +51,8 @@ pub struct Inner {
     pub cert_limiter: crate::limiter::RateLimiter,
     /// Access requests per user.
     pub request_limiter: crate::limiter::RateLimiter,
+    /// Identity providers of teams' SSO (discovery and keys, cached).
+    pub sso: std::sync::Arc<crate::sso::Oidc>,
 }
 
 #[derive(Clone)]

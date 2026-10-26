@@ -82,6 +82,11 @@ pub struct OpenSession {
     /// Record the session (otherwise, whatever the host or the config says).
     #[serde(default)]
     pub record: Option<bool>,
+    /// Credentials of a host of an end-to-end encrypted vault, sent by an
+    /// unlocked device for this session only (0.7 phase 5a): the server
+    /// connects with them and does not keep them.
+    #[serde(default)]
+    pub unlock: Option<termoak_core::resolve::E2eeUnlock>,
 }
 
 fn default_cols() -> u16 {
@@ -161,6 +166,7 @@ async fn open(
             req.rows,
             req.title,
             req.record,
+            req.unlock,
         )
         .await?;
     Ok(Json(live.view(Access::Owner)))

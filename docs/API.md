@@ -42,7 +42,10 @@ ago must keep working with a new server, so `/api/v1` only grows:
   `use_only` everywhere (vaults, members, sync v2, events); without
   `policies` vaults come without `policy`; without `recording` no
   just-in-time credentials or certificates are given for hosts whose
-  sessions must be recorded (`recording_required`).
+  sessions must be recorded (`recording_required`). Cores from
+  0.7.0-next.10 add `e2ee`: without it, end-to-end encrypted vaults do not
+  exist for the client (vault lists, sync v2, entity routes, pushes), and an
+  E2EE personal vault makes the legacy sync answer `e2ee_client_required`.
 
 An incompatible change goes into a new API (`/api/v2`) that lives alongside
 the old one while clients still use it. One deliberate exception: since
@@ -242,6 +245,28 @@ Sync, AI, push notifications and updates:
 | `policy_requires_2fa` | 409 | Turn on two-step verification for yourself before requiring it from the team |
 | `networks_forbidden_by_policy` | 403 | The team does not allow private networks in this vault |
 | `recording_required` | 403 | Sessions on this host must be recorded and this client does not record: update the app or open a server session |
+| `e2ee_locked` | 409 | The secret is end-to-end encrypted: the server cannot reveal it (devices: unlock E2EE) |
+| `e2ee_unlock_required` | 409 | A server session or test needs credentials of an E2EE vault: send them in `unlock` |
+| `e2ee_vault` | 409 | The server cannot do this for an E2EE vault (just-in-time credentials, moving or copying items with secrets) |
+| `e2ee_plaintext_rejected` | 409 | A plaintext secret for an E2EE vault: send `sealed` |
+| `e2ee_key_outdated` | 409 | The secret is sealed with another key version. Extra field: `key_version` |
+| `e2ee_not_enabled` / `e2ee_already_enabled` | 409 | The vault is not / already end-to-end encrypted |
+| `e2ee_incomplete` | 409 | Turning on or rotating must cover every item with a secret (`missing_items`, `unexpected`) and the members who keep the key (`missing_wraps`) |
+| `e2ee_stale` | 409 | The vault key changed meanwhile. Extra field: `key_version` or `next_version` |
+| `e2ee_wrap_invalid` | 400 | A wrap for someone who may not hold the key, or for an old E2EE key of theirs |
+| `e2ee_not_set_up` / `e2ee_key_exists` | 409 | You have no E2EE key yet / you already have one |
+| `e2ee_key_mismatch` | 409 | A key that does not match the published one |
+| `e2ee_client_required` | 409 | This client does not declare `e2ee` |
+| `e2ee_pairing_closed` | 409 | The pairing was decided, expired, or too many are waiting |
+| `sso_required` | 403 | The email's team signs in through single sign-on. Extra fields: `team_id`, `team_name` |
+| `sso_not_configured` | 404/503 | No SSO for this team or email (503: the server has no `public_url`) |
+| `sso_issuer_invalid` | 400 | The provider's discovery cannot be read, its issuer differs, or it is on a private address not allowed by `[sso] allowed_issuers` |
+| `sso_redirect_invalid` / `sso_pkce_invalid` | 400 | The app's callback is not a loopback URL, `termoak://sso` or this server's `/app/sso`; the PKCE challenge or verifier is malformed |
+| `sso_code_invalid` | 400 | The one-time code expired, was used, or the verifier does not match |
+| `sso_domain_taken` / `sso_domain_unverified` | 409 | Another team claimed the domain / enforcing SSO needs a verified domain |
+| `sso_only_account` | 409 | The account has no password of its own: it cannot unlink its SSO identity |
+| `audit_sink_invalid` | 400 | A sink's target, name, actions or CA is not acceptable (private targets need `[audit] allowed_targets`) |
+| `invalid_format` / `invalid_retention` | 400 | Export format other than csv/json/ndjson; retention outside 1..`max` days |
 | `ai_not_configured` | 503 | The AI provider is not configured |
 | `ai_key_required` | 403 | The plan does not include the server's AI and you have no API key of your own that can be used: add one in Settings → AI (`PUT /me/ai/keys/{provider}`) |
 | `ai_budget_exceeded` | 403 | This month's AI credit for the server's providers is spent (your own API keys keep working) |
@@ -501,6 +526,29 @@ collapse key); APNs alerts `apns-collapse-id`, `aps.category`
 goes to APNs as a background push. At most `[push] max_per_minute` (30)
 notifications per device and minute.
 
+### Single sign-on (0.7.0-next.10)
+
+Design: [E2EE-SSO-AUDIT.md](E2EE-SSO-AUDIT.md) §3. `/info features.sso`
+(needs `public_url`).
+
+| Method | Route | Who | Body / result |
+|---|---|---|---|
+| GET | `/auth/sso/discover?email=` | public | `{sso, enforced, team_id, team_name}` |
+| POST | `/auth/sso/start` | public | `{email \| team_id, redirect_uri, state?, code_challenge, code_challenge_method: "S256", device_name?, platform?}` → `{authorize_url, expires_at}` |
+| GET | `/auth/sso/callback` | the identity provider | Redirects the browser to `redirect_uri?code=<one-time>&state=…` (or `error=<code>&error_description=…`) |
+| POST | `/auth/sso/exchange` | public | `{code, code_verifier, totp_code?}` → the sign-in answer (`totp_required` first when the account has 2FA and the team does not count SSO as 2FA) |
+| GET | `/me/sso` | you | Linked identities |
+| POST | `/me/sso/link` | you | Same body as start with `team_id`: links the identity the flow signs in |
+| DELETE | `/me/sso/{team_id}` | you | Unlinks (`sso_only_account` for accounts without a password) |
+| GET, PUT, DELETE | `/teams/{id}/sso` | members read, owners/admins | `{config: SsoConfig, client_secret?}` → `{config, redirect_uri, domains}` |
+| GET, POST | `/teams/{id}/domains` | owners/admins | `{domain}` → `TeamDomain` with `record_name`/`record_value` (TXT) |
+| POST | `/teams/{id}/domains/{domain}/verify` | owners/admins | Checks the TXT record now |
+| DELETE | `/teams/{id}/domains/{domain}` | owners/admins | |
+
+With `enforce`, password sign-in, sign-up and password reset of the team's
+verified domains answer `sso_required` (the team owner keeps a password
+when `owner_password_allowed`; server administrators always).
+
 ### Two-step verification
 
 If the account has 2FA and the login has no `totp_code`, the answer is `401`
@@ -527,7 +575,8 @@ Server administrators only.
 | DELETE | `/admin/users/{id}/devices/{device_id}` | Signs out one of the user's devices |
 | GET, POST | `/admin/invites` | Lists or creates invitations `{email?, team_id?, team_role?, is_admin, expires_in_hours?, send_email?}` → `{invite, token, server, url, web_url, emailed}` |
 | DELETE | `/admin/invites/{id}` | Revokes an unused invitation |
-| GET | `/admin/audit?limit=&before=` | Audit log of the whole server, newest first |
+| GET | `/admin/audit` | Audit log of the whole server (filters: [Audit](#audit)) |
+| POST | `/admin/teams/{id}/domains/{domain}/verify` | Vouches for a team's domain without DNS (internal domains) |
 
 An invitation lets someone sign up even when registration is closed. It can
 be bound to an email, make the account an administrator and add it to a
@@ -624,7 +673,7 @@ item is in exactly one vault (`vault_id`).
 | PATCH | `/vaults/{id}/members/{member_id}` | manager | `{role}` |
 | DELETE | `/vaults/{id}/members/{member_id}` | manager | Revokes the grant |
 | POST | `/vaults/{id}/transfer` | see below | Moves or copies items into this vault |
-| GET | `/vaults/{id}/audit` | manager | `?before=&limit=`: the vault's audit (`vault.*`, `secret.reveal`, `secret.use`, sessions...) |
+| GET | `/vaults/{id}/audit` | manager | The vault's audit (`vault.*`, `secret.reveal`, `secret.use`, sessions, `e2ee.*`...); filters in [Audit](#audit) |
 
 `Vault`: `{id, kind: personal|shared|team, name, description, color, icon,
 owner_user_id, owner_team_id, team_member_role, crypto: server, key_version,
@@ -782,7 +831,7 @@ Other entity routes:
 | POST | `/exec` | `{host_ids, command \| snippet_id + variables, timeout_secs?}`. Runs in parallel; any role, each host checked on its own. A snippet is rendered per host (its built-ins come from each host; `variables` are keyed by label and a value given for a built-in wins); a prompt or secret without a value is a `400` before anything runs. The audit (`exec.batch`) keeps the snippet's script, never the values |
 | POST | `/sync` | Legacy sync (below) |
 | POST | `/vaults/sync` | Sync v2 (below) |
-| GET | `/audit` | `?before=&limit=` |
+| GET | `/audit` | Your account's log; filters in [Audit](#audit) |
 
 ### Just-in-time credentials
 
@@ -851,6 +900,45 @@ username and password, never a key.
   `rejected` with `plan_limit`.
 - Sync on the `vault/changed` and `vault/access` events, after local saves,
   periodically and after a `vault_read_only` from REST.
+- End-to-end encrypted vaults (clients with `e2ee`): records carry
+  `sealed: {key_version, blob_b64}` instead of `secret` both ways;
+  plaintext is rejected (`e2ee_plaintext_rejected`), so is another key
+  version (`e2ee_key_outdated`); keep such records dirty and push them again
+  sealed. `e2ee_locked: true` marks secrets the reader has not opened.
+
+### End-to-end encrypted vaults (0.7.0-next.10)
+
+Design, formats and rules: [E2EE-SSO-AUDIT.md](E2EE-SSO-AUDIT.md) §2.
+`/info features.e2ee`; only clients with `e2ee` in `X-Termoak-Features` see
+such vaults. Vaults carry `crypto: "e2ee"` and `e2ee: {key_version,
+may_hold_key, wrap?, key_id?, rekey_needed, pending: [E2eeRecipient],
+without_key}`.
+
+| Method | Route | Who | Body / result |
+|---|---|---|---|
+| GET | `/me/e2ee` | you | `{key: UserKeyInfo?, seals: [KeySeal], pairings: [E2eePairing]}` |
+| PUT | `/me/e2ee` | you | `{key_id, public_key, seals}` (a `recovery` seal required) → `UserKeyInfo`. Once (`e2ee_key_exists`) |
+| DELETE | `/me/e2ee` | you | `?confirm=reset` forgets your key, seals, pairings and wraps → `{reset, orphaned_vaults}`; without it only lists the vaults nobody else could open |
+| PUT | `/me/e2ee/seals` | you | `{key_id, seal}`: a new passphrase or recovery key |
+| DELETE | `/me/e2ee/passphrase` | you | Removes the passphrase seal |
+| POST | `/me/e2ee/rotate` | you | `{old_key_id, key_id, public_key, seals, wraps: [{vault_id, version, wrapped}]}` (every vault key the old key holds) |
+| GET, POST | `/me/e2ee/pairings` | your devices | Pending pairings / a new device asks `{public_key, device_name?}` |
+| GET | `/me/e2ee/pairings/{id}` | your devices | The pairing; the device that asked gets `sealed` once after approval |
+| POST | `/me/e2ee/pairings/{id}/decide` | your other devices | `{approve, sealed?}` |
+| GET | `/vaults/{id}/e2ee` | key holders | `{crypto, key_version, next_version, recipients, without_key, items, rekey_needed}` |
+| POST | `/vaults/{id}/e2ee/enable` | managers | `{version: next_version, wraps: [{user_id, key_id, wrapped}], items: [{id, kind, blob_b64}]}` |
+| POST | `/vaults/{id}/e2ee/rotate` | key holders | `{from_version, wraps, items}` |
+| POST | `/vaults/{id}/e2ee/disable` | managers | `{items: [{id, kind, secret}]}` (plaintext over TLS) |
+| POST | `/vaults/{id}/e2ee/wraps` | key holders | `{version, wraps}`: gives the key to pending members |
+
+Entity routes accept `sealed` instead of `secret` on create/update for E2EE
+vaults. `GET /{col}/{id}/secret` answers `e2ee_locked`; `POST
+/hosts/{id}/credentials` answers `e2ee_vault` unless the hops need no
+secret (team certificates). `POST /sessions` and `POST /hosts/{id}/test`
+take `unlock: {hops: [{host_id, password?, key?: {private_key,
+passphrase?}, proxy_password?}]}` with the credentials of the host and its
+jumps for that connection only (audited `e2ee.unlock`); without it a hop
+that needs a locked secret fails with `e2ee_unlock_required`.
 
 ### Legacy sync
 
@@ -951,7 +1039,7 @@ All routes live under `/hosts/{id}/sftp/`:
 | Method | Route | Description |
 |---|---|---|
 | GET | `/sessions` | `{active, shared, recent}` |
-| POST | `/sessions` | `{host_id, cols, rows, title?, record?}`. Opens a session that lives on the server (SSH hosts only: `422 telnet_not_supported` for a Telnet host) |
+| POST | `/sessions` | `{host_id, cols, rows, title?, record?, unlock?}`. Opens a session that lives on the server (SSH hosts only: `422 telnet_not_supported` for a Telnet host). `unlock` (0.7.0-next.10): the credentials of a host of an end-to-end encrypted vault for this session only, see [End-to-end encrypted vaults](#end-to-end-encrypted-vaults-070-next10) |
 | GET | `/sessions/{id}` | State, size, `participants` and `driver` (see below) |
 | PATCH | `/sessions/{id}` | `{title}` |
 | DELETE | `/sessions/{id}` | Closes the session |
@@ -1240,6 +1328,33 @@ and pre-releases.
 (the macOS `.app` used to update), `app-archive` (standalone desktop
 binary), `manifest`, `server`, `cli` or `other`. In old `vX.Y.Z` releases,
 the same `termoak-vX.Y.Z-…` archive carries both the server and the CLI.
+
+## Audit
+
+`GET /audit` (your account), `/vaults/{id}/audit` (managers),
+`/teams/{id}/audit` (team owners and admins) and `/admin/audit`
+(administrators) take `action` (comma list; `access.*` matches a prefix),
+`actor` (`user:<id>` or a user id), `vault_id`, `target`, `since`/`until`
+(ms), `q` (text anywhere), `before` (newest first, the default) or `after`
+(oldest first) and `limit` (default 100, max 1000), and answer an array of
+`AuditEntry` (`team_id` since 0.7.0-next.10). `…/audit/export?format=csv|
+json|ndjson&<filters>` downloads the matches (at most `[audit]
+max_export_rows`; audited `audit.export`).
+
+| Method | Route | Who | Body / result |
+|---|---|---|---|
+| GET, PUT | `/teams/{id}/audit/settings` | owners/admins | `{retention_days?}` (1 to the server's max; `null`: the default) |
+| GET, POST | `/teams/{id}/audit/sinks` | owners/admins | `{kind: "webhook" \| "syslog", name, config: {url} \| {host, port?, transport?: "tls" \| "tcp", ca_pem?, facility?, app_name?}, actions?}` → `{sink, secret?}` (a webhook's `whsec_…` secret, shown once) |
+| PATCH, DELETE | `/teams/{id}/audit/sinks/{sink}` | owners/admins | `{name?, config?, actions?, enabled?}` |
+| POST | `/teams/{id}/audit/sinks/{sink}/test` | owners/admins | Sends an `audit.test` event now → `{ok, error?}` |
+| … | `/admin/audit/sinks…` | administrators | The same for server-wide sinks |
+
+Webhooks: `POST` of `{sink_id, server, events: [...]}` with
+`X-Termoak-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, "<t>.<body>")>`,
+`X-Termoak-Timestamp` and `X-Termoak-Event-Id`. Syslog: RFC 5424 with
+octet counting (RFC 6587), structured data `[termoak@32473 id actor team
+vault target]` and the event as JSON. Events: `{id, time, created_at,
+action, actor, owner_id, team_id, vault_id, target, detail, server}`.
 
 ## Events
 

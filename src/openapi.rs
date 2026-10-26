@@ -41,6 +41,11 @@ use crate::routes::vaults::{
     UpdateVault, VaultCursor,
 };
 
+/// Filters of the audit searches (0.7 phase 5a).
+const AUDIT_QUERY: &[&str] = &[
+    "action", "actor", "vault_id", "target", "since", "until", "q", "before", "after", "limit",
+];
+
 /// Shape of a request or response body.
 #[derive(Clone, Copy)]
 enum Body {
@@ -333,7 +338,7 @@ fn endpoints() -> Vec<Ep> {
             Object,
         ),
         Ep {
-            query: &["before", "limit"],
+            query: AUDIT_QUERY,
             ..ep(
                 Get,
                 "/api/v1/admin/audit",
@@ -836,7 +841,7 @@ fn endpoints() -> Vec<Ep> {
             Ref("TransferResult"),
         ),
         Ep {
-            query: &["before", "limit"],
+            query: AUDIT_QUERY,
             ..ep(
                 Get,
                 "/api/v1/vaults/{id}/audit",
@@ -847,7 +852,7 @@ fn endpoints() -> Vec<Ep> {
             )
         },
         Ep {
-            query: &["before", "limit"],
+            query: AUDIT_QUERY,
             ..ep(
                 Get,
                 "/api/v1/audit",
@@ -1282,6 +1287,7 @@ fn endpoints() -> Vec<Ep> {
         },
     ];
     v.extend(security_endpoints());
+    v.extend(phase5a_endpoints());
     for (name, schema) in [
         ("hosts", "Host"),
         ("groups", "Group"),
@@ -1387,6 +1393,370 @@ fn schema_for(body: Body) -> Option<RefOr<Schema>> {
                 .into(),
         ),
     }
+}
+
+/// End-to-end encrypted vaults, SSO and the extended audit (0.7 phase 5a,
+/// docs/E2EE-SSO-AUDIT.md §6).
+fn phase5a_endpoints() -> Vec<Ep> {
+    use Body::*;
+    use HttpMethod::*;
+    let mut v = vec![
+        ep(
+            Get,
+            "/api/v1/me/e2ee",
+            "e2ee",
+            "Your E2EE key, its sealed copies and pending pairings",
+            None,
+            Ref("E2eeStatus"),
+        ),
+        ep(
+            Put,
+            "/api/v1/me/e2ee",
+            "e2ee",
+            "Publish your E2EE key with its sealed copies (once)",
+            Ref("SetupE2ee"),
+            Ref("UserKeyInfo"),
+        ),
+        Ep {
+            query: &["confirm"],
+            ..ep(
+                Delete,
+                "/api/v1/me/e2ee",
+                "e2ee",
+                "Forget your E2EE key (?confirm=reset; without it, the vaults nobody else could open)",
+                None,
+                Object,
+            )
+        },
+        ep(
+            Put,
+            "/api/v1/me/e2ee/seals",
+            "e2ee",
+            "Add or replace a sealed copy (new passphrase or recovery key)",
+            Ref("SetSeal"),
+            Object,
+        ),
+        ep(
+            Delete,
+            "/api/v1/me/e2ee/passphrase",
+            "e2ee",
+            "Remove the passphrase seal",
+            None,
+            Object,
+        ),
+        ep(
+            Post,
+            "/api/v1/me/e2ee/rotate",
+            "e2ee",
+            "Replace your E2EE key, wrapping again every vault key it holds",
+            Ref("RotateUserKey"),
+            Ref("UserKeyInfo"),
+        ),
+        ep(
+            Get,
+            "/api/v1/me/e2ee/pairings",
+            "e2ee",
+            "Your devices waiting for the key",
+            None,
+            List("E2eePairing"),
+        ),
+        ep(
+            Post,
+            "/api/v1/me/e2ee/pairings",
+            "e2ee",
+            "New device: ask your other devices for the key",
+            Ref("CreatePairing"),
+            Ref("E2eePairing"),
+        ),
+        ep(
+            Get,
+            "/api/v1/me/e2ee/pairings/{id}",
+            "e2ee",
+            "A pairing (the asking device gets the sealed key once)",
+            None,
+            Ref("E2eePairing"),
+        ),
+        ep(
+            Post,
+            "/api/v1/me/e2ee/pairings/{id}/decide",
+            "e2ee",
+            "Approve (with the sealed key) or deny a pairing",
+            Ref("DecidePairing"),
+            Ref("E2eePairing"),
+        ),
+        ep(
+            Get,
+            "/api/v1/vaults/{id}/e2ee",
+            "e2ee",
+            "What a conversion or rotation must cover (key holders)",
+            None,
+            Ref("E2eeVaultState"),
+        ),
+        ep(
+            Post,
+            "/api/v1/vaults/{id}/e2ee/enable",
+            "e2ee",
+            "Turn end-to-end encryption on (managers)",
+            Ref("EnableE2ee"),
+            Object,
+        ),
+        ep(
+            Post,
+            "/api/v1/vaults/{id}/e2ee/rotate",
+            "e2ee",
+            "Rotate the vault key (key holders)",
+            Ref("RotateE2ee"),
+            Object,
+        ),
+        ep(
+            Post,
+            "/api/v1/vaults/{id}/e2ee/disable",
+            "e2ee",
+            "Turn end-to-end encryption off (managers)",
+            Ref("DisableE2ee"),
+            Object,
+        ),
+        ep(
+            Post,
+            "/api/v1/vaults/{id}/e2ee/wraps",
+            "e2ee",
+            "Give the vault key to waiting members",
+            Ref("AddWraps"),
+            Object,
+        ),
+        Ep {
+            query: &["email"],
+            auth: false,
+            ..ep(
+                Get,
+                "/api/v1/auth/sso/discover",
+                "sso",
+                "Whether an email signs in through its team's SSO",
+                None,
+                Ref("SsoDiscovery"),
+            )
+        },
+        Ep {
+            auth: false,
+            ..ep(
+                Post,
+                "/api/v1/auth/sso/start",
+                "sso",
+                "Start a single sign-on (PKCE)",
+                Ref("SsoStart"),
+                Ref("SsoStarted"),
+            )
+        },
+        Ep {
+            query: &["code", "state", "error", "error_description"],
+            auth: false,
+            ..ep(
+                Get,
+                "/api/v1/auth/sso/callback",
+                "sso",
+                "The identity provider's redirect (browser)",
+                None,
+                None,
+            )
+        },
+        Ep {
+            auth: false,
+            ..ep(
+                Post,
+                "/api/v1/auth/sso/exchange",
+                "sso",
+                "Exchange the one-time code and PKCE verifier for tokens",
+                Ref("SsoExchange"),
+                Ref("AuthResponse"),
+            )
+        },
+        ep(
+            Get,
+            "/api/v1/me/sso",
+            "sso",
+            "Identities linked to your account",
+            None,
+            Object,
+        ),
+        ep(
+            Post,
+            "/api/v1/me/sso/link",
+            "sso",
+            "Link your account to its identity at a team's provider",
+            Ref("SsoStart"),
+            Ref("SsoStarted"),
+        ),
+        ep(
+            Delete,
+            "/api/v1/me/sso/{team_id}",
+            "sso",
+            "Unlink a team's identity",
+            None,
+            Object,
+        ),
+        ep(
+            Get,
+            "/api/v1/teams/{id}/sso",
+            "sso",
+            "A team's SSO settings and domains",
+            None,
+            Ref("TeamSso"),
+        ),
+        ep(
+            Put,
+            "/api/v1/teams/{id}/sso",
+            "sso",
+            "Save a team's SSO settings (owners/admins)",
+            Ref("SetTeamSso"),
+            Ref("TeamSso"),
+        ),
+        ep(
+            Delete,
+            "/api/v1/teams/{id}/sso",
+            "sso",
+            "Remove a team's SSO",
+            None,
+            Object,
+        ),
+        ep(
+            Get,
+            "/api/v1/teams/{id}/domains",
+            "sso",
+            "A team's domains",
+            None,
+            List("TeamDomain"),
+        ),
+        ep(
+            Post,
+            "/api/v1/teams/{id}/domains",
+            "sso",
+            "Claim a domain (DNS TXT proof)",
+            Ref("AddDomain"),
+            Ref("TeamDomain"),
+        ),
+        ep(
+            Post,
+            "/api/v1/teams/{id}/domains/{domain}/verify",
+            "sso",
+            "Check a domain's TXT record",
+            None,
+            Ref("TeamDomain"),
+        ),
+        ep(
+            Delete,
+            "/api/v1/teams/{id}/domains/{domain}",
+            "sso",
+            "Remove a domain",
+            None,
+            Object,
+        ),
+        ep(
+            Post,
+            "/api/v1/admin/teams/{id}/domains/{domain}/verify",
+            "admin",
+            "Vouch for a team's domain (administrators)",
+            None,
+            Ref("TeamDomain"),
+        ),
+        Ep {
+            query: AUDIT_QUERY,
+            ..ep(
+                Get,
+                "/api/v1/teams/{id}/audit",
+                "audit",
+                "A team's audit (owners/admins)",
+                None,
+                List("AuditEntry"),
+            )
+        },
+        ep(
+            Get,
+            "/api/v1/teams/{id}/audit/settings",
+            "audit",
+            "A team's audit retention",
+            None,
+            Ref("AuditSettingsView"),
+        ),
+        ep(
+            Put,
+            "/api/v1/teams/{id}/audit/settings",
+            "audit",
+            "Set a team's audit retention",
+            Ref("AuditSettings"),
+            Ref("AuditSettingsView"),
+        ),
+    ];
+    for base in [
+        "/api/v1/audit",
+        "/api/v1/vaults/{id}/audit",
+        "/api/v1/teams/{id}/audit",
+        "/api/v1/admin/audit",
+    ] {
+        let path: &'static str = Box::leak(format!("{base}/export").into_boxed_str());
+        let mut q = vec!["format"];
+        q.extend_from_slice(AUDIT_QUERY);
+        v.push(Ep {
+            query: Box::leak(q.into_boxed_slice()),
+            ..ep(
+                Get,
+                path,
+                "audit",
+                "Export the matching entries (csv, json or ndjson)",
+                None,
+                Binary,
+            )
+        });
+    }
+    for (base, who) in [
+        ("/api/v1/teams/{id}/audit/sinks", "a team's"),
+        ("/api/v1/admin/audit/sinks", "the server's"),
+    ] {
+        let at = |suffix: &str| -> &'static str {
+            Box::leak(format!("{base}{suffix}").into_boxed_str())
+        };
+        let text = |t: String| -> &'static str { Box::leak(t.into_boxed_str()) };
+        v.push(ep(
+            Get,
+            at(""),
+            "audit",
+            text(format!("SIEM sinks of {who} audit")),
+            None,
+            List("AuditSink"),
+        ));
+        v.push(ep(
+            Post,
+            at(""),
+            "audit",
+            text(format!("Create a sink for {who} audit (webhook or syslog)")),
+            Ref("CreateSink"),
+            Ref("CreatedSink"),
+        ));
+        v.push(ep(
+            Patch,
+            at("/{sink}"),
+            "audit",
+            "Change a sink",
+            Ref("UpdateSink"),
+            Ref("AuditSink"),
+        ));
+        v.push(ep(
+            Delete,
+            at("/{sink}"),
+            "audit",
+            "Delete a sink",
+            None,
+            Object,
+        ));
+        v.push(ep(
+            Post,
+            at("/{sink}/test"),
+            "audit",
+            "Send a test event to a sink",
+            None,
+            Object,
+        ));
+    }
+    v
 }
 
 /// Builds the OpenAPI document.
@@ -1942,6 +2312,55 @@ pub fn document() -> OpenApi {
         .schema_from::<crate::routes::security::CreateAccessRequest>()
         .schema_from::<crate::routes::security::DecideRequest>()
         .schema_from::<crate::routes::security::CertificateRequest>()
+        // 0.7 phase 5a: E2EE, SSO, extended audit.
+        .schema_from::<termoak_core::resolve::E2eeUnlock>()
+        .schema_from::<termoak_core::resolve::UnlockHop>()
+        .schema_from::<termoak_core::resolve::UnlockKey>()
+        .schema_from::<crate::routes::entities::TestHostBody>()
+        .schema_from::<SealedSecret>()
+        .schema_from::<VaultE2ee>()
+        .schema_from::<E2eeRecipient>()
+        .schema_from::<UserKeyInfo>()
+        .schema_from::<E2eePairing>()
+        .schema_from::<E2eeVaultState>()
+        .schema_from::<E2eeMember>()
+        .schema_from::<E2eeItem>()
+        .schema_from::<E2eeWrap>()
+        .schema_from::<E2eeSealedItem>()
+        .schema_from::<E2eePlainItem>()
+        .schema_from::<VaultCrypto>()
+        .schema_from::<termoak_core::e2ee::KeySeal>()
+        .schema_from::<termoak_core::e2ee::SealKind>()
+        .schema_from::<termoak_core::e2ee::KdfParams>()
+        .schema_from::<crate::e2ee::E2eeStatus>()
+        .schema_from::<crate::e2ee::SetupE2ee>()
+        .schema_from::<crate::e2ee::SetSeal>()
+        .schema_from::<crate::e2ee::RotateUserKey>()
+        .schema_from::<crate::e2ee::VaultWrapIn>()
+        .schema_from::<crate::e2ee::CreatePairing>()
+        .schema_from::<crate::e2ee::DecidePairing>()
+        .schema_from::<crate::e2ee::EnableE2ee>()
+        .schema_from::<crate::e2ee::RotateE2ee>()
+        .schema_from::<crate::e2ee::DisableE2ee>()
+        .schema_from::<crate::e2ee::AddWraps>()
+        .schema_from::<termoak_core::sso::SsoConfig>()
+        .schema_from::<termoak_core::sso::SsoPreset>()
+        .schema_from::<termoak_core::sso::TeamDomain>()
+        .schema_from::<crate::sso::SsoDiscovery>()
+        .schema_from::<crate::sso::SsoStart>()
+        .schema_from::<crate::sso::SsoStarted>()
+        .schema_from::<crate::sso::SsoExchange>()
+        .schema_from::<crate::sso::TeamSso>()
+        .schema_from::<crate::sso::SetTeamSso>()
+        .schema_from::<crate::sso::AddDomain>()
+        .schema_from::<termoak_core::store::audit::AuditSettings>()
+        .schema_from::<termoak_core::store::audit::AuditSink>()
+        .schema_from::<termoak_core::store::audit::AuditSinkKind>()
+        .schema_from::<termoak_core::store::audit::AuditSinkConfig>()
+        .schema_from::<crate::audit::AuditSettingsView>()
+        .schema_from::<crate::audit::CreateSink>()
+        .schema_from::<crate::audit::CreatedSink>()
+        .schema_from::<crate::audit::UpdateSink>()
         .build();
 
     let tags = [
@@ -1968,7 +2387,18 @@ pub fn document() -> OpenApi {
         ("sftp", "Files over SFTP through the server"),
         ("ai", "AI engine: tasks, approvals, assistant, MCP"),
         ("events", "Real-time events"),
-        ("audit", "Action log"),
+        (
+            "audit",
+            "Action log: filters, exports, retention and SIEM sinks",
+        ),
+        (
+            "e2ee",
+            "End-to-end encrypted vaults: user keys, pairing of devices, vault keys",
+        ),
+        (
+            "sso",
+            "Single sign-on for teams (OpenID Connect) and verified domains",
+        ),
         ("admin", "User administration"),
         (
             "teams",
@@ -2067,5 +2497,12 @@ mod tests {
         // Security keys and snippets with variables (0.7 phase 3a).
         assert!(schemas["SshKey"]["properties"]["security_key"].is_object());
         assert!(schemas["SecurityKeyInfo"]["properties"]["application"].is_object());
+        // E2EE, SSO, audit (0.7 phase 5a).
+        assert!(json["paths"]["/api/v1/vaults/{id}/e2ee/enable"]["post"].is_object());
+        assert!(json["paths"]["/api/v1/auth/sso/exchange"]["post"].is_object());
+        assert!(json["paths"]["/api/v1/teams/{id}/audit/sinks/{sink}/test"]["post"].is_object());
+        assert!(schemas["SyncRecord"]["properties"]["sealed"].is_object());
+        assert!(schemas["Vault"]["properties"]["e2ee"].is_object());
+        assert!(schemas["OpenSession"]["properties"]["unlock"].is_object());
     }
 }

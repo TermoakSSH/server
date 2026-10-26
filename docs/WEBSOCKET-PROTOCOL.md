@@ -259,7 +259,8 @@ below). On connect:
 `?features=` (comma list) declares what this client can do; `hello` echoes
 the ones the server knows. Today: `security_keys` (see
 [Security keys](#security-keys)), `roles_v2` and `policies` (0.7.0-next.8:
-without `roles_v2`, `vault/access` shows `connect_only` as `use_only`).
+without `roles_v2`, `vault/access` shows `connect_only` as `use_only`) and
+`e2ee` (0.7.0-next.10: end-to-end encrypted vaults, see below).
 
 and then three kinds of messages (plus `signed_out`, below):
 
@@ -317,6 +318,19 @@ Teams security (0.7.0-next.8, [TEAMS-SECURITY.md](TEAMS-SECURITY.md)) adds:
 access may have changed). When a window ends or is revoked, the requester's
 server sessions on hosts no longer allowed close with `session_closed` and
 `reason: "access_expired"` or `"access_revoked"`.
+
+End-to-end encrypted vaults (0.7.0-next.10, [E2EE-SSO-AUDIT.md](E2EE-SSO-AUDIT.md)) add:
+
+```json
+{"type":"e2ee","event":"pairing","pairing":{"id":"…","device_name":"Phone","status":"pending","expires_at":1792976000000}}
+```
+
+sent to every events socket of the user when one of their devices asks for
+the E2EE key (`status: "pending"`: show the approval with the six-digit
+code) and when it is approved or denied (the asking device then fetches
+`GET /me/e2ee/pairings/{id}`). Adding wraps for members sends them
+`vault/changed`. Clients without `e2ee` may get `vault` events about E2EE
+vaults they cannot see: they sync and nothing changes.
 
 When the device is signed out (from another device, a password reset or an
 administrator), the server sends `{"type":"signed_out","message":"…"}` and

@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 pub mod netd;
+pub mod oidc;
 pub mod srv;
 
 pub struct Sshd {

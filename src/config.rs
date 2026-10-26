@@ -526,6 +526,64 @@ pub struct FcmSection {
     pub endpoint: Option<String>,
 }
 
+/// Single sign-on for teams (0.7 phase 5a, docs/E2EE-SSO-AUDIT.md §3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SsoSection {
+    /// Teams can set up OpenID Connect sign-in.
+    pub enabled: bool,
+    /// Issuers on private addresses or plain `http://` are refused unless
+    /// they start with one of these prefixes (a Keycloak on the same
+    /// network: `"http://127.0.0.1:8080/"`).
+    pub allowed_issuers: Vec<String>,
+    /// DNS servers (`ip:port`) for the domain checks; empty: the system's.
+    pub dns_servers: Vec<String>,
+    /// Timeout of the calls to identity providers and DNS.
+    pub timeout_secs: u64,
+}
+
+impl Default for SsoSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_issuers: Vec::new(),
+            dns_servers: Vec::new(),
+            timeout_secs: 10,
+        }
+    }
+}
+
+/// Extended audit (0.7 phase 5a, docs/E2EE-SSO-AUDIT.md §4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuditSection {
+    /// Days entries are kept (0: forever). Teams may choose fewer or more
+    /// days, up to `max_team_retention_days`.
+    pub retention_days: u32,
+    /// Most days a team may keep its entries.
+    pub max_team_retention_days: u32,
+    /// Most entries one export returns.
+    pub max_export_rows: u32,
+    /// Sinks per team at most.
+    pub max_sinks_per_team: u32,
+    /// Webhooks and syslog sinks on private addresses or plain `http://`
+    /// are refused unless they start with one of these prefixes
+    /// (`"http://127.0.0.1:9000/"`, `"syslog://10.0.0.5:514"`).
+    pub allowed_targets: Vec<String>,
+}
+
+impl Default for AuditSection {
+    fn default() -> Self {
+        Self {
+            retention_days: 365,
+            max_team_retention_days: 3650,
+            max_export_rows: 100_000,
+            max_sinks_per_team: 5,
+            allowed_targets: Vec::new(),
+        }
+    }
+}
+
 /// Full configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -539,6 +597,8 @@ pub struct ServerConfig {
     pub web: WebSection,
     pub push: PushSection,
     pub networks: NetworksSection,
+    pub sso: SsoSection,
+    pub audit: AuditSection,
 }
 
 impl ServerConfig {
@@ -781,6 +841,27 @@ enabled = true
 # environment = "auto"    # auto (per device), production or sandbox
 # [push.fcm]
 # service_account_path = "/etc/termoak/firebase.json"   # or TERMOAK_FCM_CREDENTIALS
+
+# Single sign-on for teams (OpenID Connect: Google Workspace, Microsoft
+# Entra, Keycloak, Authentik or any provider with discovery). Team admins
+# set it up; the redirect URI to register at the provider is
+# <public_url>/api/v1/auth/sso/callback (public_url is needed).
+[sso]
+enabled = true
+# Identity providers on private addresses or plain http, allowed by prefix:
+# allowed_issuers = ["http://127.0.0.1:8080/realms/"]
+# DNS servers for the domain checks (TXT _termoak-challenge.<domain>):
+# dns_servers = ["1.1.1.1:53"]
+
+# Audit log: retention, exports and SIEM sinks (webhooks signed with
+# HMAC-SHA256, syslog RFC 5424 over TCP or TLS).
+[audit]
+retention_days = 365            # 0 keeps everything
+max_team_retention_days = 3650
+max_export_rows = 100000
+max_sinks_per_team = 5
+# Sinks on private addresses or plain http, allowed by prefix:
+# allowed_targets = ["http://127.0.0.1:9000/", "syslog://10.0.0.5:514"]
 
 # Plans. The catalog feeds the pricing page and can set limits (unlimited when
 # not set). Without a catalog the built-in one is used: "free" (everything
