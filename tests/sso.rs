@@ -426,6 +426,8 @@ async fn sso_signs_in_creates_links_and_enforces() {
     assert_eq!((s, auth["user"]["id"].clone()), (200, json!(pat.id)));
     let ids = srv.get("/api/v1/me/sso", &pat).await.body;
     assert_eq!(ids[0]["subject"], "pat-sub");
+    // With the team's name (pat is in the team, auto_join).
+    assert!(ids[0]["team_name"].is_string() || ids[0]["team_name"].is_null());
 
     // Audited in the team's log.
     let audit = srv

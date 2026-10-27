@@ -31,7 +31,10 @@ use crate::state::AppState;
 
 include!(concat!(env!("OUT_DIR"), "/web_files.rs"));
 
-const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+/// `'wasm-unsafe-eval'` lets the web app compile its pinned, self-hosted
+/// WebAssembly (Argon2id for end-to-end encrypted vaults, 0.7 phase 5b); it
+/// does not allow JavaScript `eval`.
+const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; \
                    img-src 'self' data:; connect-src 'self'; font-src 'self'; \
                    object-src 'none'; base-uri 'none'; form-action 'self'; \
                    frame-ancestors 'none'";

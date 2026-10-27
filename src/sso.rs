@@ -1135,8 +1135,20 @@ async fn exchange(
     }))
 }
 
+/// Your linked identities, each with its team's name (`team_name`).
 async fn my_identities(State(st): State<AppState>, u: AuthUser) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(st.store.sso_identities_of(u.id()).await?)))
+    let teams = st.store.teams_of(u.id()).await?;
+    let mut list = json!(st.store.sso_identities_of(u.id()).await?);
+    if let Some(items) = list.as_array_mut() {
+        for i in items {
+            let name = i["team_id"]
+                .as_str()
+                .and_then(|t| teams.iter().find(|x| x.id.to_string() == t))
+                .map(|t| t.name.clone());
+            i["team_name"] = json!(name);
+        }
+    }
+    Ok(Json(list))
 }
 
 async fn unlink(

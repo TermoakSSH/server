@@ -537,7 +537,7 @@ Design: [E2EE-SSO-AUDIT.md](E2EE-SSO-AUDIT.md) §3. `/info features.sso`
 | POST | `/auth/sso/start` | public | `{email \| team_id, redirect_uri, state?, code_challenge, code_challenge_method: "S256", device_name?, platform?}` → `{authorize_url, expires_at}` |
 | GET | `/auth/sso/callback` | the identity provider | Redirects the browser to `redirect_uri?code=<one-time>&state=…` (or `error=<code>&error_description=…`) |
 | POST | `/auth/sso/exchange` | public | `{code, code_verifier, totp_code?}` → the sign-in answer (`totp_required` first when the account has 2FA and the team does not count SSO as 2FA) |
-| GET | `/me/sso` | you | Linked identities |
+| GET | `/me/sso` | you | Linked identities (`issuer`, `subject`, `team_id`, `team_name`, `email`, `created_at`, `last_login_at`) |
 | POST | `/me/sso/link` | you | Same body as start with `team_id`: links the identity the flow signs in |
 | DELETE | `/me/sso/{team_id}` | you | Unlinks (`sso_only_account` for accounts without a password) |
 | GET, PUT, DELETE | `/teams/{id}/sso` | members read, owners/admins | `{config: SsoConfig, client_secret?}` → `{config, redirect_uri, domains}` |

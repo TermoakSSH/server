@@ -473,6 +473,8 @@ async fn web_is_served_with_security_headers() {
         );
         let csp = h["content-security-policy"].to_str().unwrap();
         assert!(csp.contains("script-src 'self'") && csp.contains("frame-ancestors 'none'"));
+        // WebAssembly (the web's Argon2id), never JavaScript eval.
+        assert!(csp.contains("'wasm-unsafe-eval'") && !csp.contains(" 'unsafe-eval'"));
         assert_eq!(h["referrer-policy"], "no-referrer");
         let body = resp.text().await.unwrap();
         assert!(!body.contains("{{VERSION}}"));

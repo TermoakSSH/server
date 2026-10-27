@@ -303,6 +303,119 @@ fn e2ee_from_the_engine() {
         block_on(pana.sync_now()).unwrap();
     }
 
+    // --- 0.7 phase 5b: moves and copies with an E2EE vault (done by the device) ---
+    let lab = block_on(ana.create_vault(NewVault {
+        name: "Lab".into(),
+        description: None,
+        color: None,
+        icon: None,
+        team_id: None,
+        team_member_role: None,
+        strict: false,
+    }))
+    .unwrap();
+    let db = laptop
+        .save_host(
+            host("db", &acc.id, &lab.id, "root", 22),
+            SecretChange::Set {
+                value: "lab-pw".into(),
+            },
+        )
+        .unwrap();
+    block_on(ana.sync_now()).unwrap();
+    let in_vault = |core: &Arc<TermoakCore>, vault: &str, label: &str| {
+        core.list_hosts(Some(ItemFilter {
+            account_ids: None,
+            vault_ids: Some(vec![vault.to_string()]),
+            include_device: false,
+        }))
+        .unwrap()
+        .into_iter()
+        .find(|h| h.label == label)
+    };
+    // Into the E2EE vault: a sealed copy there, the original deleted.
+    block_on(laptop.transfer(
+        vec![ItemRef {
+            account_id: Some(acc.id.clone()),
+            id: db.id.clone(),
+        }],
+        Some(acc.id.clone()),
+        Some(ops.id.clone()),
+        TransferMode::Move,
+        false,
+    ))
+    .unwrap();
+    block_on(ana.sync_now()).unwrap();
+    assert!(in_vault(&laptop, &lab.id, "db").is_none());
+    let moved = in_vault(&laptop, &ops.id, "db").expect("db moved into Ops");
+    block_on(pana.sync_now()).unwrap();
+    assert_eq!(
+        phone
+            .host_password(moved.id.clone(), None)
+            .unwrap()
+            .as_deref(),
+        Some("lab-pw"),
+        "the phone (unlocked) opens the sealed copy"
+    );
+    // Out of it: a server-readable copy in Lab.
+    block_on(laptop.transfer(
+        vec![ItemRef {
+            account_id: Some(acc.id.clone()),
+            id: web.id.clone(),
+        }],
+        Some(acc.id.clone()),
+        Some(lab.id.clone()),
+        TransferMode::Copy,
+        false,
+    ))
+    .unwrap();
+    block_on(ana.sync_now()).unwrap();
+    let copy = in_vault(&laptop, &lab.id, "web").expect("web copied into Lab");
+    assert_eq!(
+        laptop
+            .host_password(copy.id.clone(), None)
+            .unwrap()
+            .as_deref(),
+        Some("second-pw")
+    );
+    assert!(in_vault(&laptop, &ops.id, "web").is_some());
+
+    // --- 0.7 phase 5b: passphrase removed, key replaced, reset preview ---
+    assert!(block_on(ana.e2ee_remove_passphrase()).unwrap());
+    let st = block_on(ana.e2ee_status()).unwrap();
+    assert!(!st.has_passphrase && st.has_recovery_key);
+    let err = block_on(tana.e2ee_unlock_with_passphrase("correct horse battery".into()));
+    assert!(err.is_err());
+    // Nobody else holds Ops' key: a reset would lose it.
+    let orphaned = block_on(ana.e2ee_reset(false)).unwrap();
+    assert_eq!(orphaned, vec![ops.id.clone()]);
+    let old_fp = st.key.as_ref().unwrap().fingerprint.clone();
+    let rotated = block_on(ana.e2ee_rotate_user_key(Some("new horse battery staple".into()))).unwrap();
+    assert_ne!(rotated.key.fingerprint, old_fp);
+    assert!(e2ee_recovery_key_valid(rotated.recovery_key.clone()));
+    assert_eq!(rotated.recovery_key.split(' ').count(), 24);
+    block_on(ana.sync_now()).unwrap();
+    // The laptop holds the new key and still opens the vault.
+    let v = laptop
+        .vaults(None)
+        .unwrap()
+        .into_iter()
+        .find(|v| v.id == ops.id)
+        .unwrap();
+    assert!(v.e2ee.as_ref().is_some_and(|e| e.has_wrap));
+    // The phone's old key no longer matches: it unlocks again with the
+    // new passphrase.
+    block_on(pana.e2ee_lock()).unwrap();
+    block_on(pana.e2ee_unlock_with_passphrase("new horse battery staple".into())).unwrap();
+    block_on(pana.sync_now()).unwrap();
+    assert_eq!(
+        phone
+            .host_password(web.id.clone(), None)
+            .unwrap()
+            .as_deref(),
+        Some("second-pw")
+    );
+
     // --- E2EE off: other devices get plaintext again ---
     block_on(ana.e2ee_disable_vault(ops.id.clone())).unwrap();
     block_on(pana.sync_now()).unwrap();
