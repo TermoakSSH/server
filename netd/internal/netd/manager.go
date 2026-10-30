@@ -362,7 +362,14 @@ func (m *Manager) Status(id string) proto.Status {
 	if e == nil {
 		return proto.Status{NetworkID: id, State: proto.StateDown}
 	}
-	return m.status(e)
+	st := m.status(e)
+	if st.State == proto.StateStarting {
+		// Someone is waiting for it (an app polls while a Tailscale node
+		// joins, after `up` answered "starting"): that is a use, or a
+		// short idle time would take the node down before it is up.
+		e.lastUsed.Store(ms(m.now()))
+	}
+	return st
 }
 
 // List is the status of every network netd runs.

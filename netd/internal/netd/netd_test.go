@@ -38,16 +38,17 @@ func testLog() *slog.Logger {
 type fakeBackend struct{}
 
 type fakeNode struct {
-	mu     sync.Mutex
-	closed bool
-	conns  []net.Conn
+	mu       sync.Mutex
+	closed   bool
+	conns    []net.Conn
+	starting bool // still joining (a config with "slow")
 }
 
 func (fakeBackend) Start(_ context.Context, spec *proto.Spec, _ *slog.Logger) (netd.Node, error) {
 	if strings.Contains(string(spec.Config), "fail") {
 		return nil, fmt.Errorf("bad config")
 	}
-	return &fakeNode{}, nil
+	return &fakeNode{starting: strings.Contains(string(spec.Config), "slow")}, nil
 }
 
 func (n *fakeNode) Dial(_ context.Context, host string, port int) (net.Conn, error) {
@@ -74,7 +75,12 @@ type lostFIN struct{ net.Conn }
 
 func (lostFIN) CloseWrite() error { return nil }
 
-func (n *fakeNode) Info() netd.NodeInfo { return netd.NodeInfo{State: proto.StateUp} }
+func (n *fakeNode) Info() netd.NodeInfo {
+	if n.starting {
+		return netd.NodeInfo{State: proto.StateStarting}
+	}
+	return netd.NodeInfo{State: proto.StateUp}
+}
 func (n *fakeNode) Peers(context.Context) ([]proto.Peer, error) {
 	return []proto.Peer{{Name: "p", Addresses: []string{"10.0.0.1"}}}, nil
 }
@@ -256,6 +262,38 @@ func TestIdleNetworksGoDown(t *testing.T) {
 			t.Fatal("not reaped")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A node that is still joining while someone polls its status is in use:
+// the idle time (shorter than the time `up` waits, as in the QA runs) must
+// not take it down under them; once nobody asks, it goes down as usual.
+func TestStartingNetworkPolledIsNotIdle(t *testing.T) {
+	m := manager(netd.Limits{Idle: 200 * time.Millisecond})
+	spec := fake("slow", "r")
+	spec.Config = json.RawMessage(`{"slow":true}`)
+	st, err := m.Up(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != proto.StateStarting {
+		t.Fatalf("state %q", st.State)
+	}
+	for i := 0; i < 10; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if s := m.Status("slow").State; s != proto.StateStarting {
+			t.Fatalf("poll %d: state %q", i, s)
+		}
+		if n := m.Reap(); n != 0 {
+			t.Fatalf("poll %d: reaped %d", i, n)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := m.Reap(); n != 1 {
+		t.Fatalf("not polled any more: reaped %d", n)
+	}
+	if s := m.Status("slow").State; s != proto.StateDown {
+		t.Fatalf("state %q", s)
 	}
 }
 

@@ -453,8 +453,10 @@ netd/
 - **Lifecycle.** A network starts on the first `up`/`peers`/`dial` (`up`
   waits up to 10 s, then answers `starting`), restarts when its revision
   changes, and stops on `down`, when idle (`--idle`, default 15 min
-  without open connections; checked every quarter of it, at most 30 s), or
-  when room is needed. `down` and restarts close its open connections.
+  without open connections; checked every quarter of it, at most 30 s; a
+  `status` of a network still `starting` counts as a use, so a node that
+  is slow to join is not taken down while someone waits for it), or when
+  room is needed. `down` and restarts close its open connections.
 - **Limits.** `--max-networks` (64): when full, the least recently used
   network without connections makes room, otherwise `limit`.
   `--max-streams` (256 per network) → `limit`. `--max-dial-timeout` (2
