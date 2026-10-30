@@ -180,10 +180,13 @@ async fn task_with_approval(srv: &Srv, u: &User, host: &str) -> (String, Value) 
         )
         .await;
     let id = task["id"].as_str().unwrap().to_string();
+    // The engine stores the approval and then sets the status: wait for
+    // both (a poll in between sees a pending approval on a running task).
     let t = wait_task(srv, u, &id, |t| {
-        t["pending_approvals"]
-            .as_array()
-            .is_some_and(|a| !a.is_empty())
+        (t["status"] == "waiting_approval"
+            && t["pending_approvals"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()))
             || finished(t)
     })
     .await;
